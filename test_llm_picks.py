@@ -167,7 +167,7 @@ def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    return parsed, full_text, tokens_in, tokens_out, latency
+    return parsed, text, tokens_in, tokens_out, latency
 
 
 def score_picks(picks: list, expert: list) -> dict:
