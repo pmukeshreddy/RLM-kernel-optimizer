@@ -92,7 +92,8 @@ class RLMEnvironment:
     ):
         self.kernel_name = kernel_name
         self.kernel_src_path = Path(kernel_src_path)
-        self.kernel_src: str = self.kernel_src_path.read_text()
+        self.kernel_src_raw: str = self.kernel_src_path.read_text()
+        self.kernel_src: str = self._expand_local_includes(self.kernel_src_raw)
         self.kernel_type: str = kernel_type
 
         hw_spec_path = PROJECT_ROOT / "config" / "b200_spec.yaml"
@@ -120,6 +121,25 @@ class RLMEnvironment:
         self.total_api_cost_usd: float = 0.0
         self.candidates: list = []
         self.hack_rejections: list = []
+
+    # ── Preprocessing ──────────────────────────────────────────────────────────
+
+    def _expand_local_includes(self, src: str) -> str:
+        """Expand local #include directives so the LLM sees helper function signatures."""
+        lines = src.split("\n")
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#include "') and stripped.endswith('"'):
+                rel_path = stripped[len('#include "'):-1]
+                header = self.kernel_src_path.parent / rel_path
+                if header.exists():
+                    result.append(f"// === expanded from {rel_path} ===")
+                    result.append(header.read_text())
+                    result.append(f"// === end {rel_path} ===")
+                    continue
+            result.append(line)
+        return "\n".join(result)
 
     # ── Kernel source navigation ──────────────────────────────────────────────
 

@@ -15,6 +15,9 @@ CRITICAL RULES:
 3. Do NOT explain your changes — add brief inline comments if needed.
 4. NEVER change correctness — output must match reference within atol=1e-2.
 5. Target architecture: NVIDIA B200 (sm_100a, Blackwell).
+6. The input source has helper headers expanded inline (between "=== expanded from ===" markers). \
+In your output, use the original #include directives — do NOT inline the header contents. \
+Only use functions that you can see defined in the expanded headers.
 
 If asked to analyze or decompose, respond with a short structured list — no prose.
 """
