@@ -2,8 +2,8 @@
 
 models:
   root_model: "claude-haiku-4-5-20251001"
-  sub_model: "claude-haiku-4-5-20251001"
-  combine_model: "claude-haiku-4-5-20251001"    # best model only for final merge
+  sub_model: "claude-sonnet-4-6"                # Sonnet for actual kernel generation
+  combine_model: "claude-sonnet-4-6"            # best model for final merge
 
 beam:
   width: 4                    # parallel strategy variants
@@ -41,7 +41,7 @@ bottleneck:
   latency_bound_threshold_pct: 40
 
 cost_control:
-  max_tokens_per_sub_call: 4096
+  max_tokens_per_sub_call: 8192
   max_total_api_cost_usd: 10.0  # hard stop per kernel problem
   max_total_cost_all_problems: 50.0
 
