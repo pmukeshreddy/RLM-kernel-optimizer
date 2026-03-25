@@ -180,12 +180,22 @@ int main(int argc, char** argv) {{
         compile_ok, err_msg, binary = self.profiler.compile_kernel(
             kernel_src=candidate.code, harness_src=harness, output_name=name,
         )
+        if not compile_ok:
+            logger.error("  === COMPILE FAIL [%s] ===\n%s", candidate.strategy, err_msg[:600])
+            # Dump the key API calls for debugging
+            for i, line in enumerate(candidate.code.split("\n"), 1):
+                if any(kw in line for kw in ["tma_load", "mbar_wait", "mbar_init", "issue_prefetch", "PipelineState"]):
+                    logger.error("  LINE %d: %s", i, line.strip())
         if compile_ok:
             self.env.compile_passes += 1
             passed, max_err, msg = self.checker.check(candidate.code, problem_shape)
             if not passed:
                 logger.warning("  Correctness FAIL for [%s] (err=%.4f): %s",
                                candidate.strategy, max_err, msg[:200])
+                # Dump TMA-related lines for debugging
+                for i, line in enumerate(candidate.code.split("\n"), 1):
+                    if any(kw in line for kw in ["tma_load", "mbar_wait", "mbar_init", "issue_prefetch"]):
+                        logger.warning("  LINE %d: %s", i, line.strip())
             else:
                 self.env.correctness_passes += 1
                 candidate.correct = True
