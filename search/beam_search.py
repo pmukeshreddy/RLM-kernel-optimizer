@@ -17,6 +17,7 @@ from profiler.metrics import KernelMetrics, metrics_from_dict
 from search.diversity_selector import DiversitySelector
 from eval.hack_detector import is_clean
 from eval.runtime_checks import run_runtime_checks
+from eval.correctness import CorrectnessChecker
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class BeamSearch:
         self.profiler = NCURunner(env.search_config)
         self.selector = DiversitySelector(env.search_config)
         self.clf      = BottleneckClassifier(env.search_config)
+        self.checker  = CorrectnessChecker(env.search_config)
         self.beam_w   = env.search_config["beam"]["width"]
         self.rounds   = env.search_config["beam"]["refine_rounds"]
 
@@ -181,6 +183,26 @@ int main(int argc, char** argv) {{
                 output_name=f"{name}_a{attempt}",
             )
             if compile_ok:
+                # Check correctness before spending time on profiling
+                passed, max_err, msg = self.checker.check(code, problem_shape)
+                if not passed:
+                    logger.warning("  Correctness FAIL for [%s] (err=%.4f): %s",
+                                   candidate.strategy, max_err, msg[:200])
+                    if attempt < max_compile_retries and not self.env.over_budget():
+                        logger.info("  Correctness retry %d/%d for [%s] — feeding error to LLM",
+                                    attempt + 1, max_compile_retries, candidate.strategy)
+                        fixed = self.engine.fix_compile_error(
+                            code, f"Code compiles but produces WRONG results. {msg[:300]}. "
+                                  "Fix the computation logic — the output must match the reference kernel."
+                        )
+                        if fixed:
+                            code = fixed
+                            continue
+                        else:
+                            break
+                    else:
+                        break
+                candidate.correct = True
                 timing_us = self.profiler.benchmark_timing(binary)
                 if timing_us is not None:
                     speedup = baseline_us / timing_us if timing_us > 0 else 0.0
