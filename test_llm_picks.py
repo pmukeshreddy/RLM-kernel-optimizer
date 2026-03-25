@@ -1,15 +1,15 @@
 """
 test_llm_picks.py — Test whether the LLM can pick the right strategies for each kernel.
 
-Sends each kernel's source code + full strategy menu to the LLM and prints what it picks.
-No compilation, no profiling — just strategy selection.
+Two modes:
+  menu:     LLM picks 4 from a predefined list of 11 strategies
+  freeform: LLM proposes 4 optimizations from scratch, no menu at all
 
 Usage:
     export ANTHROPIC_API_KEY=sk-ant-...
-    python3 test_llm_picks.py                          # default: haiku
-    python3 test_llm_picks.py --model opus              # test with opus
-    python3 test_llm_picks.py --model sonnet             # test with sonnet
-    python3 test_llm_picks.py --model all                # compare all 3
+    python3 test_llm_picks.py --model sonnet                    # menu mode (default)
+    python3 test_llm_picks.py --model sonnet --mode freeform    # no menu, open-ended
+    python3 test_llm_picks.py --model all --mode freeform       # compare all 3 freeform
 """
 
 import argparse
@@ -30,9 +30,8 @@ MODELS = {
     "opus":   "claude-opus-4-6",
 }
 
-# ── Load strategy bank ───────────────────────────────────────────────────────
+# ── Strategy descriptions (for menu mode) ────────────────────────────────────
 
-# We inline this to avoid circular import issues
 STRATEGY_DESCRIPTIONS = {
     "vectorize_loads": {
         "desc": "Replace scalar loads with 128-bit float4/uint4 vectorized transactions",
@@ -96,14 +95,7 @@ KERNELS = {
     "nvfp4_quantize": PROJECT_ROOT / "kernels" / "reference" / "nvfp4_quantize.cu",
 }
 
-# ── What a human expert would pick (ground truth for comparison) ──────────────
-
-EXPERT_PICKS = {
-    "add_rmsnorm":    ["fuse_passes", "vectorize_loads", "fp4_lut", "thread_coarsening"],
-    "silu_mul":       ["vectorize_loads", "fast_math_expf", "fp4_lut", "thread_coarsening"],
-    "nvfp4_quantize": ["fp4_lut", "vectorize_loads", "thread_coarsening", "ldg_readonly"],
-}
-
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_strategy_menu(kernel_type: str) -> str:
     """Build a formatted strategy menu showing all strategies."""
@@ -116,7 +108,7 @@ def build_strategy_menu(kernel_type: str) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(kernel_src: str, kernel_type: str) -> str:
+def build_menu_prompt(kernel_src: str, kernel_type: str) -> str:
     menu = build_strategy_menu(kernel_type)
     return f"""\
 You are a CUDA optimization expert. Select exactly 4 strategies for this kernel.
@@ -143,12 +135,42 @@ Example response format:
 Your response (JSON array only):"""
 
 
+def build_freeform_prompt(kernel_src: str, kernel_type: str) -> str:
+    return f"""\
+You are a CUDA optimization expert. Analyze this kernel and propose exactly 4
+optimization techniques that would give the biggest speedup.
+
+You are NOT limited to any predefined list. Propose whatever CUDA optimizations
+you think are most impactful for THIS SPECIFIC kernel. Be specific and concrete.
+
+Kernel type: {kernel_type}
+Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 142 SMs)
+
+```cuda
+{kernel_src}
+```
+
+For each optimization, give a short name and one-line description of what to do.
+
+Return as a JSON array of objects, most impactful first:
+[
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}},
+  {{"name": "short_name", "what": "one line description of the concrete change"}}
+]
+
+Respond with ONLY the JSON array, nothing else."""
+
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
 def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
-    """Call the LLM and return (parsed_strategies, raw_response, cost, latency)."""
+    """Call the LLM and return (parsed, raw_response, tokens_in, tokens_out, latency)."""
     t0 = time.time()
     response = client.messages.create(
         model=model_id,
-        max_tokens=256,
+        max_tokens=512,
         temperature=0.2,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -156,45 +178,40 @@ def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
     text = response.content[0].text
     tokens_in = response.usage.input_tokens
     tokens_out = response.usage.output_tokens
+    return text, tokens_in, tokens_out, latency
 
-    # Parse JSON array from response
-    parsed = []
+
+def parse_menu_response(text: str) -> list:
+    """Parse a JSON array of strategy name strings."""
     json_match = re.search(r'\[.*?\]', text, re.DOTALL)
     if json_match:
         try:
             raw = json.loads(json_match.group())
-            parsed = [s for s in raw if isinstance(s, str)]
+            return [s for s in raw if isinstance(s, str)]
         except (json.JSONDecodeError, TypeError):
             pass
-
-    return parsed, text, tokens_in, tokens_out, latency
-
-
-def score_picks(picks: list, expert: list) -> dict:
-    """Score LLM picks against expert ground truth."""
-    pick_set = set(picks[:4])
-    expert_set = set(expert)
-    overlap = pick_set & expert_set
-    # Check if any picks are inapplicable (from STRATEGY_DESCRIPTIONS)
-    return {
-        "overlap": len(overlap),
-        "total": len(expert_set),
-        "matching": sorted(overlap),
-        "missed": sorted(expert_set - pick_set),
-        "extra": sorted(pick_set - expert_set),
-        "score_pct": len(overlap) / len(expert_set) * 100,
-    }
+    return []
 
 
-def run_test(client: anthropic.Anthropic, model_name: str, model_id: str):
-    """Run the strategy selection test for all 3 kernels."""
+def parse_freeform_response(text: str) -> list:
+    """Parse a JSON array of {name, what} objects."""
+    json_match = re.search(r'\[.*?\]', text, re.DOTALL)
+    if json_match:
+        try:
+            raw = json.loads(json_match.group())
+            return [item for item in raw if isinstance(item, dict) and "name" in item]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
+# ── Menu mode ─────────────────────────────────────────────────────────────────
+
+def run_menu_test(client: anthropic.Anthropic, model_name: str, model_id: str):
+    """Menu mode: pick 4 from predefined list."""
     print(f"\n{'='*70}")
-    print(f"  MODEL: {model_name} ({model_id})")
+    print(f"  MODE: MENU | MODEL: {model_name} ({model_id})")
     print(f"{'='*70}")
-
-    total_score = 0
-    total_possible = 0
-    total_cost = 0.0
 
     pricing = {
         "haiku":  {"in": 0.25, "out": 1.25},
@@ -202,71 +219,90 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str):
         "opus":   {"in": 15.0, "out": 75.0},
     }
     price = pricing.get(model_name, {"in": 3.0, "out": 15.0})
+    total_cost = 0.0
 
     for kernel_type, src_path in KERNELS.items():
         kernel_src = src_path.read_text()
-        prompt = build_prompt(kernel_src, kernel_type)
+        prompt = build_menu_prompt(kernel_src, kernel_type)
 
         print(f"\n  --- {kernel_type} ---")
-        picks, raw, tok_in, tok_out, latency = call_llm(client, prompt, model_id)
+        text, tok_in, tok_out, latency = call_llm(client, prompt, model_id)
         cost = (tok_in * price["in"] + tok_out * price["out"]) / 1_000_000
         total_cost += cost
 
-        expert = EXPERT_PICKS[kernel_type]
-        result = score_picks(picks, expert)
-        total_score += result["overlap"]
-        total_possible += result["total"]
+        picks = parse_menu_response(text)
+        print(f"  Picked:   {picks}")
+        print(f"  Tokens:   in={tok_in} out={tok_out}  Cost: ${cost:.4f}  Latency: {latency:.1f}s")
 
-        print(f"  LLM picked:    {picks}")
-        print(f"  Expert ideal:  {expert}")
-        print(f"  Match:         {result['overlap']}/4 ({result['score_pct']:.0f}%)")
-        if result["matching"]:
-            print(f"    correct:     {result['matching']}")
-        if result["missed"]:
-            print(f"    missed:      {result['missed']}")
-        if result["extra"]:
-            print(f"    extra:       {result['extra']}")
-        print(f"  Tokens:        in={tok_in} out={tok_out}")
-        print(f"  Cost:          ${cost:.4f}")
-        print(f"  Latency:       {latency:.1f}s")
-
-        # Show raw response if parsing failed
         if not picks:
-            print(f"  RAW RESPONSE:  {raw[:200]}")
+            print(f"  RAW:      {text[:200]}")
 
-    print(f"\n  {'─'*50}")
-    print(f"  TOTAL SCORE:   {total_score}/{total_possible} "
-          f"({total_score/total_possible*100:.0f}%)")
-    print(f"  TOTAL COST:    ${total_cost:.4f}")
-    print(f"  {'─'*50}")
-    return total_score, total_possible, total_cost
+    print(f"\n  Total cost: ${total_cost:.4f}")
+    return total_cost
 
+
+# ── Free-form mode ────────────────────────────────────────────────────────────
+
+def run_freeform_test(client: anthropic.Anthropic, model_name: str, model_id: str):
+    """Free-form mode: LLM proposes optimizations from scratch."""
+    print(f"\n{'='*70}")
+    print(f"  MODE: FREE-FORM | MODEL: {model_name} ({model_id})")
+    print(f"{'='*70}")
+
+    pricing = {
+        "haiku":  {"in": 0.25, "out": 1.25},
+        "sonnet": {"in": 3.0,  "out": 15.0},
+        "opus":   {"in": 15.0, "out": 75.0},
+    }
+    price = pricing.get(model_name, {"in": 3.0, "out": 15.0})
+    total_cost = 0.0
+
+    for kernel_type, src_path in KERNELS.items():
+        kernel_src = src_path.read_text()
+        prompt = build_freeform_prompt(kernel_src, kernel_type)
+
+        print(f"\n  --- {kernel_type} ---")
+        text, tok_in, tok_out, latency = call_llm(client, prompt, model_id)
+        cost = (tok_in * price["in"] + tok_out * price["out"]) / 1_000_000
+        total_cost += cost
+
+        strategies = parse_freeform_response(text)
+
+        if strategies:
+            for i, s in enumerate(strategies, 1):
+                name = s.get("name", "?")
+                what = s.get("what", "?")
+                print(f"  {i}. {name:30s} — {what}")
+        else:
+            print(f"  PARSE FAILED. Raw response:")
+            print(f"  {text[:500]}")
+
+        print(f"  Tokens:   in={tok_in} out={tok_out}  Cost: ${cost:.4f}  Latency: {latency:.1f}s")
+
+    print(f"\n  Total cost: ${total_cost:.4f}")
+    return total_cost
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Test LLM strategy selection")
     parser.add_argument("--model", default="haiku",
                         choices=["haiku", "sonnet", "opus", "all"],
                         help="Which model to test (default: haiku)")
+    parser.add_argument("--mode", default="menu",
+                        choices=["menu", "freeform", "both"],
+                        help="menu=predefined list, freeform=open-ended, both=run both")
     args = parser.parse_args()
 
     client = anthropic.Anthropic()
+    models_to_test = MODELS.items() if args.model == "all" else [(args.model, MODELS[args.model])]
 
-    if args.model == "all":
-        results = {}
-        for name, model_id in MODELS.items():
-            score, total, cost = run_test(client, name, model_id)
-            results[name] = {"score": score, "total": total, "cost": cost}
-
-        print(f"\n{'='*70}")
-        print(f"  COMPARISON SUMMARY")
-        print(f"{'='*70}")
-        for name, r in results.items():
-            pct = r["score"] / r["total"] * 100
-            print(f"  {name:8s}  {r['score']}/{r['total']} ({pct:.0f}%)  "
-                  f"cost=${r['cost']:.4f}")
-    else:
-        model_id = MODELS[args.model]
-        run_test(client, args.model, model_id)
+    for name, model_id in models_to_test:
+        if args.mode in ("menu", "both"):
+            run_menu_test(client, name, model_id)
+        if args.mode in ("freeform", "both"):
+            run_freeform_test(client, name, model_id)
 
 
 if __name__ == "__main__":
