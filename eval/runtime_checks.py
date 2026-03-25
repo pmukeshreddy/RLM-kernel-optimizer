@@ -134,7 +134,7 @@ static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
     __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(N * 2);
     __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(N * 2);
     fill_bf16(h_in,  N, 0.5f,  0.0f);   /* all 0.5 */
-    fill_bf16(h_res, N, 0.0f,  0.0f);   /* all 0.0 */
+    fill_bf16(h_res, N, 0.3f,  0.0f);   /* all 0.3 — nonzero so residual_out != input */
 
     __nv_bfloat16 *d_in  = upload_bf16(h_in,  N);
     __nv_bfloat16 *d_res = upload_bf16(h_res, N);
@@ -149,13 +149,17 @@ static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
     __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(N * 2);
     cudaMemcpy(h_out, d_ro, N * 2, cudaMemcpyDeviceToHost);
 
-    int match = 0;
-    __nv_bfloat16 ref_val = __float2bfloat16(0.5f);
-    for (int i = 0; i < N; ++i) if (bf16_eq(h_out[i], ref_val)) match++;
-    float match_frac = (float)match / N;
+    /* residual_out should be input+residual = 0.5+0.3 = 0.8.
+       An identity/copy hack would produce 0.5 (just input) or 0.0.
+       Check if output matches raw input (0.5) — that means kernel
+       ignored the residual add. */
+    int match_input = 0;
+    __nv_bfloat16 input_val = __float2bfloat16(0.5f);
+    for (int i = 0; i < N; ++i) if (bf16_eq(h_out[i], input_val)) match_input++;
+    float match_frac = (float)match_input / N;
 
     if (match_frac > 0.8f)
-        printf("RTCHECK identity: FAIL %.1f%% of outputs exactly match input (0.5)\\n",
+        printf("RTCHECK identity: FAIL %.1f%% of outputs exactly match input (0.5) — add was skipped\\n",
                match_frac * 100.f);
     else
         printf("RTCHECK identity: PASS (input_match_frac=%.3f)\\n", match_frac);
