@@ -169,7 +169,8 @@ class RLMEnvironment:
         return self.kernel_src[start:end]
 
     def count_memory_ops(self) -> dict:
-        src = self.kernel_src
+        # Use raw source (without expanded includes) to analyze the actual kernel code
+        src = self.kernel_src_raw
         return {
             "loads":       len(re.findall(r"\b(?:__ldg|ld\.global|tex1Dfetch)\b", src)),
             "stores":      len(re.findall(r"\b(?:__stg|st\.global|atomicAdd)\b", src)),
