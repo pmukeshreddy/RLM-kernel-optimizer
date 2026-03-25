@@ -150,22 +150,16 @@ def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
         model=model_id,
         max_tokens=256,
         temperature=0.2,
-        messages=[
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": "["},  # prefill to force JSON
-        ],
+        messages=[{"role": "user", "content": prompt}],
     )
     latency = time.time() - t0
     text = response.content[0].text
     tokens_in = response.usage.input_tokens
     tokens_out = response.usage.output_tokens
 
-    # Reconstruct full response (prefill "[" + completion)
-    full_text = "[" + text
-
     # Parse JSON array from response
     parsed = []
-    json_match = re.search(r'\[.*?\]', full_text, re.DOTALL)
+    json_match = re.search(r'\[.*?\]', text, re.DOTALL)
     if json_match:
         try:
             raw = json.loads(json_match.group())
