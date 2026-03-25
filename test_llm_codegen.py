@@ -431,9 +431,10 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
 
             print(f"    {task['name']:30s}  {status:15s}  "
                   f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
-            if err_msg and "stub" not in err_msg:
-                first_err = err_msg.split("\n")[0][:100]
-                print(f"      err: {first_err}")
+            if err_msg:
+                for err_line in err_msg.split("\n")[:3]:
+                    if err_line.strip():
+                        print(f"      err: {err_line.strip()[:120]}")
 
             results.append({
                 "kernel": kernel_type,
