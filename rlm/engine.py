@@ -106,32 +106,53 @@ class RLMEngine:
     # ── Round 0: Decomposition ────────────────────────────────────────────────
 
     def decompose(self) -> list:
-        """Root LLM selects strategies. Returns list of strategy names."""
+        """Select strategies using kernel-type-aware detection + LLM validation.
+
+        1. Get ideal strategies for this kernel type (from strategy_bank)
+        2. Ask the LLM to validate/reorder based on actual kernel analysis
+        3. Parse LLM's JSON response, fall back to kernel-aware defaults
+        """
         env = self.env
         hot_loop = env.get_hot_loop_src()
-        missing  = env.detect_missing_optimizations()
-        enabled  = env.search_config["strategies"]["enabled"]
+        # detect_missing_optimizations now returns kernel-aware ideal strategies
+        ideal_strategies = env.detect_missing_optimizations()
+        enabled = env.search_config["strategies"]["enabled"]
 
-        if not missing:
-            missing = enabled[:self.beam_width]
-        strategies = missing[:self.beam_width]
+        if not ideal_strategies:
+            ideal_strategies = enabled[:self.beam_width]
 
         prompt = decompose_prompt(
             env_summary=env.state_summary(),
             kernel_slice=hot_loop,
-            missing_opts=missing,
+            missing_opts=ideal_strategies,
         )
 
-        logger.info("Round 0: decomposing with strategies=%s", strategies)
+        logger.info("Round 0: kernel-type=%s ideal_strategies=%s",
+                     env.kernel_type, ideal_strategies)
         response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
         logger.debug("Decomposition response: %s", response[:300])
 
-        # Parse strategies from response or use detected ones
-        parsed = [s for s in enabled if s in response or s in missing]
-        if not parsed:
-            parsed = strategies
+        # Try to parse LLM's strategy recommendations as JSON list
+        import json
+        parsed = []
+        # Look for a JSON array in the response
+        json_match = re.search(r'\[.*?\]', response, re.DOTALL)
+        if json_match:
+            try:
+                raw = json.loads(json_match.group())
+                parsed = [s for s in raw if isinstance(s, str) and s in enabled]
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-        return parsed[:self.beam_width]
+        # If LLM returned valid strategies, use them (but validate against enabled list)
+        if len(parsed) >= self.beam_width:
+            logger.info("Using LLM-selected strategies: %s", parsed[:self.beam_width])
+            return parsed[:self.beam_width]
+
+        # Otherwise use the kernel-aware ideal strategies
+        logger.info("Using kernel-aware ideal strategies: %s",
+                     ideal_strategies[:self.beam_width])
+        return ideal_strategies[:self.beam_width]
 
     # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
 
@@ -287,25 +308,40 @@ CRITICAL: Return ONLY the fixed COMPLETE .cu file in a single ```cuda code block
         return code[:800]
 
     def _bottleneck_to_strategy(self, bottleneck: str, current_strategy: str) -> str:
-        mapping = {
-            "memory_bound":  "tma_prefetch",
-            "compute_bound": "register_tiling",
-            "sync_bound":    "warp_reduction",
-            "latency_bound": "async_pipeline",
-            "unknown":       "vectorize_loads",
-        }
-        suggested = mapping.get(bottleneck, "vectorize_loads")
-        if suggested == current_strategy:
-            fallback = {
-                "vectorize_loads": "tma_prefetch",
-                "tma_prefetch":    "async_pipeline",
-                "warp_reduction":  "fuse_passes",
-                "register_tiling": "vectorize_loads",
-                "async_pipeline":  "warp_reduction",
-                "fuse_passes":     "register_tiling",
-            }
-            suggested = fallback.get(current_strategy, "vectorize_loads")
-        return suggested
+        """Select next strategy based on bottleneck AND kernel type.
+
+        Uses kernel-type-aware strategy bank to pick strategies that are
+        actually applicable, rather than a static mapping that suggests
+        TMA for elementwise kernels.
+        """
+        from search.strategy_bank import select_for_kernel, STRATEGY_BANK
+
+        tried = [current_strategy] + self.env.optimization_history.strategies_tried()
+        kernel_type = self.env.kernel_type
+
+        # Get kernel-aware candidates, excluding already-tried strategies
+        candidates = select_for_kernel(
+            kernel_type=kernel_type,
+            tried=tried,
+            beam_width=4,
+        )
+
+        # Prefer strategies that target the identified bottleneck
+        for name in candidates:
+            s = STRATEGY_BANK.get(name)
+            if s and s.applies_to(bottleneck):
+                return name
+
+        # If nothing matches the bottleneck, just use the top kernel-aware pick
+        if candidates:
+            return candidates[0]
+
+        # Ultimate fallback — cycle through applicable strategies
+        for name, s in STRATEGY_BANK.items():
+            if name not in tried and s.applies_to_kernel(kernel_type):
+                return name
+
+        return "vectorize_loads"
 
     # ── Synchronous wrappers (for beam_search.py) ─────────────────────────────
 

@@ -186,6 +186,24 @@ class RLMEnvironment:
         }
 
     def detect_missing_optimizations(self) -> list:
+        """Kernel-type-aware optimization detection.
+
+        Uses kernel-specific ideal strategy selection instead of keyword grep.
+        Falls back to legacy grep-based detection for unknown kernel types.
+        """
+        from search.strategy_bank import select_for_kernel, KERNEL_IDEAL_STRATEGIES
+
+        tried = self.optimization_history.strategies_tried()
+
+        # Use kernel-aware selection if we know the kernel type
+        if self.kernel_type in KERNEL_IDEAL_STRATEGIES:
+            return select_for_kernel(
+                kernel_type=self.kernel_type,
+                tried=tried,
+                beam_width=self.search_config["beam"]["width"],
+            )
+
+        # Legacy fallback for unknown kernel types
         ops = self.count_memory_ops()
         enabled = self.search_config["strategies"]["enabled"]
         missing = []

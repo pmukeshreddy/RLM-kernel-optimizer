@@ -20,6 +20,11 @@ strategies:
     - fuse_passes
     - register_tiling
     - async_pipeline
+    - fp4_lut
+    - fast_math_expf
+    - thread_coarsening
+    - ldg_readonly
+    - vectorized_stores
   disabled: []
 
 profiler:
