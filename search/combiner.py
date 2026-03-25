@@ -51,7 +51,7 @@ __global__ void fused_add_rmsnorm_nvfp4_optimized(
     const __nv_bfloat16* __restrict__ rms_weight,
     __nv_bfloat16*       __restrict__ residual_out,
     uint8_t*             __restrict__ quant_out,
-    __nv_bfloat16*       __restrict__ quant_scales,
+    __nv_fp8_storage_t*  __restrict__ quant_scales,
     int hidden_size,
     float eps)
 {{

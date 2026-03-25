@@ -13,7 +13,7 @@
 __global__ void nvfp4_quantize_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
     uint8_t*             __restrict__ packed,
-    __nv_bfloat16*       __restrict__ scales,
+    __nv_fp8_storage_t*  __restrict__ scales,
     int N)
 {
     int block_id  = blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,7 +27,7 @@ __global__ void nvfp4_quantize_bf16_kernel(
         x[i] = __bfloat162float(input[base + i]);
 
     uint8_t packed_out[NVFP4_BLOCK_SIZE / 2];
-    __nv_bfloat16 scale_out;
+    __nv_fp8_storage_t scale_out;
     quantize_block_nvfp4(x, packed_out, &scale_out);
 
     int packed_base = block_id * (NVFP4_BLOCK_SIZE / 2);
@@ -39,9 +39,9 @@ __global__ void nvfp4_quantize_bf16_kernel(
 
 // NVFP4 → BFloat16 dequantization
 __global__ void nvfp4_dequantize_bf16_kernel(
-    const uint8_t*       __restrict__ packed,
-    const __nv_bfloat16* __restrict__ scales,
-    __nv_bfloat16*       __restrict__ output,
+    const uint8_t*            __restrict__ packed,
+    const __nv_fp8_storage_t* __restrict__ scales,
+    __nv_bfloat16*            __restrict__ output,
     int N)
 {
     int block_id  = blockIdx.x * blockDim.x + threadIdx.x;
@@ -49,7 +49,7 @@ __global__ void nvfp4_dequantize_bf16_kernel(
     if (block_id >= num_blocks) return;
 
     int packed_base = block_id * (NVFP4_BLOCK_SIZE / 2);
-    __nv_bfloat16 scale = scales[block_id];
+    __nv_fp8_storage_t scale = scales[block_id];
 
     float out[NVFP4_BLOCK_SIZE];
     dequantize_block_nvfp4(&packed[packed_base], scale, out);
@@ -61,7 +61,7 @@ __global__ void nvfp4_dequantize_bf16_kernel(
 }
 
 void launch_nvfp4_quantize_bf16(
-    const __nv_bfloat16* input, uint8_t* packed, __nv_bfloat16* scales,
+    const __nv_bfloat16* input, uint8_t* packed, __nv_fp8_storage_t* scales,
     int N, cudaStream_t stream)
 {
     int num_blocks = N / NVFP4_BLOCK_SIZE;
@@ -71,7 +71,7 @@ void launch_nvfp4_quantize_bf16(
 }
 
 void launch_nvfp4_dequantize_bf16(
-    const uint8_t* packed, const __nv_bfloat16* scales,
+    const uint8_t* packed, const __nv_fp8_storage_t* scales,
     __nv_bfloat16* output, int N, cudaStream_t stream)
 {
     int num_blocks = N / NVFP4_BLOCK_SIZE;

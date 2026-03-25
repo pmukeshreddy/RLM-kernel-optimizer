@@ -49,6 +49,7 @@ def _runtime_harness(rows: int, hidden: int) -> str:
     return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -57,7 +58,7 @@ def _runtime_harness(rows: int, hidden: int) -> str:
 
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_bfloat16*, uint8_t*, __nv_bfloat16*, int, int, cudaStream_t);
+    __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, int, cudaStream_t);
 
 static const int ROWS={rows}, HIDDEN={hidden}, N={n}, NB={nb};
 
@@ -103,7 +104,7 @@ static void check_no_op(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
 
     __nv_bfloat16 *d_ro = upload_bf16(h_nan, N);
     uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_bfloat16 *d_sc; cudaMalloc(&d_sc, NB * 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
 
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
                                     ROWS, HIDDEN, s);
@@ -140,7 +141,7 @@ static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
     __nv_bfloat16 *d_res = upload_bf16(h_res, N);
     __nv_bfloat16 *d_ro;  cudaMalloc(&d_ro,  N * 2);
     uint8_t       *d_qo;  cudaMalloc(&d_qo,  N / 2);
-    __nv_bfloat16 *d_sc;  cudaMalloc(&d_sc,  NB * 2);
+    __nv_fp8_storage_t *d_sc;  cudaMalloc(&d_sc,  NB);
 
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
                                     ROWS, HIDDEN, s);
@@ -176,7 +177,7 @@ static void check_cache(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                         __nv_bfloat16* d_w,  cudaStream_t s) {{
     __nv_bfloat16 *d_ro_a; cudaMalloc(&d_ro_a, N * 2);
     uint8_t       *d_qo_a; cudaMalloc(&d_qo_a, N / 2);
-    __nv_bfloat16 *d_sc_a; cudaMalloc(&d_sc_a, NB * 2);
+    __nv_fp8_storage_t *d_sc_a; cudaMalloc(&d_sc_a, NB);
 
     /* Run 1 → ptr_a */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro_a, d_qo_a, d_sc_a,
@@ -186,7 +187,7 @@ static void check_cache(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
     /* Allocate fresh buffers at (almost certainly) different addresses */
     __nv_bfloat16 *d_ro_b; cudaMalloc(&d_ro_b, N * 2); cudaMemset(d_ro_b, 0, N * 2);
     uint8_t       *d_qo_b; cudaMalloc(&d_qo_b, N / 2);
-    __nv_bfloat16 *d_sc_b; cudaMalloc(&d_sc_b, NB * 2);
+    __nv_fp8_storage_t *d_sc_b; cudaMalloc(&d_sc_b, NB);
 
     /* Run 2 → ptr_b (same inputs) */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro_b, d_qo_b, d_sc_b,
@@ -220,7 +221,7 @@ static void check_nondeter(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                             __nv_bfloat16* d_w,  cudaStream_t s) {{
     __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, N * 2);
     uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_bfloat16 *d_sc; cudaMalloc(&d_sc, NB * 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
 
     /* Run 1 */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
@@ -259,7 +260,7 @@ static void check_stream_inj(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                               __nv_bfloat16* d_w,  cudaStream_t s) {{
     __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, N * 2);
     uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_bfloat16 *d_sc; cudaMalloc(&d_sc, NB * 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
 
     /* Warmup */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,

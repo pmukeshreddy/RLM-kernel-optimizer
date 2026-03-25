@@ -1,5 +1,10 @@
 """
 benchmark.py — Timing harness for WaferBench problem shapes.
+
+Follows ThunderKittens 2.0 convention:
+  - 500 warmup iterations
+  - 100 timed reps via CUDA events
+  - L2 cache input cycling to prevent cache hits inflating performance
 """
 
 from __future__ import annotations
@@ -13,6 +18,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
+
+# Number of input buffer copies for L2 cache cycling
+_L2_CYCLE_BUFS = 4
 
 
 def geometric_mean(values: list) -> float:
@@ -45,20 +53,25 @@ class Benchmarker:
         else:
             raise ValueError(f"Unknown kernel_type: {self.kernel_type}")
 
-    def _timing_footer(self, launch_call: str, iters: int, warmup: int) -> str:
-        """Shared dual-timing footer (event + wall clock) injected into each harness."""
+    def _timing_footer(self, launch_call_indexed: str, iters: int, warmup: int) -> str:
+        """Shared dual-timing footer with L2 cache input cycling.
+
+        launch_call_indexed must use `buf_idx` for input buffer selection,
+        e.g. "launch_kernel(di[buf_idx], ..., s);"
+        """
         return f"""
-    for(int i=0;i<{warmup};++i) {launch_call}
+    // Warmup with L2 cycling
+    for(int i=0;i<{warmup};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
     cudaStreamSynchronize(s);
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    for(int i=0;i<{iters};++i) {launch_call}
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms_event=0; cudaEventElapsedTime(&ms_event,t0,t1);
     float us_event=ms_event*1000.f/{iters};
     cudaDeviceSynchronize();
     struct timespec ts0,ts1; clock_gettime(CLOCK_MONOTONIC,&ts0);
-    for(int i=0;i<{iters};++i) {launch_call}
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
     cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC,&ts1);
     double wall_ns=(ts1.tv_sec-ts0.tv_sec)*1e9+(ts1.tv_nsec-ts0.tv_nsec);
     float us_wall=(float)(wall_ns/1000.0/{iters});
@@ -72,20 +85,27 @@ class Benchmarker:
     def _harness_add_rmsnorm(self, shape: tuple) -> str:
         rows, hidden = shape
         n, nb = rows * hidden, rows * hidden // 16
-        launch = f"launch_fused_add_rmsnorm_nvfp4(di,dr,dw,dro,dq,ds,rows,hidden,s);"
+        nbufs = _L2_CYCLE_BUFS
+        launch = (f"launch_fused_add_rmsnorm_nvfp4("
+                  f"di[buf_idx],dr[buf_idx],dw,dro,dq,ds,rows,hidden,s);")
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdio.h>
 #include <time.h>
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_bfloat16*, unsigned char*, __nv_bfloat16*, int, int, cudaStream_t);
+    __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
 int main() {{
     const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
-    __nv_bfloat16 *di,*dr,*dw,*dro,*ds; unsigned char *dq;
-    cudaMalloc(&di,N*2); cudaMalloc(&dr,N*2); cudaMalloc(&dw,hidden*2);
-    cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb*2);
+    __nv_bfloat16 *di[{nbufs}], *dr[{nbufs}], *dw, *dro;
+    unsigned char *dq; __nv_fp8_storage_t *ds;
+    for (int b=0; b<{nbufs}; ++b) {{
+        cudaMalloc(&di[b],N*2); cudaMalloc(&dr[b],N*2);
+    }}
+    cudaMalloc(&dw,hidden*2);
+    cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
     return 0;
@@ -95,18 +115,28 @@ int main() {{
     def _harness_silu_mul(self, shape: tuple) -> str:
         b, m, k = shape
         n = b * m * k
-        launch = f"launch_silu_mul_bf16(dg,du,dout,N,s);"
+        nb = n // 16
+        nbufs = _L2_CYCLE_BUFS
+        launch = (f"launch_silu_mul_fp4quant("
+                  f"dg[buf_idx],du[buf_idx],dq,ds,N,s);")
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <time.h>
-void launch_silu_mul_bf16(
-    const __nv_bfloat162*, const __nv_bfloat162*, __nv_bfloat162*, int, cudaStream_t);
+void launch_silu_mul_fp4quant(
+    const __nv_bfloat16*, const __nv_bfloat16*,
+    uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main() {{
-    const int N={n};
-    __nv_bfloat162 *dg,*du,*dout;
-    cudaMalloc(&dg,N*2); cudaMalloc(&du,N*2); cudaMalloc(&dout,N*2);
+    const int N={n}, nb={nb};
+    __nv_bfloat16 *dg[{nbufs}], *du[{nbufs}];
+    uint8_t *dq; __nv_fp8_storage_t *ds;
+    for (int b=0; b<{nbufs}; ++b) {{
+        cudaMalloc(&dg[b],N*2); cudaMalloc(&du[b],N*2);
+    }}
+    cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
     return 0;
@@ -117,19 +147,24 @@ int main() {{
         m, k = shape
         n = m * k
         nb = n // 16
-        launch = f"launch_nvfp4_quantize_bf16(din,dpk,dsc,N,s);"
+        nbufs = _L2_CYCLE_BUFS
+        launch = f"launch_nvfp4_quantize_bf16(din[buf_idx],dpk,dsc,N,s);"
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
 void launch_nvfp4_quantize_bf16(
-    const __nv_bfloat16*, uint8_t*, __nv_bfloat16*, int, cudaStream_t);
+    const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main() {{
     const int N={n}, nb={nb};
-    __nv_bfloat16 *din,*dsc; uint8_t *dpk;
-    cudaMalloc(&din,N*2); cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb*2);
+    __nv_bfloat16 *din[{nbufs}]; uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    for (int b=0; b<{nbufs}; ++b) {{
+        cudaMalloc(&din[b],N*2);
+    }}
+    cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
     return 0;

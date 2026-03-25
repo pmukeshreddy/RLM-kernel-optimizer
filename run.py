@@ -25,6 +25,7 @@ from search.beam_search import BeamSearch
 from eval.correctness import CorrectnessChecker
 from eval.benchmark import Benchmarker, geometric_mean
 from eval.waferbench_format import format_submission, save_submission, print_submission_summary
+from eval import flashinfer_ref
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +44,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "add_rmsnorm",
         "description": "Fused Add+RMSNorm+NVFP4 quant (128×2048)",
         "shape":       (128, 2048),
-        "baseline_us": 13.5,
     },
     {
         "name":        "add_rmsnorm_fp4quant_b128xh4096",
@@ -51,7 +51,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "add_rmsnorm",
         "description": "Fused Add+RMSNorm+NVFP4 quant (128×4096)",
         "shape":       (128, 4096),
-        "baseline_us": 13.9,
     },
     {
         "name":        "add_rmsnorm_fp4quant_b128xh8192",
@@ -59,7 +58,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "add_rmsnorm",
         "description": "Fused Add+RMSNorm+NVFP4 quant (128×8192)",
         "shape":       (128, 8192),
-        "baseline_us": 13.0,
     },
     {
         "name":        "nvfp4_quantize_m128xk14336",
@@ -67,7 +65,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "nvfp4_quantize",
         "description": "BF16→NVFP4 block quantization (128×14336)",
         "shape":       (128, 14336),
-        "baseline_us": 7.6,
     },
     {
         "name":        "silu_mul_fp4quant_b8xm256xk7168",
@@ -75,7 +72,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "silu_mul",
         "description": "Fused SiLU×Mul+NVFP4 quant (8×256×7168)",
         "shape":       (8, 256, 7168),
-        "baseline_us": 22.7,
     },
     {
         "name":        "silu_mul_fp4quant_b8xm256xk14336",
@@ -83,7 +79,6 @@ WAFERBENCH_KERNELS = [
         "kernel_type": "silu_mul",
         "description": "Fused SiLU×Mul+NVFP4 quant (8×256×14336)",
         "shape":       (8, 256, 14336),
-        "baseline_us": 39.1,
     },
 ]
 
@@ -96,7 +91,6 @@ def optimize_kernel(
 ) -> dict:
     name        = kernel_def["name"]
     src_path    = PROJECT_ROOT / kernel_def["src"]
-    baseline    = kernel_def["baseline_us"]
     kernel_type = kernel_def["kernel_type"]
     shape       = kernel_def["shape"]
 
@@ -105,6 +99,20 @@ def optimize_kernel(
     if not src_path.exists():
         logger.error("Kernel source not found: %s", src_path)
         return {}
+
+    # Measure baseline from FlashInfer (production reference)
+    baseline = flashinfer_ref.measure_baseline(kernel_type, shape)
+    if baseline is not None:
+        logger.info("FlashInfer baseline for %s: %.2f us", name, baseline)
+    else:
+        # Fallback: measure reference kernel on current hardware
+        logger.info("FlashInfer unavailable — measuring reference kernel baseline")
+        benchmarker_tmp = Benchmarker(config, kernel_type=kernel_type)
+        baseline = benchmarker_tmp._compile_and_time(src_path.read_text(), shape)
+        if baseline is None:
+            logger.error("Cannot measure baseline for %s", name)
+            baseline = 1.0  # prevent division by zero
+        logger.info("Reference kernel baseline for %s: %.2f us", name, baseline)
 
     env = RLMEnvironment(kernel_name=name, kernel_src_path=str(src_path),
                          kernel_type=kernel_type, problem_shape=shape)
@@ -133,7 +141,8 @@ def optimize_kernel(
     logger.info("Beam search completed in %.1f seconds", elapsed)
 
     checker  = CorrectnessChecker(env.search_config)
-    passed, max_err, msg = checker.check(best.code, env.problem_shapes[0])
+    passed, max_err, msg = checker.check(best.code, env.problem_shapes[0],
+                                          kernel_type=kernel_type)
     best.correct = passed
     logger.info("Correctness: %s (max_err=%.6f)", "PASS" if passed else "FAIL", max_err)
 
@@ -143,17 +152,22 @@ def optimize_kernel(
 
     benchmarker = Benchmarker(env.search_config, kernel_type=kernel_type)
 
-    # Measure actual baseline on current hardware instead of using hardcoded values
-    ref_src = src_path.read_text()
+    # Use FlashInfer baseline (already measured) or measure reference kernel
     baseline_per_shape = {}
     for s in env.problem_shapes:
-        measured = benchmarker._compile_and_time(ref_src, s)
-        if measured is not None:
-            baseline_per_shape[s] = measured
-            logger.info("Measured baseline for %s: %.2f us (hardcoded: %.2f us)", s, measured, baseline)
+        fi_baseline = flashinfer_ref.measure_baseline(kernel_type, s)
+        if fi_baseline is not None:
+            baseline_per_shape[s] = fi_baseline
+            logger.info("FlashInfer baseline for shape %s: %.2f us", s, fi_baseline)
         else:
-            baseline_per_shape[s] = baseline
-            logger.warning("Baseline measurement failed for %s, using hardcoded %.2f us", s, baseline)
+            ref_src = src_path.read_text()
+            measured = benchmarker._compile_and_time(ref_src, s)
+            if measured is not None:
+                baseline_per_shape[s] = measured
+                logger.info("Reference kernel baseline for %s: %.2f us", s, measured)
+            else:
+                baseline_per_shape[s] = baseline
+                logger.warning("Baseline measurement failed for %s, using %.2f us", s, baseline)
 
     bench_results = benchmarker.benchmark(best.code, baseline_per_shape)
 

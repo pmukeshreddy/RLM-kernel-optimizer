@@ -131,7 +131,7 @@ class NCURunner:
     # ── Timing ────────────────────────────────────────────────────────────────
 
     def benchmark_timing(
-        self, binary_path: Path, warmup: int = 5, iters: int = 100
+        self, binary_path: Path, warmup: int = 500, iters: int = 100
     ) -> Optional[float]:
         """Run binary, parse 'timing_us: <float>' from stdout. Returns microseconds."""
         if not binary_path.exists():

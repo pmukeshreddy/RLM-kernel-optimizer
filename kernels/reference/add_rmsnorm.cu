@@ -114,7 +114,7 @@ __global__ void fused_add_rmsnorm_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ rms_weight,
     __nv_bfloat16*       __restrict__ residual_out,
     uint8_t*             __restrict__ quant_out,
-    __nv_bfloat16*       __restrict__ quant_scales,
+    __nv_fp8_storage_t*  __restrict__ quant_scales,
     int hidden_size,
     float eps)
 {
@@ -164,7 +164,7 @@ __global__ void fused_add_rmsnorm_nvfp4_kernel(
         }
 
         uint8_t packed_out[NVFP4_BLOCK_SIZE / 2];
-        __nv_bfloat16 scale_out;
+        __nv_fp8_storage_t scale_out;
         quantize_block_nvfp4(block_vals, packed_out, &scale_out);
 
         int packed_base = (row * num_quant_blocks + qb) * (NVFP4_BLOCK_SIZE / 2);
@@ -179,7 +179,7 @@ __global__ void fused_add_rmsnorm_nvfp4_kernel(
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16* input, const __nv_bfloat16* residual,
     const __nv_bfloat16* rms_weight, __nv_bfloat16* residual_out,
-    uint8_t* quant_out, __nv_bfloat16* quant_scales,
+    uint8_t* quant_out, __nv_fp8_storage_t* quant_scales,
     int num_rows, int hidden_size, cudaStream_t stream)
 {
     int num_warps = FUSED_BLOCK_THREADS / 32;

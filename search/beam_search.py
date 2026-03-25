@@ -64,17 +64,18 @@ class BeamSearch:
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdio.h>
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_bfloat16*, unsigned char*, __nv_bfloat16*, int, int, cudaStream_t);
+    __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
 int main(int argc, char** argv) {{
-    int warmup=5, iters=100;
+    int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
-    __nv_bfloat16 *di,*dr,*dw,*dro,*ds; unsigned char *dq;
+    __nv_bfloat16 *di,*dr,*dw,*dro; unsigned char *dq; __nv_fp8_storage_t *ds;
     cudaMalloc(&di,N*2); cudaMalloc(&dr,N*2); cudaMalloc(&dw,hidden*2);
-    cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb*2);
+    cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     for(int i=0;i<warmup;++i) launch_fused_add_rmsnorm_nvfp4(di,dr,dw,dro,dq,ds,rows,hidden,s);
     cudaStreamSynchronize(s);
@@ -92,28 +93,33 @@ int main(int argc, char** argv) {{
     def _harness_silu_mul(self, shape: tuple) -> str:
         b, m, k = shape
         n = b * m * k
+        nb = n // 16
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <stdint.h>
 #include <stdio.h>
-void launch_silu_mul_bf16(
-    const __nv_bfloat162*, const __nv_bfloat162*, __nv_bfloat162*, int, cudaStream_t);
+void launch_silu_mul_fp4quant(
+    const __nv_bfloat16*, const __nv_bfloat16*,
+    uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main(int argc, char** argv) {{
-    int warmup=5, iters=100;
+    int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
-    const int N={n};
-    __nv_bfloat162 *dg,*du,*dout;
-    cudaMalloc(&dg,N*2); cudaMalloc(&du,N*2); cudaMalloc(&dout,N*2);
+    const int N={n}, nb={nb};
+    __nv_bfloat16 *dg,*du; uint8_t *dq; __nv_fp8_storage_t *ds;
+    cudaMalloc(&dg,N*2); cudaMalloc(&du,N*2);
+    cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
-    for(int i=0;i<warmup;++i) launch_silu_mul_bf16(dg,du,dout,N,s);
+    for(int i=0;i<warmup;++i) launch_silu_mul_fp4quant(dg,du,dq,ds,N,s);
     cudaStreamSynchronize(s);
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    for(int i=0;i<iters;++i) launch_silu_mul_bf16(dg,du,dout,N,s);
+    for(int i=0;i<iters;++i) launch_silu_mul_fp4quant(dg,du,dq,ds,N,s);
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms=0; cudaEventElapsedTime(&ms,t0,t1);
     printf("timing_us: %.3f\\n", ms*1000.f/iters);
-    cudaFree(dg); cudaFree(du); cudaFree(dout);
+    cudaFree(dg); cudaFree(du); cudaFree(dq); cudaFree(ds);
     return 0;
 }}
 """
@@ -125,16 +131,17 @@ int main(int argc, char** argv) {{
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
 void launch_nvfp4_quantize_bf16(
-    const __nv_bfloat16*, uint8_t*, __nv_bfloat16*, int, cudaStream_t);
+    const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main(int argc, char** argv) {{
-    int warmup=5, iters=100;
+    int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int N={n}, nb={nb};
-    __nv_bfloat16 *din,*dsc; uint8_t *dpk;
-    cudaMalloc(&din,N*2); cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb*2);
+    __nv_bfloat16 *din; uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    cudaMalloc(&din,N*2); cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     for(int i=0;i<warmup;++i) launch_nvfp4_quantize_bf16(din,dpk,dsc,N,s);
     cudaStreamSynchronize(s);
@@ -188,7 +195,8 @@ int main(int argc, char** argv) {{
                     logger.error("  LINE %d: %s", i, line.strip())
         if compile_ok:
             self.env.compile_passes += 1
-            passed, max_err, msg = self.checker.check(candidate.code, problem_shape)
+            passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
+                                                          kernel_type=self.env.kernel_type)
             if not passed:
                 logger.warning("  Correctness FAIL for [%s] (err=%.4f): %s",
                                candidate.strategy, max_err, msg[:200])

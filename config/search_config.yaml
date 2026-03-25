@@ -48,7 +48,7 @@ cost_control:
 eval:
   correctness_atol: 1e-2
   correctness_rtol: 1e-3
-  benchmark_warmup: 5
+  benchmark_warmup: 500
   benchmark_iters: 100
   # Shapes are now per-task (passed via problem_shape in run.py).
   # These are fallback defaults only — not used during normal WaferBench runs.

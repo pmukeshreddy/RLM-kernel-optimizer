@@ -1,12 +1,24 @@
 // nvfp4_utils.cuh — NVFP4 pack/unpack and quantization helpers
 // NVFP4: 1-bit exponent, 2-bit mantissa, 1-bit sign
 // Format: s | e | m1 | m0  (4 bits total)
-// Scale: per-16-element block scaling factor (bfloat16)
+// Scale: per-16-element block scaling factor (E4M3 fp8)
 
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
+
+// ────────────────────────────────────────────────────────────────────────────
+// E4M3 scale helpers — scales are stored as FP8 E4M3 (1 byte per block)
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ __nv_fp8_storage_t float_to_e4m3(float x) {
+    return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+}
+
+__device__ __forceinline__ float e4m3_to_float(__nv_fp8_storage_t x) {
+    return __nv_cvt_fp8_to_float(x, __NV_E4M3);
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // NVFP4 representation constants
@@ -73,14 +85,14 @@ __device__ __forceinline__ float nvfp4_to_float(uint8_t code) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Block quantize: 16 floats → 8 bytes (packed fp4) + 1 bf16 scale
+// Block quantize: 16 floats → 8 bytes (packed fp4) + 1 E4M3 scale
 // Input:  float x[16]
-// Output: uint8_t packed[8], __nv_bfloat16 scale
+// Output: uint8_t packed[8], __nv_fp8_storage_t scale (E4M3)
 // ────────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void quantize_block_nvfp4(
     const float* __restrict__ x,
     uint8_t* __restrict__ packed,
-    __nv_bfloat16* __restrict__ scale)
+    __nv_fp8_storage_t* __restrict__ scale)
 {
     // Find block absmax for scaling
     float amax = 0.0f;
@@ -92,7 +104,7 @@ __device__ __forceinline__ void quantize_block_nvfp4(
     // Scale so that max maps to representable NVFP4 max (6.0)
     const float inv_max_repr = 1.0f / 6.0f;
     float s = (amax > 0.0f) ? (amax * inv_max_repr) : 1.0f;
-    *scale = __float2bfloat16(s);
+    *scale = float_to_e4m3(s);
 
     float inv_s = (amax > 0.0f) ? (6.0f / amax) : 1.0f;
 
@@ -106,14 +118,14 @@ __device__ __forceinline__ void quantize_block_nvfp4(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Block dequantize: 8 bytes (packed fp4) + bf16 scale → 16 floats
+// Block dequantize: 8 bytes (packed fp4) + E4M3 scale → 16 floats
 // ────────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void dequantize_block_nvfp4(
     const uint8_t* __restrict__ packed,
-    __nv_bfloat16 scale,
+    __nv_fp8_storage_t scale,
     float* __restrict__ out)
 {
-    float s = __bfloat162float(scale);
+    float s = e4m3_to_float(scale);
     #pragma unroll
     for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
         uint8_t byte = packed[i];
