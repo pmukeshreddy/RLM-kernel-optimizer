@@ -170,6 +170,9 @@ def optimize_kernel(
             "correct":          passed,
             "max_abs_err":      max_err,
             "hack_rejections":  env.hack_rejections,
+            "total_attempts":       env.total_attempts,
+            "compile_passes":       env.compile_passes,
+            "correctness_passes":   env.correctness_passes,
         },
     )
 
@@ -237,6 +240,15 @@ def main():
         ]
         if speedups:
             print(f"Geometric mean speedup (all kernels): {geometric_mean(speedups):.3f}x")
+
+        # Pass rate summary
+        total_att = sum(r.get("metadata", {}).get("total_attempts", 0) for r in all_results)
+        total_comp = sum(r.get("metadata", {}).get("compile_passes", 0) for r in all_results)
+        total_corr = sum(r.get("metadata", {}).get("correctness_passes", 0) for r in all_results)
+        if total_att > 0:
+            print(f"\nFirst-try pass rates ({total_att} total attempts):")
+            print(f"  Compile:     {total_comp}/{total_att} ({100*total_comp/total_att:.0f}%)")
+            print(f"  Correctness: {total_corr}/{total_att} ({100*total_corr/total_att:.0f}%)")
 
         # Hack detection summary
         all_rejections = [

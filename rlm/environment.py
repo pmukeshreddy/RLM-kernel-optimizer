@@ -121,6 +121,10 @@ class RLMEnvironment:
         self.total_api_cost_usd: float = 0.0
         self.candidates: list = []
         self.hack_rejections: list = []
+        # Pass rate tracking (first-try, no retries)
+        self.total_attempts: int = 0
+        self.compile_passes: int = 0
+        self.correctness_passes: int = 0
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
 
