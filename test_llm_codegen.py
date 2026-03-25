@@ -266,34 +266,192 @@ def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
 
 def try_compile_syntax_only(cuda_code: str, kernel_type: str,
                             nvcc: str, tmpdir: str) -> tuple:
-    """Fallback: strip hardware-specific headers and check if LLM code compiles.
+    """Fallback: replace only the unavailable FP8 intrinsics with stubs.
 
-    Replaces #include of common headers with minimal stubs so we can check
-    whether the LLM's code itself (not the B200 intrinsics) is valid.
+    Provides complete function signatures from nvfp4_utils.cuh and
+    b200_intrinsics.cuh so the compiler verifies all call sites.
+    Only stubs the __nv_cvt_* functions that require CUDA 12.8+.
     """
-    stub_header = '''\
+    stub_nvfp4 = '''\
 #pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <stdint.h>
 
-// Stub types for compilation testing
+// === Stub: FP8 type and conversion (requires CUDA 12.8+) ===
 typedef unsigned char __nv_fp8_storage_t;
+__device__ __forceinline__ __nv_fp8_storage_t float_to_e4m3(float x) {
+    return static_cast<__nv_fp8_storage_t>(0);
+}
+__device__ __forceinline__ float e4m3_to_float(__nv_fp8_storage_t x) {
+    return 0.0f;
+}
 
-#define NVFP4_BLOCK_SIZE 16
+// === Real definitions (copied from nvfp4_utils.cuh) ===
+#define NVFP4_MANTISSA_BITS 2
+#define NVFP4_EXPONENT_BITS 1
+#define NVFP4_BIAS          1
+#define NVFP4_BLOCK_SIZE    16
+#define NVFP4_PER_BYTE      2
+#define NVFP4_PER_INT32     8
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
+__device__ __constant__ float kNVFP4LUT[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+__device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
+    uint8_t sign_bit = (x < 0.0f) ? 0x8u : 0x0u;
+    float ax = fabsf(x);
+    ax = fminf(ax, 6.0f);
+    uint8_t code;
+    if      (ax < 0.25f) code = 0;
+    else if (ax < 0.75f) code = 1;
+    else if (ax < 1.25f) code = 2;
+    else if (ax < 1.75f) code = 3;
+    else if (ax < 2.5f)  code = 4;
+    else if (ax < 3.5f)  code = 5;
+    else if (ax < 5.0f)  code = 6;
+    else                 code = 7;
+    return sign_bit | code;
+}
+
+__device__ __forceinline__ float nvfp4_to_float(uint8_t code) {
+    return kNVFP4LUT[code & 0xF];
 }
 
 __device__ __forceinline__ void quantize_block_nvfp4(
-    const float* vals, uint8_t* packed, __nv_fp8_storage_t* scale) {
-    *scale = 0;
-    for (int i = 0; i < 8; i++) packed[i] = 0;
+    const float* __restrict__ x,
+    uint8_t* __restrict__ packed,
+    __nv_fp8_storage_t* __restrict__ scale)
+{
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i)
+        amax = fmaxf(amax, fabsf(x[i]));
+
+    const float inv_max_repr = 1.0f / 6.0f;
+    float s = (amax > 0.0f) ? (amax * inv_max_repr) : 1.0f;
+    *scale = float_to_e4m3(s);
+    float inv_s = (amax > 0.0f) ? (6.0f / amax) : 1.0f;
+
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+        uint8_t lo = float_to_nvfp4(x[2*i]   * inv_s);
+        uint8_t hi = float_to_nvfp4(x[2*i+1] * inv_s);
+        packed[i] = (hi << 4) | (lo & 0xF);
+    }
 }
+
+__device__ __forceinline__ void dequantize_block_nvfp4(
+    const uint8_t* __restrict__ packed,
+    __nv_fp8_storage_t scale,
+    float* __restrict__ out)
+{
+    float s = e4m3_to_float(scale);
+    #pragma unroll
+    for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+        uint8_t byte = packed[i];
+        out[2*i]   = nvfp4_to_float(byte & 0xF) * s;
+        out[2*i+1] = nvfp4_to_float(byte >> 4)  * s;
+    }
+}
+
+__device__ __forceinline__ uint32_t pack8_nvfp4(const uint8_t codes[8]) {
+    uint32_t result = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+        result |= ((uint32_t)(codes[i] & 0xF)) << (i * 4);
+    return result;
+}
+
+__device__ __forceinline__ void unpack8_nvfp4(uint32_t packed, uint8_t codes[8]) {
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+        codes[i] = (packed >> (i * 4)) & 0xF;
+}
+
+__device__ __forceinline__ float warp_absmax(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        val = fmaxf(val, fabsf(__shfl_xor_sync(0xFFFFFFFF, val, mask)));
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        val += __shfl_xor_sync(0xFFFFFFFF, val, mask);
+    return val;
+}
+'''
+
+    stub_b200 = '''\
+#pragma once
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+// === TMA stubs (require sm_100a PTX) ===
+struct TMADescriptor1D {
+    uint64_t tensor_map;
+    uint32_t box_size;
+    uint32_t element_stride;
+};
+
+__device__ __forceinline__ void tma_load_1d(
+    void* smem_dst, const void* gmem_src, uint64_t* mbar, uint32_t num_bytes) {}
+__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t num_transactions) {}
+__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {}
+__device__ __forceinline__ void mbar_arrive(uint64_t* mbar) {}
+
+struct PipelineState {
+    uint32_t phase = 0;
+    uint32_t stage = 0;
+    __device__ __forceinline__ void issue_prefetch(
+        void* smem_buf, const void* gmem_src, uint32_t num_bytes, uint64_t* mbar) {}
+    __device__ __forceinline__ void wait(uint64_t* mbar) {}
+    __device__ __forceinline__ void swap() { stage ^= 1; phase ^= 1; }
+};
+
+// === Vectorized load/store (these work on sm_80+) ===
+__device__ __forceinline__ float4 load_float4(const float* ptr) {
+    return *reinterpret_cast<const float4*>(ptr);
+}
+__device__ __forceinline__ void store_float4(float* ptr, float4 val) {
+    *reinterpret_cast<float4*>(ptr) = val;
+}
+__device__ __forceinline__ uint4 load_uint4(const uint32_t* ptr) {
+    return *reinterpret_cast<const uint4*>(ptr);
+}
+__device__ __forceinline__ void load_bf16x8(
+    const __nv_bfloat16* ptr,
+    __nv_bfloat162& a, __nv_bfloat162& b,
+    __nv_bfloat162& c, __nv_bfloat162& d)
+{
+    uint4 raw = *reinterpret_cast<const uint4*>(ptr);
+    a = *reinterpret_cast<__nv_bfloat162*>(&raw.x);
+    b = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
+    c = *reinterpret_cast<__nv_bfloat162*>(&raw.z);
+    d = *reinterpret_cast<__nv_bfloat162*>(&raw.w);
+}
+
+// === TMEM stubs (require sm_100a PTX) ===
+__device__ __forceinline__ uint32_t tmem_alloc(uint32_t num_bytes) { return 0; }
+__device__ __forceinline__ void tmem_free(uint32_t tmem_addr) {}
+__device__ __forceinline__ uint32_t tmem_load(uint32_t tmem_addr) { return 0; }
+__device__ __forceinline__ void tmem_store(uint32_t tmem_addr, uint32_t val) {}
+
+__device__ __forceinline__ bool is_warp_leader() { return (threadIdx.x % 32) == 0; }
+__device__ __forceinline__ bool is_block_leader() {
+    return threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
+}
+
+__device__ __forceinline__ float load_streaming(const float* ptr) {
+    return *ptr;
+}
+__device__ __forceinline__ void prefetch_l2(const void* ptr) {}
 '''
 
     # Write stub headers
@@ -303,9 +461,9 @@ __device__ __forceinline__ void quantize_block_nvfp4(
     os.makedirs(common_stub, exist_ok=True)
 
     with open(os.path.join(common_stub, "nvfp4_utils.cuh"), "w") as f:
-        f.write(stub_header)
+        f.write(stub_nvfp4)
     with open(os.path.join(common_stub, "b200_intrinsics.cuh"), "w") as f:
-        f.write("#pragma once\n")
+        f.write(stub_b200)
 
     # Rewrite includes to use stubs
     modified = cuda_code.replace('../common/', 'common/')
@@ -324,7 +482,7 @@ __device__ __forceinline__ void quantize_block_nvfp4(
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0:
-            return True, "(stub compile — header intrinsics not available)"
+            return True, "(stub compile — FP8 intrinsics stubbed, all function signatures verified)"
         else:
             err = result.stderr
             err_lines = [l for l in err.split("\n") if "error" in l.lower()]
@@ -355,13 +513,9 @@ CRITICAL RULES:
 4. Do NOT change the launch_* function signature
 5. Output must match reference within atol=1e-2
 6. No explanations — just the code block
-7. Do NOT invent or call helper functions that don't exist in the expanded headers above.
-   You may ONLY call functions you can see defined in the code above.
-   For vectorized loads, use raw CUDA casts like:
-     uint4 vec = *reinterpret_cast<const uint4*>(&ptr[idx]);
-     __nv_bfloat16 vals[8];
-     memcpy(vals, &vec, sizeof(uint4));
-   Do NOT call load_bf16x8, load_vectorized, or any other invented function.
+7. You may call any function defined in the expanded headers above (e.g. load_bf16x8,
+   load_float4, quantize_block_nvfp4, etc.). Do NOT invent helper functions that aren't
+   defined in the headers.
 8. For vectorized stores, use raw casts like:
      *reinterpret_cast<uint2*>(&out[idx]) = packed_val;
 """
