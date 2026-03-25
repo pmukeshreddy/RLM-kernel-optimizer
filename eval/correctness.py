@@ -139,7 +139,10 @@ class CorrectnessChecker:
             if r.returncode != 0:
                 return False, float("inf"), f"Compile failed: {r.stderr[:300]}"
 
-            r2     = subprocess.run([str(bin_file)], capture_output=True, text=True, timeout=60)
+            try:
+                r2     = subprocess.run([str(bin_file)], capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                return False, float("inf"), "Kernel hung (timeout) — likely deadlock or infinite loop"
             output = r2.stdout.strip()
 
             if "PASS" in output:
