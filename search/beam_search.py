@@ -214,7 +214,7 @@ int main(int argc, char** argv) {{
         logger.info("Strategies: %s", strategies)
         env.current_round = 0
 
-        kernel_slice = env.get_hot_loop_src()
+        kernel_slice = env.kernel_src
         candidates = self.engine.run_generate_beams(
             strategies=strategies, kernel_slice=kernel_slice, round_num=0
         )

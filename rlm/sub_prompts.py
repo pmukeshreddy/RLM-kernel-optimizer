@@ -1,6 +1,6 @@
 """
 sub_prompts.py — Strategy-specific prompts for sub-LLMs.
-Sub-LLMs only see the relevant kernel slice, not the full source.
+Sub-LLMs receive the full kernel source and must return a complete compilable .cu file.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ def vectorize_loads_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
 
 Hardware: NVIDIA B200 ({mem_bw} TB/s HBM3e bandwidth)
 {metrics_str}
-Target kernel section:
+Full kernel source (complete .cu file):
 ```cuda
 {kernel_slice}
 ```
@@ -36,8 +36,7 @@ Requirements:
 5. Do NOT add new __syncthreads() calls
 6. Add `#pragma unroll 4` hints where appropriate
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 
@@ -54,7 +53,7 @@ def tma_prefetch_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict 
 
 Hardware: NVIDIA B200 (Blackwell) with TMA support
 {metrics_str}
-Target kernel section:
+Full kernel source (complete .cu file):
 ```cuda
 {kernel_slice}
 ```
@@ -73,8 +72,7 @@ Shared memory layout:
   __shared__ T smem_buf[2][TILE_SIZE];  // double buffer
   __shared__ uint64_t mbar[2];
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 
@@ -91,7 +89,7 @@ def warp_reduction_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
 
 Hardware: NVIDIA B200 (sm_100a, __shfl_xor_sync supported)
 {metrics_str}
-Target kernel section (contains __syncthreads-based reduction):
+Full kernel source (complete .cu file, contains __syncthreads-based reduction):
 ```cuda
 {kernel_slice}
 ```
@@ -107,8 +105,7 @@ Requirements:
 5. Use `0xFFFFFFFF` as the warp mask (full warp participation)
 6. Preserve numerical equivalence
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 
@@ -125,7 +122,7 @@ def fuse_passes_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict =
 
 Hardware: NVIDIA B200 ({hw_spec['memory']['hbm_bandwidth_tbs']} TB/s HBM3e)
 {metrics_str}
-Target kernel (currently makes multiple passes over data):
+Full kernel source (complete .cu file, currently makes multiple passes over data):
 ```cuda
 {kernel_slice}
 ```
@@ -140,8 +137,7 @@ Requirements:
 5. Use `__ldg()` for read-only data (L1 texture cache)
 6. Mark read-only pointers with `__restrict__` and `const`
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block. Add register count as an inline comment.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 
@@ -158,7 +154,7 @@ def register_tiling_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
 
 Hardware: NVIDIA B200 (255 registers/thread, 4-wide SIMD fp32)
 {metrics_str}
-Target kernel section:
+Full kernel source (complete .cu file):
 ```cuda
 {kernel_slice}
 ```
@@ -173,8 +169,7 @@ Requirements:
 5. Preserve #pragma unroll for the compiler
 6. Do not exceed 96 registers/thread
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 
@@ -191,7 +186,7 @@ def async_pipeline_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
 
 Hardware: NVIDIA B200 (Blackwell, cp.async.bulk supported)
 {metrics_str}
-Target kernel section:
+Full kernel source (complete .cu file):
 ```cuda
 {kernel_slice}
 ```
@@ -208,8 +203,7 @@ Requirements:
 7. Wait with `__pipeline_wait_prior(1)` — allow 1 outstanding stage
 8. Handle prologue (first tile) and epilogue (drain) correctly
 
-Return ONLY the complete optimized CUDA code in a single ```cuda code block.
-No explanations, no markdown headings, no prose — just the code block.
+CRITICAL: Return the COMPLETE .cu file (all #includes, ALL kernel functions, and the launch_* wrapper function) in a single ```cuda code block. The file must compile standalone with nvcc. No explanations — just the code block.
 """
 
 

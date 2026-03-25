@@ -187,7 +187,8 @@ class RLMEngine:
         tasks = []
         for candidate in survivors:
             strategy     = self._bottleneck_to_strategy(candidate.bottleneck, candidate.strategy)
-            kernel_slice = self._extract_hot_loop_from_code(candidate.code)
+            # Pass the full candidate code so the LLM returns a complete compilable file
+            kernel_slice = candidate.code if candidate.code else self.env.kernel_src
             tasks.append(
                 self._generate_single_beam(
                     strategy=strategy,
@@ -205,14 +206,14 @@ class RLMEngine:
             return top_candidates[0]
 
         a, b   = top_candidates[0], top_candidates[1]
-        hot_a  = self._extract_hot_loop_from_code(a.code)
-        hot_b  = self._extract_hot_loop_from_code(b.code)
+        hot_a  = a.code
+        hot_b  = b.code
 
         prompt = combine_prompt(
             variant_a_summary=a.summary(),
-            variant_a_code=hot_a[:1500],
+            variant_a_code=hot_a,
             variant_b_summary=b.summary(),
-            variant_b_code=hot_b[:1500],
+            variant_b_code=hot_b,
         )
 
         response, _, _ = self._call_llm(prompt, model=self.combine_model, temperature=0.2)
