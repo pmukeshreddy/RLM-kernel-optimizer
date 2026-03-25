@@ -169,12 +169,38 @@ int main(int argc, char** argv) {{
         harness = self._build_harness(problem_shape)
         name    = f"{candidate.strategy}_r{candidate.round_num}_{int(time.time())}"
 
-        ok, metrics, speedup = self.profiler.compile_and_profile(
-            kernel_src=candidate.code,
-            harness_src=harness,
-            name=name,
-            baseline_us=baseline_us,
-        )
+        # Try compilation — if it fails, feed error back to LLM for up to 2 retries
+        max_compile_retries = 2
+        code = candidate.code
+        ok = False
+        metrics = None
+        speedup = 0.0
+        for attempt in range(1 + max_compile_retries):
+            compile_ok, err_msg, binary = self.profiler.compile_kernel(
+                kernel_src=code, harness_src=harness,
+                output_name=f"{name}_a{attempt}",
+            )
+            if compile_ok:
+                timing_us = self.profiler.benchmark_timing(binary)
+                if timing_us is not None:
+                    speedup = baseline_us / timing_us if timing_us > 0 else 0.0
+                    metrics = self.profiler.profile(binary, report_name=f"{name}_a{attempt}")
+                    if metrics:
+                        metrics.duration_us = timing_us
+                        metrics.speedup = speedup
+                ok = True
+                candidate.code = code
+                break
+            if attempt < max_compile_retries and not self.env.over_budget():
+                logger.info("  Compile retry %d/%d for [%s] — feeding error to LLM",
+                            attempt + 1, max_compile_retries, candidate.strategy)
+                fixed = self.engine.fix_compile_error(code, err_msg[:500])
+                if fixed:
+                    code = fixed
+                else:
+                    break
+            else:
+                break
         candidate.compile_ok = ok
 
         # Runtime hack checks — run after compile confirms the kernel is valid CUDA

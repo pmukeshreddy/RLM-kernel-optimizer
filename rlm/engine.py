@@ -229,6 +229,31 @@ class RLMEngine:
             compile_ok=True,
         )
 
+    # ── Compile-error fix loop ─────────────────────────────────────────────────
+
+    def fix_compile_error(self, broken_code: str, error_msg: str) -> str:
+        """Send compile error back to LLM and ask it to fix the code."""
+        prompt = f"""\
+The following CUDA code failed to compile. Fix the error and return the corrected COMPLETE .cu file.
+
+Compilation error:
+```
+{error_msg}
+```
+
+Broken code:
+```cuda
+{broken_code}
+```
+
+CRITICAL: Return ONLY the fixed COMPLETE .cu file in a single ```cuda code block. Keep all #includes, kernel functions, and launch_* wrapper. No explanations.
+"""
+        try:
+            response, _, _ = self._call_llm(prompt, model=self.sub_model, temperature=0.2)
+        except RuntimeError:
+            return ""
+        return self._extract_cuda_code(response)
+
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _extract_cuda_code(self, text: str) -> str:
