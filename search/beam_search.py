@@ -240,9 +240,10 @@ int main(int argc, char** argv) {{
                 )
                 return None
 
+        # Always set speedup from timing, even if NCU profiling failed
+        candidate.speedup = speedup
         if metrics:
             candidate.metrics    = metrics.to_dict()
-            candidate.speedup    = speedup
             candidate.bottleneck = self.clf.classify(metrics).value
         return metrics
 
