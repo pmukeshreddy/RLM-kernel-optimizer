@@ -180,27 +180,39 @@ def extract_cuda_code(text: str) -> str:
 
 
 def detect_cuda_arch() -> str:
-    """Detect best available CUDA architecture for compilation."""
+    """Detect best available CUDA architecture by actually compiling a test file."""
     ncu_path = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     nvcc = os.path.join(ncu_path, "bin", "nvcc")
     if not os.path.exists(nvcc):
         nvcc = "nvcc"
 
-    # Check nvcc version to determine supported archs
-    try:
-        result = subprocess.run([nvcc, "--version"], capture_output=True, text=True)
-        version_text = result.stdout
-        # Try sm_100a first (Blackwell, CUDA 12.8+), fallback to sm_90a, sm_89, sm_80
+    # Actually compile a tiny file with the B200 intrinsics to test support
+    test_code = '''\
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+__device__ float test() {
+    __nv_fp8_storage_t x = 0;
+    return __nv_cvt_fp8_to_float(x, __NV_E4M3);
+}
+'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "test.cu")
+        obj = os.path.join(tmpdir, "test.o")
+        with open(src, "w") as f:
+            f.write(test_code)
+
         for arch in ["sm_100a", "sm_90a", "sm_89", "sm_80"]:
-            test_result = subprocess.run(
-                [nvcc, "-arch=" + arch, "--dryrun", "-x", "cu", "/dev/null"],
-                capture_output=True, text=True,
-            )
-            if test_result.returncode == 0 or "error" not in test_result.stderr.lower():
-                return arch
-    except FileNotFoundError:
-        pass
-    return "sm_80"  # safe fallback
+            try:
+                result = subprocess.run(
+                    [nvcc, "-c", f"-arch={arch}", "-o", obj, src],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    return arch
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+    return "sm_80"
 
 
 def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
@@ -233,16 +245,16 @@ def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
                 return True, ""
             else:
                 err = result.stderr
-                # If header intrinsics fail, try again skipping the problematic
-                # headers by checking if error is ONLY from nvfp4_utils.cuh
                 err_lines = [l for l in err.split("\n") if "error" in l.lower()]
-                code_errors = [l for l in err_lines
-                               if "nvfp4_utils.cuh" not in l and "b200_intrinsics.cuh" not in l]
 
-                if not code_errors and err_lines:
-                    # All errors are from headers (CUDA version mismatch), not LLM code.
-                    # Re-try with syntax-only check using --dryrun or lower arch
-                    # to at least verify the LLM's code structure is valid.
+                # Check if errors come from the common headers (CUDA version issue)
+                header_errors = [l for l in err_lines
+                                 if "nvfp4_utils.cuh" in l or "b200_intrinsics.cuh" in l
+                                 or "__nv_cvt" in l or "__NV_E4M3" in l]
+
+                if header_errors:
+                    # Headers are incompatible with this CUDA version.
+                    # Fall back to stub compile to test the LLM's code itself.
                     return try_compile_syntax_only(cuda_code, kernel_type, nvcc, tmpdir)
 
                 return False, "\n".join(err_lines[:5]) if err_lines else err[:300]
