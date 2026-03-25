@@ -119,8 +119,7 @@ def build_strategy_menu(kernel_type: str) -> str:
 def build_prompt(kernel_src: str, kernel_type: str) -> str:
     menu = build_strategy_menu(kernel_type)
     return f"""\
-Analyze this CUDA kernel and select exactly 4 optimization strategies that would
-have the HIGHEST IMPACT for this specific kernel.
+You are a CUDA optimization expert. Select exactly 4 strategies for this kernel.
 
 Kernel type: {kernel_type}
 Target: NVIDIA B200 (Blackwell, sm_100a)
@@ -132,14 +131,16 @@ Target: NVIDIA B200 (Blackwell, sm_100a)
 Available strategies:
 {menu}
 
-Think about:
-1. What does this kernel actually do? (elementwise? reduction? multi-pass?)
-2. Where is it spending time? (memory loads? compute? synchronization?)
-3. Which strategies match the kernel's actual access pattern?
+RULES:
+- Pick only strategies marked "Applicable: YES"
+- Pick strategies that match what this kernel actually does
+- Do NOT explain your reasoning
+- Respond with ONLY a JSON array, nothing else
 
-Return ONLY a JSON array of exactly 4 strategy names, most impactful first:
-["strategy1", "strategy2", "strategy3", "strategy4"]
-"""
+Example response format:
+["strategy_a", "strategy_b", "strategy_c", "strategy_d"]
+
+Your response (JSON array only):"""
 
 
 def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
@@ -147,18 +148,24 @@ def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
     t0 = time.time()
     response = client.messages.create(
         model=model_id,
-        max_tokens=512,
+        max_tokens=256,
         temperature=0.2,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "["},  # prefill to force JSON
+        ],
     )
     latency = time.time() - t0
     text = response.content[0].text
     tokens_in = response.usage.input_tokens
     tokens_out = response.usage.output_tokens
 
+    # Reconstruct full response (prefill "[" + completion)
+    full_text = "[" + text
+
     # Parse JSON array from response
     parsed = []
-    json_match = re.search(r'\[.*?\]', text, re.DOTALL)
+    json_match = re.search(r'\[.*?\]', full_text, re.DOTALL)
     if json_match:
         try:
             raw = json.loads(json_match.group())
@@ -166,7 +173,7 @@ def call_llm(client: anthropic.Anthropic, prompt: str, model_id: str) -> tuple:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    return parsed, text, tokens_in, tokens_out, latency
+    return parsed, full_text, tokens_in, tokens_out, latency
 
 
 def score_picks(picks: list, expert: list) -> dict:
