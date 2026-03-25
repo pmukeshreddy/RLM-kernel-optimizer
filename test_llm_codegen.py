@@ -1,13 +1,13 @@
 """
-test_llm_codegen.py — Test if LLMs can write compilable, optimized CUDA kernels.
+test_llm_codegen.py — Test if LLMs can write compilable, correct CUDA kernels.
 
-For each kernel, asks the LLM to apply a specific optimization and tries to compile.
-Measures: compile pass rate, code extraction success, and latency.
+Measures: compile pass@1, correctness pass@1 (optional, requires GPU), and cost.
 
 Usage:
-    python3 test_llm_codegen.py --model sonnet
+    python3 test_llm_codegen.py --model sonnet              # compile-only
+    python3 test_llm_codegen.py --model sonnet --check       # compile + correctness (needs GPU)
     python3 test_llm_codegen.py --model all
-    python3 test_llm_codegen.py --model opus --kernel silu_mul   # single kernel
+    python3 test_llm_codegen.py --model opus --kernel silu_mul
 """
 
 import argparse
@@ -180,13 +180,8 @@ def extract_cuda_code(text: str) -> str:
 
 
 def detect_cuda_arch() -> str:
-    """Detect best available CUDA architecture by actually compiling a test file."""
-    ncu_path = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-    nvcc = os.path.join(ncu_path, "bin", "nvcc")
-    if not os.path.exists(nvcc):
-        nvcc = "nvcc"
-
-    # Actually compile a tiny file with the B200 intrinsics to test support
+    """Detect best CUDA arch that nvcc can compile (for compile-only tests)."""
+    nvcc = _find_nvcc()
     test_code = '''\
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -200,7 +195,6 @@ __device__ float test() {
         obj = os.path.join(tmpdir, "test.o")
         with open(src, "w") as f:
             f.write(test_code)
-
         for arch in ["sm_100a", "sm_90a", "sm_89", "sm_80"]:
             try:
                 result = subprocess.run(
@@ -211,68 +205,43 @@ __device__ float test() {
                     return arch
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
-
     return "sm_80"
 
 
-def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
-    """Try to compile CUDA code with nvcc. Returns (success, error_msg)."""
-    ncu_path = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-    nvcc = os.path.join(ncu_path, "bin", "nvcc")
-    if not os.path.exists(nvcc):
-        nvcc = "nvcc"  # hope it's on PATH
-
-    if arch is None:
-        arch = "sm_80"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_file = os.path.join(tmpdir, f"{kernel_type}_optimized.cu")
-        obj_file = os.path.join(tmpdir, f"{kernel_type}_optimized.o")
-
-        with open(src_file, "w") as f:
-            f.write(cuda_code)
-
-        try:
-            result = subprocess.run(
-                [nvcc, "-c", "-O3", "--std=c++17",
-                 f"-arch={arch}",
-                 f"-I{COMMON_DIR}",
-                 f"-I{PROJECT_ROOT / 'kernels' / 'reference'}",
-                 "-o", obj_file, src_file],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode == 0:
-                return True, ""
-            else:
-                err = result.stderr
-                err_lines = [l for l in err.split("\n") if "error" in l.lower()]
-
-                # Check if errors come from the common headers (CUDA version issue)
-                header_errors = [l for l in err_lines
-                                 if "nvfp4_utils.cuh" in l or "b200_intrinsics.cuh" in l
-                                 or "__nv_cvt" in l or "__NV_E4M3" in l]
-
-                if header_errors:
-                    # Headers are incompatible with this CUDA version.
-                    # Fall back to stub compile to test the LLM's code itself.
-                    return try_compile_syntax_only(cuda_code, kernel_type, nvcc, tmpdir)
-
-                return False, "\n".join(err_lines[:5]) if err_lines else err[:300]
-        except FileNotFoundError:
-            return False, "nvcc not found"
-        except subprocess.TimeoutExpired:
-            return False, "compilation timed out (60s)"
+def detect_gpu_arch() -> str:
+    """Detect actual GPU compute capability (for running kernels)."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            cap = result.stdout.strip().split("\n")[0].strip()
+            major, minor = cap.split(".")
+            return f"sm_{major}{minor}"
+    except Exception:
+        pass
+    return None
 
 
-def try_compile_syntax_only(cuda_code: str, kernel_type: str,
-                            nvcc: str, tmpdir: str) -> tuple:
-    """Fallback: replace only the unavailable FP8 intrinsics with stubs.
+def has_gpu() -> bool:
+    """Check if an NVIDIA GPU is available."""
+    try:
+        result = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
 
-    Provides complete function signatures from nvfp4_utils.cuh and
-    b200_intrinsics.cuh so the compiler verifies all call sites.
-    Only stubs the __nv_cvt_* functions that require CUDA 12.8+.
-    """
-    stub_nvfp4 = '''\
+
+def _find_nvcc() -> str:
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    return nvcc if os.path.exists(nvcc) else "nvcc"
+
+
+# ── Stub headers (for systems without CUDA 12.8+ / Blackwell) ────────────────
+
+STUB_NVFP4 = '''\
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -281,10 +250,33 @@ def try_compile_syntax_only(cuda_code: str, kernel_type: str,
 // === Stub: FP8 type and conversion (requires CUDA 12.8+) ===
 typedef unsigned char __nv_fp8_storage_t;
 __device__ __forceinline__ __nv_fp8_storage_t float_to_e4m3(float x) {
-    return static_cast<__nv_fp8_storage_t>(0);
+    // Minimal E4M3 stub: clamp to [0,448], encode sign+exponent+mantissa
+    unsigned int bits;
+    memcpy(&bits, &x, 4);
+    unsigned int sign = (bits >> 24) & 0x80;
+    float ax = fabsf(x);
+    if (ax < 1.95313e-03f) return sign;                   // zero / tiny
+    if (ax > 448.0f) return sign | 0x7E;                  // max normal
+    int exp = 0;
+    float m = frexpf(ax, &exp);                            // 0.5 <= m < 1.0
+    exp += 6;                                              // bias=7, frexp gives 2^(exp-1)
+    if (exp < 0) exp = 0;
+    if (exp > 15) exp = 15;
+    int mant = (int)((m * 2.0f - 1.0f) * 4.0f + 0.5f);   // 2-bit mantissa
+    if (mant > 3) mant = 3;
+    return (uint8_t)(sign | (exp << 2) | mant);
 }
 __device__ __forceinline__ float e4m3_to_float(__nv_fp8_storage_t x) {
-    return 0.0f;
+    unsigned int sign = (x & 0x80) ? 1 : 0;
+    unsigned int exp  = (x >> 2) & 0xF;
+    unsigned int mant = x & 0x3;
+    float val;
+    if (exp == 0) {
+        val = (mant / 4.0f) * powf(2.0f, -6.0f);         // subnormal
+    } else {
+        val = (1.0f + mant / 4.0f) * powf(2.0f, (float)exp - 7.0f);
+    }
+    return sign ? -val : val;
 }
 
 // === Real definitions (copied from nvfp4_utils.cuh) ===
@@ -386,7 +378,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 '''
 
-    stub_b200 = '''\
+STUB_B200 = '''\
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -454,18 +446,67 @@ __device__ __forceinline__ float load_streaming(const float* ptr) {
 __device__ __forceinline__ void prefetch_l2(const void* ptr) {}
 '''
 
-    # Write stub headers
+
+def write_stub_headers(parent_dir: str):
+    """Write stub nvfp4_utils.cuh and b200_intrinsics.cuh under parent_dir/common/."""
+    common = os.path.join(parent_dir, "common")
+    os.makedirs(common, exist_ok=True)
+    with open(os.path.join(common, "nvfp4_utils.cuh"), "w") as f:
+        f.write(STUB_NVFP4)
+    with open(os.path.join(common, "b200_intrinsics.cuh"), "w") as f:
+        f.write(STUB_B200)
+
+
+# ── Compilation ──────────────────────────────────────────────────────────────
+
+def try_compile(cuda_code: str, kernel_type: str, arch: str = None) -> tuple:
+    """Try to compile CUDA code with nvcc. Returns (success, error_msg)."""
+    nvcc = _find_nvcc()
+    if arch is None:
+        arch = "sm_80"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_file = os.path.join(tmpdir, f"{kernel_type}_optimized.cu")
+        obj_file = os.path.join(tmpdir, f"{kernel_type}_optimized.o")
+
+        with open(src_file, "w") as f:
+            f.write(cuda_code)
+
+        try:
+            result = subprocess.run(
+                [nvcc, "-c", "-O3", "--std=c++17",
+                 f"-arch={arch}",
+                 f"-I{COMMON_DIR}",
+                 f"-I{COMMON_DIR.parent}",
+                 "-o", obj_file, src_file],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                return True, ""
+            else:
+                err = result.stderr
+                err_lines = [l for l in err.split("\n") if "error" in l.lower()]
+
+                header_errors = [l for l in err_lines
+                                 if "nvfp4_utils.cuh" in l or "b200_intrinsics.cuh" in l
+                                 or "__nv_cvt" in l or "__NV_E4M3" in l]
+
+                if header_errors:
+                    return try_compile_syntax_only(cuda_code, kernel_type, nvcc, tmpdir)
+
+                return False, "\n".join(err_lines[:5]) if err_lines else err[:300]
+        except FileNotFoundError:
+            return False, "nvcc not found"
+        except subprocess.TimeoutExpired:
+            return False, "compilation timed out (60s)"
+
+
+def try_compile_syntax_only(cuda_code: str, kernel_type: str,
+                            nvcc: str, tmpdir: str) -> tuple:
+    """Fallback: compile with stub headers when native FP8 intrinsics unavailable."""
     stub_dir = os.path.join(tmpdir, "stubs")
-    os.makedirs(stub_dir, exist_ok=True)
-    common_stub = os.path.join(stub_dir, "common")
-    os.makedirs(common_stub, exist_ok=True)
+    write_stub_headers(stub_dir)
 
-    with open(os.path.join(common_stub, "nvfp4_utils.cuh"), "w") as f:
-        f.write(stub_nvfp4)
-    with open(os.path.join(common_stub, "b200_intrinsics.cuh"), "w") as f:
-        f.write(stub_b200)
-
-    # Rewrite includes to use stubs
     modified = cuda_code.replace('../common/', 'common/')
 
     src_file = os.path.join(tmpdir, f"{kernel_type}_stub.cu")
@@ -476,7 +517,7 @@ __device__ __forceinline__ void prefetch_l2(const void* ptr) {}
     try:
         result = subprocess.run(
             [nvcc, "-c", "-O3", "--std=c++17",
-             "-arch=sm_80",  # use widely available arch for stub compile
+             "-arch=sm_80",
              f"-I{stub_dir}",
              "-o", obj_file, src_file],
             capture_output=True, text=True, timeout=60,
@@ -490,6 +531,324 @@ __device__ __forceinline__ void prefetch_l2(const void* ptr) {}
     except Exception as e:
         return False, str(e)
 
+
+# ── Correctness testing (requires GPU) ───────────────────────────────────────
+
+HARNESS_ADD_RMSNORM = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int rows = 4, hidden = 64;
+    const int N = rows * hidden;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_in  = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_res = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_wt  = new __nv_bfloat16[hidden];
+    for (int i = 0; i < N; i++) {
+        h_in[i]  = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+        h_res[i] = __float2bfloat16(0.01f * ((i * 13 + 7) % 200) - 1.0f);
+    }
+    for (int i = 0; i < hidden; i++)
+        h_wt[i] = __float2bfloat16(0.5f + 0.01f * (i % 50));
+
+    __nv_bfloat16 *d_in, *d_res, *d_wt, *d_resout;
+    uint8_t *d_qout;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_in,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_res,    N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_wt,     hidden * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_resout, N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_qout,   packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_in,  h_in,  N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_res, h_res, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_wt,  h_wt,  hidden * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_qout,   0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+    cudaMemset(d_resout, 0, N * sizeof(__nv_bfloat16));
+
+    launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_wt, d_resout, d_qout, d_scales,
+                                    rows, hidden, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t  *h_qout   = new uint8_t[packed_bytes];
+    uint8_t  *h_scales = new uint8_t[num_qblocks];
+    uint16_t *h_resout = new uint16_t[N];
+    cudaMemcpy(h_qout,   d_qout,   packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales,  num_qblocks, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_resout, d_resout,  N * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_qout[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\nRESOUT:");
+    for (int i = 0; i < N; i++) printf("%04x", h_resout[i]);
+    printf("\\n");
+
+    delete[] h_in; delete[] h_res; delete[] h_wt;
+    delete[] h_qout; delete[] h_scales; delete[] h_resout;
+    cudaFree(d_in); cudaFree(d_res); cudaFree(d_wt);
+    cudaFree(d_resout); cudaFree(d_qout); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESS_SILU_MUL = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int N = 256;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_gate = new __nv_bfloat16[N];
+    __nv_bfloat16 *h_up   = new __nv_bfloat16[N];
+    for (int i = 0; i < N; i++) {
+        h_gate[i] = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+        h_up[i]   = __float2bfloat16(0.01f * ((i * 11 + 5) % 200) - 1.0f);
+    }
+
+    __nv_bfloat16 *d_gate, *d_up;
+    uint8_t *d_qout;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_gate,   N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_up,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_qout,   packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_gate, h_gate, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up,   h_up,   N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_qout,   0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+
+    launch_silu_mul_fp4quant(d_gate, d_up, d_qout, d_scales, N, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t *h_qout  = new uint8_t[packed_bytes];
+    uint8_t *h_scales = new uint8_t[num_qblocks];
+    cudaMemcpy(h_qout,  d_qout,  packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales, num_qblocks, cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_qout[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\n");
+
+    delete[] h_gate; delete[] h_up;
+    delete[] h_qout; delete[] h_scales;
+    cudaFree(d_gate); cudaFree(d_up); cudaFree(d_qout); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESS_NVFP4_QUANTIZE = '''
+// === Correctness test harness ===
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    const int N = 256;
+    const int num_qblocks = N / 16;
+    const int packed_bytes = N / 2;
+
+    __nv_bfloat16 *h_in = new __nv_bfloat16[N];
+    for (int i = 0; i < N; i++)
+        h_in[i] = __float2bfloat16(0.01f * ((i * 7 + 3) % 200) - 1.0f);
+
+    __nv_bfloat16 *d_in;
+    uint8_t *d_packed;
+    __nv_fp8_storage_t *d_scales;
+    cudaMalloc(&d_in,     N * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_packed, packed_bytes);
+    cudaMalloc(&d_scales, num_qblocks * sizeof(__nv_fp8_storage_t));
+
+    cudaMemcpy(d_in, h_in, N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemset(d_packed, 0, packed_bytes);
+    cudaMemset(d_scales, 0, num_qblocks);
+
+    launch_nvfp4_quantize_bf16(d_in, d_packed, d_scales, N, (cudaStream_t)0);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error: %s\\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    uint8_t *h_packed = new uint8_t[packed_bytes];
+    uint8_t *h_scales = new uint8_t[num_qblocks];
+    cudaMemcpy(h_packed, d_packed, packed_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_scales, d_scales, num_qblocks, cudaMemcpyDeviceToHost);
+
+    printf("QOUT:");
+    for (int i = 0; i < packed_bytes; i++) printf("%02x", h_packed[i]);
+    printf("\\nSCALES:");
+    for (int i = 0; i < num_qblocks; i++) printf("%02x", h_scales[i]);
+    printf("\\n");
+
+    delete[] h_in;
+    delete[] h_packed; delete[] h_scales;
+    cudaFree(d_in); cudaFree(d_packed); cudaFree(d_scales);
+    return 0;
+}
+'''
+
+HARNESSES = {
+    "add_rmsnorm":    HARNESS_ADD_RMSNORM,
+    "silu_mul":       HARNESS_SILU_MUL,
+    "nvfp4_quantize": HARNESS_NVFP4_QUANTIZE,
+}
+
+
+def compile_and_run_kernel(kernel_code: str, harness: str, kernel_type: str,
+                           tag: str, nvcc: str, gpu_arch: str,
+                           include_dir: str, tmpdir: str) -> tuple:
+    """Compile kernel + test harness into executable, run it, return (stdout, err)."""
+    modified = kernel_code.replace('../common/', 'common/')
+    full_code = modified + "\n" + harness
+
+    src_file = os.path.join(tmpdir, f"{kernel_type}_{tag}.cu")
+    exe_file = os.path.join(tmpdir, f"{kernel_type}_{tag}")
+
+    with open(src_file, "w") as f:
+        f.write(full_code)
+
+    try:
+        result = subprocess.run(
+            [nvcc, "-O2", "--std=c++17", f"-arch={gpu_arch}",
+             f"-I{include_dir}",
+             f"-I{os.path.join(include_dir, 'common')}",
+             "-o", exe_file, src_file],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            err = result.stderr
+            err_lines = [l for l in err.split("\n") if "error" in l.lower()]
+            return None, "\n".join(err_lines[:3]) if err_lines else err[:200]
+    except Exception as e:
+        return None, str(e)
+
+    try:
+        result = subprocess.run(
+            [exe_file], capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None, f"runtime error: {result.stderr[:200]}"
+        return result.stdout, ""
+    except Exception as e:
+        return None, str(e)
+
+
+def compare_outputs(ref_stdout: str, opt_stdout: str) -> tuple:
+    """Compare hex outputs from reference and optimized kernels.
+    Returns (is_correct, detail_msg)."""
+    def parse_hex_lines(text):
+        lines = {}
+        for line in text.strip().split("\n"):
+            if ":" in line:
+                tag, hex_data = line.split(":", 1)
+                lines[tag.strip()] = hex_data.strip()
+        return lines
+
+    ref_lines = parse_hex_lines(ref_stdout)
+    opt_lines = parse_hex_lines(opt_stdout)
+
+    if not ref_lines:
+        return False, "no reference output"
+    if not opt_lines:
+        return False, "no optimized output"
+
+    total_bytes = 0
+    mismatches = 0
+
+    for tag in ref_lines:
+        if tag not in opt_lines:
+            return False, f"missing output: {tag}"
+        ref_hex = ref_lines[tag]
+        opt_hex = opt_lines[tag]
+        if len(ref_hex) != len(opt_hex):
+            return False, f"{tag} size mismatch: ref={len(ref_hex)//2}B opt={len(opt_hex)//2}B"
+
+        for i in range(0, len(ref_hex), 2):
+            total_bytes += 1
+            if ref_hex[i:i+2] != opt_hex[i:i+2]:
+                mismatches += 1
+
+    if total_bytes == 0:
+        return False, "no output bytes"
+
+    mismatch_pct = mismatches / total_bytes * 100
+    if mismatch_pct == 0:
+        return True, ""
+    elif mismatch_pct <= 5:
+        return True, f"~{mismatch_pct:.1f}% byte diff (FP rounding)"
+    else:
+        return False, f"{mismatch_pct:.1f}% mismatch ({mismatches}/{total_bytes} bytes)"
+
+
+def check_correctness(cuda_code: str, kernel_type: str, nvcc: str) -> tuple:
+    """Run both reference and optimized kernels on GPU, compare outputs.
+    Returns (is_correct: bool|None, detail_msg: str).
+    None means correctness couldn't be tested (reference failed etc.)."""
+    gpu_arch = detect_gpu_arch()
+    if not gpu_arch:
+        return None, "no GPU detected"
+
+    ref_raw = KERNELS[kernel_type].read_text()
+    harness = HARNESSES[kernel_type]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Try native compilation first (real headers)
+        native_include = str(COMMON_DIR.parent)
+        ref_out, ref_err = compile_and_run_kernel(
+            ref_raw, harness, kernel_type, "ref",
+            nvcc, gpu_arch, native_include, tmpdir)
+
+        if ref_out is None:
+            # Native failed — fall back to stubs
+            stub_dir = os.path.join(tmpdir, "stubs")
+            write_stub_headers(stub_dir)
+            ref_out, ref_err = compile_and_run_kernel(
+                ref_raw, harness, kernel_type, "ref_stub",
+                nvcc, "sm_80", stub_dir, tmpdir)
+            if ref_out is None:
+                return None, f"reference failed: {ref_err}"
+            # Use stubs for optimized too
+            include_dir = stub_dir
+            arch = "sm_80"
+        else:
+            include_dir = native_include
+            arch = gpu_arch
+
+        opt_out, opt_err = compile_and_run_kernel(
+            cuda_code, harness, kernel_type, "opt",
+            nvcc, arch, include_dir, tmpdir)
+
+        if opt_out is None:
+            return False, f"run failed: {opt_err}"
+
+        return compare_outputs(ref_out, opt_out)
+
+
+# ── Prompt ───────────────────────────────────────────────────────────────────
 
 def build_codegen_prompt(kernel_src_expanded: str, task: dict) -> str:
     """Build a prompt asking the LLM to apply a specific optimization."""
@@ -524,19 +883,32 @@ CRITICAL RULES:
 # ── Main test ─────────────────────────────────────────────────────────────────
 
 def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
-             kernel_filter: str = None):
+             kernel_filter: str = None, check: bool = False):
     print(f"\n{'='*70}")
-    print(f"  CODEGEN TEST | MODEL: {model_name}")
+    print(f"  CODEGEN TEST | MODEL: {model_name}" +
+          (" | CORRECTNESS CHECK" if check else ""))
     print(f"{'='*70}")
 
     arch = detect_cuda_arch()
     print(f"  CUDA arch: {arch}")
+
+    nvcc = _find_nvcc()
+
+    if check:
+        gpu_arch = detect_gpu_arch()
+        if gpu_arch:
+            print(f"  GPU arch:  {gpu_arch}")
+        else:
+            print(f"  GPU:       not detected — correctness checks will be skipped")
+            check = False
 
     price = PRICING.get(model_name, {"in": 3.0, "out": 15.0})
     total_cost = 0.0
     total_tasks = 0
     extract_pass = 0
     compile_pass = 0
+    correct_pass = 0
+    correct_tested = 0
     results = []
 
     for kernel_type, tasks in TASKS.items():
@@ -547,7 +919,7 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
         kernel_src_raw = src_path.read_text()
         kernel_src_expanded = expand_includes(kernel_src_raw, src_path)
 
-        print(f"\n  ── {kernel_type} ──")
+        print(f"\n  -- {kernel_type} --")
 
         for task in tasks:
             total_tasks += 1
@@ -575,29 +947,50 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
 
             # Try compile
             compiled = False
-            err_msg = ""
+            compile_err = ""
             if has_code:
-                compiled, err_msg = try_compile(code, kernel_type, arch)
+                compiled, compile_err = try_compile(code, kernel_type, arch)
                 if compiled:
                     compile_pass += 1
 
-            # Status
+            # Correctness check
+            correct = None
+            correct_msg = ""
+            if check and compiled and has_code:
+                correct_tested += 1
+                correct, correct_msg = check_correctness(code, kernel_type, nvcc)
+                if correct:
+                    correct_pass += 1
+
+            # Build status string
             if compiled:
-                if "stub" in err_msg:
-                    status = "COMPILE OK*"  # stub compile (header intrinsics unavailable)
-                else:
-                    status = "COMPILE OK"
+                status = "COMPILE OK"
             elif has_code:
                 status = "COMPILE FAIL"
             else:
                 status = "NO CODE"
 
-            print(f"    {task['name']:30s}  {status:15s}  "
-                  f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
-            if err_msg and not compiled:
-                for err_line in err_msg.split("\n")[:3]:
+            if check:
+                if correct is True:
+                    corr_str = "CORRECT" + ("*" if correct_msg else "")
+                elif correct is False:
+                    corr_str = "WRONG"
+                elif compiled:
+                    corr_str = "SKIP"
+                else:
+                    corr_str = ""
+                print(f"    {task['name']:25s}  {status:14s}  {corr_str:10s}  "
+                      f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
+            else:
+                print(f"    {task['name']:25s}  {status:14s}  "
+                      f"tok={tok_out:4d}  ${cost:.4f}  {latency:.1f}s")
+
+            if compile_err and not compiled:
+                for err_line in compile_err.split("\n")[:3]:
                     if err_line.strip():
                         print(f"      err: {err_line.strip()[:120]}")
+            if correct_msg:
+                print(f"      {correct_msg[:120]}")
 
             results.append({
                 "kernel": kernel_type,
@@ -605,10 +998,12 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
                 "model": model_name,
                 "extracted": has_code,
                 "compiled": compiled,
+                "correct": correct,
                 "tokens_out": tok_out,
                 "cost": cost,
                 "latency": latency,
-                "error": err_msg[:200] if err_msg else "",
+                "compile_error": compile_err[:200] if compile_err else "",
+                "correct_msg": correct_msg[:200] if correct_msg else "",
             })
 
     # Summary
@@ -617,6 +1012,12 @@ def run_test(client: anthropic.Anthropic, model_name: str, model_id: str,
           f"({extract_pass/total_tasks*100:.0f}%)")
     print(f"  COMPILE PASS@1:   {compile_pass}/{total_tasks} "
           f"({compile_pass/total_tasks*100:.0f}%)")
+    if check:
+        if correct_tested > 0:
+            print(f"  CORRECT PASS@1:   {correct_pass}/{correct_tested} "
+                  f"({correct_pass/correct_tested*100:.0f}%)")
+        else:
+            print(f"  CORRECT PASS@1:   no kernels compiled to test")
     print(f"  TOTAL COST:       ${total_cost:.4f}")
     print(f"  {'─'*50}")
 
@@ -630,14 +1031,21 @@ def main():
     parser.add_argument("--kernel", default=None,
                         choices=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
                         help="Test only one kernel type")
+    parser.add_argument("--check", action="store_true",
+                        help="Run correctness check on GPU (requires NVIDIA GPU)")
     args = parser.parse_args()
+
+    if args.check and not has_gpu():
+        print("WARNING: --check requires an NVIDIA GPU. No GPU detected.")
+        print("         Running compile-only mode.\n")
+        args.check = False
 
     client = anthropic.Anthropic()
     all_results = []
 
     if args.model == "all":
         for name, model_id in MODELS.items():
-            results = run_test(client, name, model_id, args.kernel)
+            results = run_test(client, name, model_id, args.kernel, args.check)
             all_results.extend(results)
 
         # Comparison
@@ -649,11 +1057,17 @@ def main():
             compiled = sum(1 for r in mine if r["compiled"])
             total = len(mine)
             cost = sum(r["cost"] for r in mine)
-            print(f"  {name:8s}  compile={compiled}/{total} "
-                  f"({compiled/total*100:.0f}%)  cost=${cost:.4f}")
+            line = f"  {name:8s}  compile={compiled}/{total} ({compiled/total*100:.0f}%)"
+            if args.check:
+                tested = [r for r in mine if r["correct"] is not None]
+                correct = sum(1 for r in tested if r["correct"])
+                if tested:
+                    line += f"  correct={correct}/{len(tested)} ({correct/len(tested)*100:.0f}%)"
+            line += f"  cost=${cost:.4f}"
+            print(line)
     else:
         model_id = MODELS[args.model]
-        run_test(client, args.model, model_id, args.kernel)
+        run_test(client, args.model, model_id, args.kernel, args.check)
 
 
 if __name__ == "__main__":
