@@ -355,6 +355,15 @@ CRITICAL RULES:
 4. Do NOT change the launch_* function signature
 5. Output must match reference within atol=1e-2
 6. No explanations — just the code block
+7. Do NOT invent or call helper functions that don't exist in the expanded headers above.
+   You may ONLY call functions you can see defined in the code above.
+   For vectorized loads, use raw CUDA casts like:
+     uint4 vec = *reinterpret_cast<const uint4*>(&ptr[idx]);
+     __nv_bfloat16 vals[8];
+     memcpy(vals, &vec, sizeof(uint4));
+   Do NOT call load_bf16x8, load_vectorized, or any other invented function.
+8. For vectorized stores, use raw casts like:
+     *reinterpret_cast<uint2*>(&out[idx]) = packed_val;
 """
 
 
