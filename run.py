@@ -142,7 +142,19 @@ def optimize_kernel(
         best.code = src_path.read_text()
 
     benchmarker = Benchmarker(env.search_config, kernel_type=kernel_type)
-    baseline_per_shape = {shape: baseline for shape in env.problem_shapes}
+
+    # Measure actual baseline on current hardware instead of using hardcoded values
+    ref_src = src_path.read_text()
+    baseline_per_shape = {}
+    for s in env.problem_shapes:
+        measured = benchmarker._compile_and_time(ref_src, s)
+        if measured is not None:
+            baseline_per_shape[s] = measured
+            logger.info("Measured baseline for %s: %.2f us (hardcoded: %.2f us)", s, measured, baseline)
+        else:
+            baseline_per_shape[s] = baseline
+            logger.warning("Baseline measurement failed for %s, using hardcoded %.2f us", s, baseline)
+
     bench_results = benchmarker.benchmark(best.code, baseline_per_shape)
 
     submission = format_submission(
