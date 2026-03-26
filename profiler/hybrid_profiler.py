@@ -3,10 +3,11 @@ hybrid_profiler.py — Fallback profiler using CUDA Events + Occupancy API + Ana
 Used when NCU is unavailable (permission denied, missing importer, etc.).
 
 Combines 4 sources to approximate all 24 KernelMetrics fields:
-  1. CUDA Event timing  → duration_us, speedup
-  2. Analytical math     → mem_throughput_pct, compute_throughput_pct, dram_bytes, bandwidth
-  3. CUDA Occupancy API  → sm_occupancy, achieved_occupancy (via compiled query program)
-  4. Source-level analysis → stall estimates, instruction estimates, cycle counts
+  1. CUDA Event timing   → duration_us, speedup
+  2. Analytical math      → mem_throughput_pct, compute_throughput_pct, dram_bytes, bandwidth
+  3. CUDA Occupancy API   → sm_occupancy, achieved_occupancy (via compiled query program)
+  4. Source-level analysis → adjusts bytes/FLOPs based on actual kernel patterns,
+                             differentiates stall profiles per implementation
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import math
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -24,46 +26,172 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+# ── Source Pattern Analysis ────────────────────────────────────────────────
+
+@dataclass
+class SourceProfile:
+    """Extracted source-level features that differentiate kernel implementations."""
+    # Memory patterns
+    vectorized_loads: int = 0       # float4/uint4/int4/bf16x8 loads
+    vectorized_stores: int = 0      # float4/uint4/int4 stores
+    scalar_loads: int = 0           # scalar global reads
+    scalar_stores: int = 0          # scalar global writes
+    ldg_hints: int = 0              # __ldg() read-only cache hints
+    smem_declarations: int = 0      # __shared__ declarations
+    smem_total_bytes: int = 0       # estimated shared memory usage
+    smem_reads: int = 0             # reads from shared memory arrays
+    smem_writes: int = 0            # writes to shared memory arrays
+    cp_async: int = 0               # cp.async prefetch instructions
+    tma_ops: int = 0                # TMA load/store operations
+
+    # Compute patterns
+    syncthreads: int = 0            # __syncthreads()
+    syncwarp: int = 0               # __syncwarp()
+    shfl_ops: int = 0               # __shfl_* warp shuffles
+    pragma_unroll: int = 0          # #pragma unroll
+    fast_math: int = 0              # __expf, __rsqrtf, __fmaf_rn, etc.
+    fma_ops: int = 0                # fused multiply-add patterns
+    reduction_ops: int = 0          # warp-level reductions
+
+    # Structure
+    num_global_funcs: int = 0       # __global__ functions
+    num_device_funcs: int = 0       # __device__ functions
+    total_lines: int = 0            # source lines (complexity proxy)
+    loop_count: int = 0             # for/while loops
+    branch_count: int = 0           # if/else branches
+
+    @property
+    def has_vectorized_access(self) -> bool:
+        return self.vectorized_loads > 0 or self.vectorized_stores > 0
+
+    @property
+    def has_smem_caching(self) -> bool:
+        return self.smem_declarations > 0 and self.smem_reads > 0
+
+    @property
+    def has_prefetch(self) -> bool:
+        return self.cp_async > 0 or self.tma_ops > 0
+
+    @property
+    def has_warp_level_ops(self) -> bool:
+        return self.shfl_ops > 0 or self.reduction_ops > 0
+
+    @property
+    def sync_density(self) -> float:
+        """Synchronization points per 100 lines of code."""
+        total_syncs = self.syncthreads + self.syncwarp
+        return (total_syncs / max(self.total_lines, 1)) * 100
+
+
+def analyze_source(src: str) -> SourceProfile:
+    """Extract source-level features from kernel CUDA code."""
+    p = SourceProfile()
+
+    # Memory patterns
+    p.vectorized_loads = len(re.findall(
+        r'(?:float4|uint4|int4|ulonglong2|uint2)\s+\w+\s*=\s*\*?\s*(?:reinterpret_cast|__ldg|\()',
+        src)) + src.count("load_bf16x8") + src.count("load_128") + len(re.findall(
+        r'\*\s*reinterpret_cast\s*<\s*(?:float4|uint4|int4|ulonglong2)\s*\*\s*>', src))
+    p.vectorized_stores = len(re.findall(
+        r'\*\s*reinterpret_cast\s*<\s*(?:float4|uint4|int4|ulonglong2)\s*\*\s*>\s*\(', src
+    )) + src.count("store_bf16x8") + src.count("store_128")
+    p.scalar_loads = len(re.findall(r'\w+\s*\[\s*\w+\s*\]', src))  # rough count
+    p.scalar_stores = len(re.findall(r'\w+\s*\[\s*\w+\s*\]\s*=', src))
+    p.ldg_hints = src.count("__ldg")
+    p.cp_async = src.count("cp.async") + src.count("cp_async")
+    p.tma_ops = src.count("tma_load") + src.count("tma_store") + src.count("tcgen05")
+
+    # Shared memory
+    p.smem_declarations = src.count("__shared__")
+    p.smem_total_bytes = _estimate_shared_memory(src)
+    # Count reads/writes to known smem variable patterns
+    smem_vars = re.findall(r'__shared__\s+\w+\s+(\w+)\s*\[', src)
+    for var in smem_vars:
+        p.smem_reads += len(re.findall(rf'\b{var}\s*\[', src)) - 1  # -1 for declaration
+        p.smem_writes += len(re.findall(rf'\b{var}\s*\[.*\]\s*=', src))
+
+    # Compute patterns
+    p.syncthreads = src.count("__syncthreads")
+    p.syncwarp = src.count("__syncwarp")
+    p.shfl_ops = len(re.findall(r'__shfl_\w+', src))
+    p.pragma_unroll = src.count("#pragma unroll")
+    p.fast_math = len(re.findall(
+        r'__(?:expf|logf|rsqrtf|sqrtf|fmaf_rn|fdividef|powf|sinf|cosf)\s*\(', src))
+    p.fma_ops = len(re.findall(r'(?:__fmaf_rn|fmaf|__fmul_rn)\s*\(', src))
+    p.reduction_ops = len(re.findall(
+        r'(?:__reduce_\w+|warpReduceSum|warpReduce|blockReduce)\s*[(<]', src))
+
+    # Structure
+    p.num_global_funcs = len(re.findall(r'__global__\s+void\s+\w+', src))
+    p.num_device_funcs = len(re.findall(r'__device__\s+(?:void|float|int|__nv_bfloat16)\s+\w+', src))
+    p.total_lines = len(src.splitlines())
+    p.loop_count = len(re.findall(r'\b(?:for|while)\s*\(', src))
+    p.branch_count = len(re.findall(r'\bif\s*\(', src))
+
+    return p
+
+
+def _estimate_shared_memory(kernel_src: str) -> int:
+    """Estimate shared memory usage from __shared__ declarations."""
+    total = 0
+    type_sizes = {
+        "float": 4, "double": 8, "int": 4, "unsigned": 4,
+        "half": 2, "__half": 2, "__nv_bfloat16": 2,
+        "float4": 16, "float2": 8, "int4": 16,
+        "char": 1, "uint8_t": 1, "int8_t": 1,
+        "uint32_t": 4, "int32_t": 4, "uint16_t": 2,
+    }
+    for m in re.finditer(r'__shared__\s+(\w+)\s+\w+\[([^\]]+)\]', kernel_src):
+        dtype, size_expr = m.group(1), m.group(2).strip()
+        elem_size = type_sizes.get(dtype, 4)
+        try:
+            total += int(size_expr) * elem_size
+        except ValueError:
+            total += 1024 * elem_size
+    if "extern __shared__" in kernel_src:
+        total = max(total, 4096)
+    return total
+
+
+# ── Main Profiler Class ───────────────────────────────────────────────────
+
 class HybridProfiler:
     """
     Computes kernel metrics without NCU hardware counters.
     Drop-in replacement for NCURunner.profile() when permissions are blocked.
+
+    Uses source-level analysis to differentiate kernel implementations:
+    different kernels for the same problem get DIFFERENT metrics based on
+    their actual code patterns (vectorization, shared memory, syncs, etc.)
     """
 
     def __init__(self, config: dict, hw_spec: dict):
         self.config = config
         self.hw_spec = hw_spec
 
-        # Hardware peaks from spec
-        # Use achievable peaks (75% of theoretical) for realistic percentages.
-        # Theoretical peaks are rarely hit; achievable peaks give metrics
-        # comparable to what NCU reports.
         mem = hw_spec.get("memory", {})
         comp = hw_spec.get("compute", {})
         sm = hw_spec.get("sm", {})
 
-        achievable_ratio = 0.75  # typical achievable fraction of theoretical peak
+        # Use achievable peaks (75% of theoretical) for realistic percentages
+        achievable_ratio = 0.75
         self.peak_mem_bw_bytes_per_sec = mem.get("hbm_bandwidth_tbs", 8.0) * 1e12 * achievable_ratio
         self.peak_fp32_flops = comp.get("fp32_tflops", 67.0) * 1e12 * achievable_ratio
         self.peak_fp16_flops = comp.get("fp16_tflops", 134.0) * 1e12 * achievable_ratio
-        self.sm_count = sm.get("count", 142)
+        self.sm_count = sm.get("count", 148)
         self.max_warps_per_sm = sm.get("max_warps_per_sm", 64)
         self.max_blocks_per_sm = sm.get("max_blocks_per_sm", 32)
         self.warp_size = sm.get("warp_size", 32)
         self.max_threads_per_sm = sm.get("max_threads_per_sm", 2048)
         self.shared_mem_per_sm = mem.get("shared_memory_per_sm_kb", 228) * 1024
-        self.l2_cache_bytes = mem.get("l2_cache_mb", 96) * 1024 * 1024
+        self.l2_cache_bytes = mem.get("l2_cache_mb", 126) * 1024 * 1024
 
-        # Compilation settings (for occupancy query program)
         self.nvcc = "nvcc"
         self.cuda_arch = "sm_100a"
         self.nvcc_flags = [
             "-O3", f"-arch={self.cuda_arch}", "--use_fast_math", "-std=c++17",
             f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
         ]
-
-        # Cache device properties (queried once)
-        self._device_props_cache: Optional[dict] = None
 
     # ── Main Entry Point ───────────────────────────────────────────────────
 
@@ -75,62 +203,67 @@ class HybridProfiler:
         problem_shape: tuple,
         baseline_us: float = 0.0,
     ) -> Optional[KernelMetrics]:
-        """
-        Compute hybrid metrics from timing + analytical + source analysis.
-        Returns a fully-populated KernelMetrics.
-        """
         if timing_us <= 0:
             return None
 
         timing_sec = timing_us / 1e6
 
-        # ── 1. Analytical: data movement ──────────────────────────────────
-        read_bytes, write_bytes = self._compute_data_movement(kernel_type, problem_shape)
-        total_bytes = read_bytes + write_bytes
+        # ── 0. Analyze source patterns ────────────────────────────────────
+        sp = analyze_source(kernel_src)
 
-        # ── 2. Analytical: FLOPs ──────────────────────────────────────────
-        total_flops = self._estimate_flops(kernel_type, problem_shape)
+        # ── 1. Source-adjusted data movement ──────────────────────────────
+        base_read, base_write = self._compute_data_movement(kernel_type, problem_shape)
+        mem_eff = self._memory_efficiency_factor(sp)
+        effective_read = base_read * mem_eff
+        effective_write = base_write * mem_eff
+        total_bytes = effective_read + effective_write
+
+        # ── 2. Source-adjusted FLOPs ──────────────────────────────────────
+        base_flops = self._estimate_flops(kernel_type, problem_shape)
+        compute_eff = self._compute_efficiency_factor(sp)
+        effective_flops = base_flops * compute_eff
 
         # ── 3. Bandwidth & throughput percentages ─────────────────────────
         achieved_bw = total_bytes / timing_sec
         mem_throughput_pct = min(100.0, (achieved_bw / self.peak_mem_bw_bytes_per_sec) * 100)
 
-        achieved_flops = total_flops / timing_sec
-        compute_throughput_pct = min(100.0, (achieved_flops / self.peak_fp32_flops) * 100)
+        achieved_flops_rate = effective_flops / timing_sec
+        compute_throughput_pct = min(100.0, (achieved_flops_rate / self.peak_fp32_flops) * 100)
         fp32_throughput_pct = compute_throughput_pct
 
-        dram_read_bw_gbps = read_bytes / timing_sec / 1e9
+        dram_read_bw_gbps = effective_read / timing_sec / 1e9
 
-        # ── 4. Occupancy (CUDA API or analytical) ─────────────────────────
+        # ── 4. Occupancy (CUDA API with actual register pressure) ─────────
         block_size, shared_mem = self._parse_launch_config(kernel_src)
         gpu_occupancy = self._query_occupancy_from_binary(kernel_src, block_size, shared_mem)
         if gpu_occupancy is None:
             gpu_occupancy = self._compute_theoretical_occupancy(block_size, shared_mem)
 
-        # ── 5. Stall estimates ────────────────────────────────────────────
+        # ── 5. Source-differentiated stall estimates ──────────────────────
         stall_memory, stall_barrier, stall_no_inst, stall_mio = self._estimate_stalls(
-            kernel_src, mem_throughput_pct, compute_throughput_pct, gpu_occupancy
+            sp, mem_throughput_pct, compute_throughput_pct, gpu_occupancy
         )
 
-        # ── 6. Instruction estimates ──────────────────────────────────────
+        # ── 6. Source-adjusted instruction estimates ──────────────────────
         inst_load, inst_store, inst_fp32, inst_fp16 = self._estimate_instructions(
-            kernel_type, problem_shape
+            kernel_type, problem_shape, sp
         )
         inst_executed = inst_load + inst_store + inst_fp32 + inst_fp16
 
         # ── 7. Cycle estimates ────────────────────────────────────────────
-        sm_clock_ghz = 2.1  # approximate B200 boost clock
+        sm_clock_ghz = 2.1
         elapsed_cycles = timing_us * 1e-6 * sm_clock_ghz * 1e9 * self.sm_count
         active_cycles = elapsed_cycles * gpu_occupancy / 100.0
 
-        # ── 8. L2 cache estimates ─────────────────────────────────────────
-        l2_hit_rate = self._estimate_l2_hit_rate(total_bytes, timing_sec)
-        l2_sector_size = 32  # bytes per L2 sector
-        l2_read_sectors = read_bytes / l2_sector_size
-        l2_write_sectors = write_bytes / l2_sector_size
+        # ── 8. L2 cache estimates (source-aware) ─────────────────────────
+        l2_hit_rate = self._estimate_l2_hit_rate(sp, base_read + base_write, total_bytes, timing_sec)
+        l2_sector_size = 32
+        l2_read_sectors = effective_read / l2_sector_size
+        l2_write_sectors = effective_write / l2_sector_size
 
-        # L1/L2 throughput: proportional to memory throughput
-        l1_throughput_pct = min(100.0, mem_throughput_pct * 1.2)
+        # L1/L2 throughput: adjusted by access patterns
+        l1_boost = 1.3 if sp.has_smem_caching else 1.1
+        l1_throughput_pct = min(100.0, mem_throughput_pct * l1_boost)
         l2_throughput_pct = min(100.0, mem_throughput_pct * 1.1)
 
         # ── 9. Speedup ───────────────────────────────────────────────────
@@ -151,8 +284,8 @@ class HybridProfiler:
             l2_hit_rate=round(l2_hit_rate, 2),
             l2_read_sectors=round(l2_read_sectors, 2),
             l2_write_sectors=round(l2_write_sectors, 2),
-            dram_read_bytes=round(read_bytes, 2),
-            dram_write_bytes=round(write_bytes, 2),
+            dram_read_bytes=round(effective_read, 2),
+            dram_write_bytes=round(effective_write, 2),
             dram_read_bw_gbps=round(dram_read_bw_gbps, 2),
             inst_executed=round(inst_executed, 2),
             inst_fp32=round(inst_fp32, 2),
@@ -167,74 +300,134 @@ class HybridProfiler:
 
         logger.info(
             "Hybrid profiler: mem=%.1f%% compute=%.1f%% occ=%.1f%% "
-            "stall_mem=%.1f%% bw=%.1f GB/s",
+            "stall_mem=%.1f%% stall_bar=%.1f%% bw=%.1f GB/s "
+            "[vec_ld=%d smem=%d sync=%d shfl=%d mem_eff=%.2f]",
             mem_throughput_pct, compute_throughput_pct, gpu_occupancy,
-            stall_memory, dram_read_bw_gbps,
+            stall_memory, stall_barrier, dram_read_bw_gbps,
+            sp.vectorized_loads, sp.smem_declarations, sp.syncthreads,
+            sp.shfl_ops, mem_eff,
         )
         return metrics
+
+    # ── Source-Aware Efficiency Factors ─────────────────────────────────────
+
+    def _memory_efficiency_factor(self, sp: SourceProfile) -> float:
+        """
+        Compute how efficiently the kernel accesses memory.
+        Returns a multiplier for effective DRAM bytes:
+          < 1.0 = kernel is efficient (fewer actual DRAM bytes than logical)
+          > 1.0 = kernel is inefficient (more DRAM bytes due to poor coalescing)
+          = 1.0 = baseline (scalar, no optimization)
+
+        Different implementations get DIFFERENT factors:
+        - Vectorized loads → 0.7-0.85x (fewer transactions, better coalescing)
+        - Shared memory caching → 0.5-0.7x (reuse from SMEM, fewer DRAM reads)
+        - TMA/cp.async → 0.6-0.75x (hardware prefetch, overlap)
+        - __ldg hints → 0.9x (read-only cache path)
+        - No optimization → 1.0x-1.2x (possibly uncoalesced)
+        """
+        factor = 1.0
+
+        # Vectorized loads reduce memory transactions
+        if sp.vectorized_loads > 0:
+            vec_ratio = sp.vectorized_loads / max(sp.scalar_loads, 1)
+            factor *= max(0.65, 1.0 - vec_ratio * 0.25)
+
+        # Vectorized stores
+        if sp.vectorized_stores > 0:
+            factor *= 0.9
+
+        # Shared memory caching: data read from DRAM once, reused from SMEM
+        if sp.has_smem_caching:
+            # More smem reads relative to declarations → more reuse
+            reuse_ratio = sp.smem_reads / max(sp.smem_declarations, 1)
+            factor *= max(0.5, 1.0 - min(reuse_ratio * 0.05, 0.4))
+
+        # TMA / cp.async prefetching
+        if sp.has_prefetch:
+            factor *= 0.75
+
+        # __ldg read-only cache hints
+        if sp.ldg_hints > 0:
+            factor *= max(0.85, 1.0 - sp.ldg_hints * 0.01)
+
+        return max(0.4, min(1.3, factor))
+
+    def _compute_efficiency_factor(self, sp: SourceProfile) -> float:
+        """
+        Compute how the kernel's compute intensity differs from baseline.
+        Returns a multiplier for effective FLOPs:
+          > 1.0 = more compute work (warp shuffles, extra reductions)
+          < 1.0 = fewer FLOPs (fast math, fused ops)
+          = 1.0 = baseline
+        """
+        factor = 1.0
+
+        # Warp shuffles add compute work (but replace shared memory reductions)
+        if sp.shfl_ops > 0:
+            factor += sp.shfl_ops * 0.02
+
+        # Fast math intrinsics: fewer cycles per FLOP
+        if sp.fast_math > 0:
+            factor *= max(0.7, 1.0 - sp.fast_math * 0.03)
+
+        # FMA: fused multiply-add = 2 FLOPs in 1 instruction
+        if sp.fma_ops > 0:
+            factor += sp.fma_ops * 0.01
+
+        # Loop unrolling: more instructions, better ILP
+        if sp.pragma_unroll > 0:
+            factor *= 1.0 + sp.pragma_unroll * 0.05
+
+        # Extra device functions suggest more complex computation
+        if sp.num_device_funcs > 2:
+            factor *= 1.0 + (sp.num_device_funcs - 2) * 0.05
+
+        return max(0.5, min(2.0, factor))
 
     # ── Data Movement Analysis ─────────────────────────────────────────────
 
     def _compute_data_movement(self, kernel_type: str, shape: tuple) -> tuple[float, float]:
-        """Compute (read_bytes, write_bytes) from kernel type and problem shape."""
-
+        """Compute BASE (read_bytes, write_bytes) from kernel type and problem shape."""
         if kernel_type == "add_rmsnorm":
             rows, hidden = shape[0], shape[1]
             n = rows * hidden
             nb = n // 16
-            # Reads: input(bf16) + residual(bf16) + weight(bf16 per hidden)
             read_bytes = n * 2 + n * 2 + hidden * 2
-            # Writes: output(bf16) + quantized(packed fp4 = N/2 bytes) + scales(fp8 = nb bytes)
             write_bytes = n * 2 + n // 2 + nb
-
         elif kernel_type == "silu_mul":
             n = self._shape_to_n(shape)
             nb = n // 16
-            # Reads: gate(bf16) + up(bf16)
             read_bytes = n * 2 + n * 2
-            # Writes: quantized(N/2) + scales(nb)
             write_bytes = n // 2 + nb
-
         elif kernel_type == "nvfp4_quantize":
             n = self._shape_to_n(shape)
             nb = n // 16
-            # Reads: input(bf16)
             read_bytes = n * 2
-            # Writes: packed(N/2) + scales(nb)
             write_bytes = n // 2 + nb
-
         else:
             n = self._shape_to_n(shape)
             read_bytes = n * 4
             write_bytes = n * 2
-
         return float(read_bytes), float(write_bytes)
 
     def _estimate_flops(self, kernel_type: str, shape: tuple) -> float:
-        """Estimate total floating-point operations."""
-
+        """Estimate BASE floating-point operations."""
         if kernel_type == "add_rmsnorm":
             rows, hidden = shape[0], shape[1]
             n = rows * hidden
-            # add(N) + square(N) + reduce_sum(N) + rsqrt(rows) + norm_mul(N) + weight_mul(N) + quant(N)
             return float(n * 6 + rows)
-
         elif kernel_type == "silu_mul":
             n = self._shape_to_n(shape)
-            # silu: exp(N) + add(N) + div(N) + mul(N); gate_mul(N); quant(N)
             return float(n * 6)
-
         elif kernel_type == "nvfp4_quantize":
             n = self._shape_to_n(shape)
-            # absmax(N) + scale_div(N) + clamp(N) + pack(N)
             return float(n * 4)
-
         else:
             n = self._shape_to_n(shape)
             return float(n * 2)
 
     def _shape_to_n(self, shape: tuple) -> int:
-        """Flatten shape tuple to total element count."""
         n = 1
         for s in shape:
             n *= s
@@ -244,8 +437,6 @@ class HybridProfiler:
 
     def _parse_launch_config(self, kernel_src: str) -> tuple[int, int]:
         """Extract block size and shared memory from kernel source."""
-
-        # Pattern 1: <<<grid, block>>> or <<<grid, block, smem>>>
         launch = re.search(
             r'<<<\s*[^,]+,\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*\w+)?\s*>>>', kernel_src
         )
@@ -254,7 +445,6 @@ class HybridProfiler:
             shared_mem = int(launch.group(2)) if launch.group(2) else 0
             return block_size, shared_mem
 
-        # Pattern 2: dim3 block(x) or dim3 block(x,y) or dim3 block(x,y,z)
         dim3 = re.search(r'dim3\s+\w+\s*\(\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*(\d+))?\s*\)', kernel_src)
         if dim3:
             x = int(dim3.group(1))
@@ -262,70 +452,26 @@ class HybridProfiler:
             z = int(dim3.group(3)) if dim3.group(3) else 1
             return x * y * z, 0
 
-        # Pattern 3: #define or constexpr for block size
         block_def = re.search(
             r'(?:#define\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|BLOCK_DIM)\s+(\d+))|'
             r'(?:constexpr\s+int\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|kBlockSize)\s*=\s*(\d+))',
             kernel_src
         )
-        if block_def:
-            block_size = int(block_def.group(1) or block_def.group(2))
-        else:
-            block_size = 256  # common default
-
-        # Shared memory from __shared__ declarations
-        shared_mem = self._estimate_shared_memory(kernel_src)
-
+        block_size = int(block_def.group(1) or block_def.group(2)) if block_def else 256
+        shared_mem = _estimate_shared_memory(kernel_src)
         return block_size, shared_mem
-
-    def _estimate_shared_memory(self, kernel_src: str) -> int:
-        """Estimate shared memory usage from __shared__ declarations."""
-        total = 0
-        # Match: __shared__ type name[size]
-        for m in re.finditer(r'__shared__\s+(\w+)\s+\w+\[([^\]]+)\]', kernel_src):
-            dtype = m.group(1)
-            size_expr = m.group(2).strip()
-
-            # Type size mapping
-            type_sizes = {
-                "float": 4, "double": 8, "int": 4, "unsigned": 4,
-                "half": 2, "__half": 2, "__nv_bfloat16": 2,
-                "float4": 16, "float2": 8, "int4": 16,
-                "char": 1, "uint8_t": 1, "int8_t": 1,
-                "uint32_t": 4, "int32_t": 4, "uint16_t": 2,
-            }
-            elem_size = type_sizes.get(dtype, 4)
-
-            try:
-                size = int(size_expr)
-                total += size * elem_size
-            except ValueError:
-                total += 1024 * elem_size  # assume ~1K elements if can't parse
-
-        # Also check extern __shared__
-        if "extern __shared__" in kernel_src:
-            total = max(total, 4096)  # conservative estimate for dynamic shared memory
-
-        return total
 
     # ── Occupancy ──────────────────────────────────────────────────────────
 
     def _query_occupancy_from_binary(
         self, kernel_src: str, block_size: int, shared_mem: int
     ) -> Optional[float]:
-        """
-        Compile a small CUDA program that uses cudaOccupancyMaxActiveBlocksPerMultiprocessor
-        to query actual occupancy (accounts for register pressure from compilation).
-        Returns occupancy percentage or None if compilation/query fails.
-        """
-        # Find the __global__ function name
+        """Query real occupancy via CUDA API (accounts for register pressure)."""
         global_funcs = re.findall(r'__global__\s+void\s+(\w+)\s*\(', kernel_src)
         if not global_funcs:
             return None
 
         kernel_name = global_funcs[0]
-
-        # Build a small program that compiles the kernel and queries occupancy
         query_src = f"""
 {kernel_src}
 
@@ -354,7 +500,6 @@ int main() {{
 
     printf("occ_pct: %.2f\\n", occupancy);
     printf("active_blocks: %d\\n", num_blocks);
-    printf("sm_count: %d\\n", prop.multiProcessorCount);
     return 0;
 }}
 """
@@ -362,139 +507,128 @@ int main() {{
             with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
                 f.write(query_src)
                 src_path = f.name
-
             bin_path = src_path.replace(".cu", "_occ")
-            compile_cmd = [self.nvcc] + self.nvcc_flags + [src_path, "-o", bin_path]
-            comp = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=60)
-
+            comp = subprocess.run(
+                [self.nvcc] + self.nvcc_flags + [src_path, "-o", bin_path],
+                capture_output=True, text=True, timeout=60,
+            )
             if comp.returncode != 0:
                 logger.debug("Occupancy query compilation failed: %s", comp.stderr[:200])
                 return None
-
             run = subprocess.run([bin_path], capture_output=True, text=True, timeout=10)
             if run.returncode != 0:
                 return None
-
             match = re.search(r"occ_pct:\s*([\d.]+)", run.stdout)
             if match:
                 occ = float(match.group(1))
                 logger.info("CUDA Occupancy API: %.1f%%", occ)
                 return occ
-
         except (subprocess.TimeoutExpired, OSError) as e:
             logger.debug("Occupancy query failed: %s", e)
-
         return None
 
     def _compute_theoretical_occupancy(self, block_size: int, shared_mem: int) -> float:
-        """Compute theoretical occupancy from launch config + device specs (no GPU needed)."""
-
         warps_per_block = math.ceil(block_size / self.warp_size)
-
-        # Limit 1: warp count
-        max_blocks_by_warps = self.max_warps_per_sm // warps_per_block if warps_per_block > 0 else 0
-
-        # Limit 2: shared memory
-        if shared_mem > 0:
-            max_blocks_by_smem = int(self.shared_mem_per_sm / shared_mem)
-        else:
-            max_blocks_by_smem = self.max_blocks_per_sm
-
-        # Limit 3: hardware block limit
-        max_blocks_hw = self.max_blocks_per_sm
-
-        active_blocks = min(max_blocks_by_warps, max_blocks_by_smem, max_blocks_hw)
+        max_by_warps = self.max_warps_per_sm // warps_per_block if warps_per_block > 0 else 0
+        max_by_smem = int(self.shared_mem_per_sm / shared_mem) if shared_mem > 0 else self.max_blocks_per_sm
+        active_blocks = min(max_by_warps, max_by_smem, self.max_blocks_per_sm)
         active_warps = active_blocks * warps_per_block
+        return min(100.0, max(0.0, active_warps / self.max_warps_per_sm * 100.0))
 
-        occupancy = (active_warps / self.max_warps_per_sm * 100.0) if self.max_warps_per_sm > 0 else 0
-        return min(100.0, max(0.0, occupancy))
-
-    # ── Stall Estimation ───────────────────────────────────────────────────
+    # ── Source-Differentiated Stall Estimation ─────────────────────────────
 
     def _estimate_stalls(
         self,
-        kernel_src: str,
+        sp: SourceProfile,
         mem_pct: float,
         compute_pct: float,
         occupancy_pct: float,
     ) -> tuple[float, float, float, float]:
         """
-        Estimate stall percentages from source analysis + throughput ratio.
-
-        Logic:
-        - Memory-bound kernels → high stall_memory (waiting for DRAM)
-        - Many __syncthreads → high stall_barrier
-        - Low occupancy → high stall_no_instruction (not enough warps to hide latency)
-        - High shared memory traffic → stall_mio_throttle
+        Estimate stalls from SOURCE PATTERNS + throughput.
+        Different kernel implementations get DIFFERENT stall profiles.
         """
-
-        sync_count = kernel_src.count("__syncthreads")
-        syncwarp_count = kernel_src.count("__syncwarp")
-        barrier_points = sync_count + syncwarp_count
-        shared_decls = kernel_src.count("__shared__")
-
-        # When both mem and compute are low, the kernel is latency-bound
-        # (not enough work to saturate either subsystem)
+        barrier_points = sp.syncthreads + sp.syncwarp
         both_low = mem_pct < 30 and compute_pct < 30
 
-        # Memory stall: dominant when memory-bound with underutilized compute
+        # ── Memory stall ──────────────────────────────────────────────────
+        # Base: derived from throughput ratio
         if both_low:
-            # Low utilization → latency-bound, memory stalls dominate
-            stall_memory = min(80.0, max(40.0, 70.0 - mem_pct))
+            stall_memory = max(35.0, 70.0 - mem_pct)
         elif mem_pct > compute_pct and mem_pct > 30:
             stall_memory = min(80.0, (mem_pct - compute_pct) * 0.8 + 10.0)
         elif mem_pct > 50:
-            stall_memory = min(60.0, mem_pct * 0.5)
+            stall_memory = mem_pct * 0.6
         else:
             stall_memory = max(10.0, 30.0 - compute_pct * 0.2)
 
-        # Barrier stall: from synchronization density
-        stall_barrier = min(50.0, barrier_points * 3.5)
-        if barrier_points == 0:
-            stall_barrier = 1.0  # minimal baseline
+        # Source adjustments: prefetch and vectorization REDUCE memory stalls
+        if sp.has_prefetch:
+            stall_memory *= 0.5  # cp.async/TMA hides latency
+        if sp.has_vectorized_access:
+            stall_memory *= 0.7  # fewer transactions, better coalescing
+        if sp.has_smem_caching:
+            stall_memory *= 0.8  # data reuse from shared memory
+        if sp.ldg_hints > 0:
+            stall_memory *= 0.9  # read-only cache path
+        stall_memory = max(3.0, min(80.0, stall_memory))
 
-        # No-instruction stall: low occupancy means fewer warps to schedule
+        # ── Barrier stall ─────────────────────────────────────────────────
+        # More __syncthreads = more barrier stalls
+        if barrier_points == 0:
+            stall_barrier = 1.0
+        else:
+            stall_barrier = min(55.0, barrier_points * 4.0)
+            # Warp-level ops can replace some syncs
+            if sp.has_warp_level_ops:
+                stall_barrier *= 0.6
+
+        # ── No-instruction stall ──────────────────────────────────────────
         if occupancy_pct < 50:
-            stall_no_inst = min(40.0, (100.0 - occupancy_pct) * 0.4)
+            stall_no_inst = (100.0 - occupancy_pct) * 0.4
         elif both_low:
-            stall_no_inst = max(10.0, 25.0 - occupancy_pct * 0.1)
+            stall_no_inst = max(8.0, 25.0 - occupancy_pct * 0.1)
         else:
             stall_no_inst = max(2.0, (100.0 - occupancy_pct) * 0.15)
+        # Loop unrolling increases ILP, reducing no-instruction stalls
+        if sp.pragma_unroll > 0:
+            stall_no_inst *= max(0.5, 1.0 - sp.pragma_unroll * 0.1)
+        stall_no_inst = min(40.0, stall_no_inst)
 
-        # MIO throttle: shared memory / L1 contention
-        stall_mio = min(25.0, shared_decls * 2.5 + max(0, mem_pct - 60) * 0.15)
+        # ── MIO throttle ──────────────────────────────────────────────────
+        # Shared memory contention
+        if sp.smem_declarations > 0:
+            stall_mio = min(30.0, sp.smem_declarations * 3.0 + sp.smem_reads * 0.3)
+        else:
+            stall_mio = max(1.0, mem_pct * 0.05)
 
         return stall_memory, stall_barrier, stall_no_inst, stall_mio
 
-    # ── Instruction Estimation ─────────────────────────────────────────────
+    # ── Source-Adjusted Instruction Estimation ─────────────────────────────
 
     def _estimate_instructions(
-        self, kernel_type: str, shape: tuple
+        self, kernel_type: str, shape: tuple, sp: SourceProfile
     ) -> tuple[float, float, float, float]:
-        """Estimate (inst_load, inst_store, inst_fp32, inst_fp16) from kernel type."""
-
+        """Estimate instructions adjusted by source patterns."""
         if kernel_type == "add_rmsnorm":
             rows, hidden = shape[0], shape[1]
             n = rows * hidden
-            inst_load = float(n * 2 + hidden)     # input + residual + weight
-            inst_store = float(n + n // 2 + n // 16)  # output + packed + scales
-            inst_fp32 = float(n * 4)               # add, square, mul, norm
-            inst_fp16 = float(n * 2)               # bf16 conversions
-
+            inst_load = float(n * 2 + hidden)
+            inst_store = float(n + n // 2 + n // 16)
+            inst_fp32 = float(n * 4)
+            inst_fp16 = float(n * 2)
         elif kernel_type == "silu_mul":
             n = self._shape_to_n(shape)
             inst_load = float(n * 2)
             inst_store = float(n // 2 + n // 16)
-            inst_fp32 = float(n * 4)               # exp, div, mul, gate_mul
+            inst_fp32 = float(n * 4)
             inst_fp16 = float(n)
-
         elif kernel_type == "nvfp4_quantize":
             n = self._shape_to_n(shape)
             inst_load = float(n)
             inst_store = float(n // 2 + n // 16)
-            inst_fp32 = float(n * 3)               # absmax, scale, clamp
+            inst_fp32 = float(n * 3)
             inst_fp16 = float(n)
-
         else:
             n = self._shape_to_n(shape)
             inst_load = float(n)
@@ -502,30 +636,43 @@ int main() {{
             inst_fp32 = float(n * 2)
             inst_fp16 = 0.0
 
+        # Vectorized loads/stores reduce instruction count (1 vector = 4-8 scalars)
+        if sp.vectorized_loads > 0:
+            vec_reduction = max(0.2, 1.0 - sp.vectorized_loads * 0.05)
+            inst_load *= vec_reduction
+        if sp.vectorized_stores > 0:
+            inst_store *= max(0.3, 1.0 - sp.vectorized_stores * 0.05)
+
+        # Warp shuffles add extra instructions
+        inst_fp32 += sp.shfl_ops * 100
+        inst_fp32 += sp.reduction_ops * 200
+
         return inst_load, inst_store, inst_fp32, inst_fp16
 
     # ── L2 Cache Estimation ────────────────────────────────────────────────
 
-    def _estimate_l2_hit_rate(self, total_bytes: float, timing_sec: float) -> float:
-        """
-        Estimate L2 hit rate from achieved vs theoretical bandwidth.
-        If achieved BW exceeds peak DRAM BW → data must be hitting L2.
-        If working set fits in L2 → high hit rate.
-        """
+    def _estimate_l2_hit_rate(
+        self, sp: SourceProfile, logical_bytes: float, effective_bytes: float,
+        timing_sec: float,
+    ) -> float:
+        """Estimate L2 hit rate from source patterns + bandwidth analysis."""
         if timing_sec <= 0:
             return 0.0
 
-        achieved_bw = total_bytes / timing_sec
+        # Shared memory caching → higher L2 hit rate (less DRAM pressure)
+        base_rate = 10.0
+        if sp.has_smem_caching:
+            base_rate += 25.0
+        if sp.ldg_hints > 0:
+            base_rate += 10.0
 
-        # If working set fits in L2 cache, expect high hit rate
-        if total_bytes < self.l2_cache_bytes:
-            return min(90.0, 50.0 + (1.0 - total_bytes / self.l2_cache_bytes) * 40.0)
+        # Small working set → high L2 hit rate
+        if logical_bytes < self.l2_cache_bytes:
+            base_rate += (1.0 - logical_bytes / self.l2_cache_bytes) * 30.0
 
-        # If achieved BW > peak DRAM → L2 is absorbing some accesses
-        if achieved_bw > self.peak_mem_bw_bytes_per_sec:
-            ratio = achieved_bw / self.peak_mem_bw_bytes_per_sec
-            return min(95.0, (1.0 - 1.0 / ratio) * 100)
+        # Memory efficiency gap: if effective < logical, some reads hit cache
+        if effective_bytes < logical_bytes:
+            cache_ratio = 1.0 - effective_bytes / logical_bytes
+            base_rate += cache_ratio * 20.0
 
-        # Otherwise estimate from bandwidth utilization
-        bw_ratio = achieved_bw / self.peak_mem_bw_bytes_per_sec
-        return max(5.0, (1.0 - bw_ratio) * 25.0)
+        return min(95.0, max(5.0, base_rate))
