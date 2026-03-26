@@ -359,4 +359,8 @@ int main(int argc, char** argv) {{
         logger.info("Search complete: %s", final.summary())
         logger.info("Total API cost: $%.4f", env.total_api_cost_usd)
         logger.info("="*60)
+
+        # Clean up async client to prevent 'Event loop is closed' errors
+        self.engine.close()
+
         return final

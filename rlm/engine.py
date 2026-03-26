@@ -31,6 +31,7 @@ class RLMEngine:
         # Sync client for root/combine calls (sequential); async client for parallel beams
         self.client       = anthropic.Anthropic()
         self.async_client = AsyncAnthropic()
+        self._loop = None  # persistent event loop for async calls
 
         self.root_model    = cfg["models"]["root_model"]
         self.sub_model     = cfg["models"]["sub_model"]
@@ -597,9 +598,22 @@ CRITICAL RULES:
     def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
         """Reuse a single event loop to avoid 'Event loop is closed' errors
         from AsyncAnthropic's httpx connection pool cleanup."""
-        if not hasattr(self, '_loop') or self._loop.is_closed():
+        if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
         return self._loop
+
+    def close(self):
+        """Properly close the async client and event loop."""
+        if self._loop is not None and not self._loop.is_closed():
+            try:
+                self._loop.run_until_complete(self.async_client.close())
+            except Exception:
+                pass
+            self._loop.close()
+        self._loop = None
+
+    def __del__(self):
+        self.close()
 
     def run_decompose(self) -> list:
         return self.decompose()
