@@ -33,6 +33,12 @@ class BottleneckClassifier:
             return Bottleneck.SYNC_BOUND
         if metrics.stall_memory >= self.latency_threshold:
             return Bottleneck.LATENCY_BOUND
+
+        # Low utilization on both axes → kernel is latency-bound
+        # (too small to saturate hardware, or stalled waiting for data)
+        if metrics.mem_throughput_pct < 30 and metrics.compute_throughput_pct < 30:
+            return Bottleneck.LATENCY_BOUND
+
         return Bottleneck.UNKNOWN
 
     def classify_all(self, candidates_metrics: list) -> dict:

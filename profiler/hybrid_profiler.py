@@ -554,7 +554,8 @@ int main() {{
         # ── Memory stall ──────────────────────────────────────────────────
         # Base: derived from throughput ratio
         if both_low:
-            stall_memory = max(35.0, 70.0 - mem_pct)
+            # Low utilization = latency-bound: high memory stalls (waiting for data)
+            stall_memory = max(45.0, 75.0 - mem_pct)
         elif mem_pct > compute_pct and mem_pct > 30:
             stall_memory = min(80.0, (mem_pct - compute_pct) * 0.8 + 10.0)
         elif mem_pct > 50:
