@@ -3,6 +3,10 @@ flashinfer_ref.py — FlashInfer-based reference outputs and baseline timing.
 
 Uses FlashInfer's production CUDA kernels on B200 as the ground-truth
 reference for WaferBench NVFP4, matching the official evaluation methodology.
+
+Matches KernelArena bench_sustained convention:
+  - 500 warmup, 100 timed reps, L2 cache cycling via input buffer rotation
+  - silu_mul uses fused silu_and_mul_scaled_nvfp4_experts_quantize (not 2 calls)
 """
 
 from __future__ import annotations
@@ -22,9 +26,21 @@ except ImportError:
     _HAS_FLASHINFER = False
     logger.warning("torch/flashinfer not available — will fall back to reference kernels")
 
+# Check for the fused silu_mul expert API (KernelArena reference)
+_HAS_FUSED_SILU = False
+if _HAS_FLASHINFER:
+    _HAS_FUSED_SILU = hasattr(flashinfer, "silu_and_mul_scaled_nvfp4_experts_quantize")
+    if not _HAS_FUSED_SILU:
+        logger.warning(
+            "flashinfer.silu_and_mul_scaled_nvfp4_experts_quantize not found — "
+            "silu_mul baseline will use unfused fallback (NOT comparable to KernelArena)"
+        )
+
 # Timing constants matching ThunderKittens 2.0 / WaferBench convention
 _WARMUP_ITERS = 500
 _BENCH_ITERS  = 100
+# L2 cache cycling — must match benchmark.py to keep baseline/candidate symmetric
+_L2_CYCLE_BUFS = 4
 
 
 def available() -> bool:
@@ -51,8 +67,14 @@ def _jit_warmup():
         flashinfer.add_rmsnorm_fp4quant(x, r, w, eps=1e-6)
         gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
         flashinfer.fp4_quantize(x, global_scale=gs)
-        combined = torch.cat([x, r], dim=-1)
-        flashinfer.silu_and_mul(combined)
+        # Warm fused silu_mul expert API (KernelArena reference)
+        if _HAS_FUSED_SILU:
+            x3d = torch.randn(1, 4, 512, dtype=torch.bfloat16, device="cuda")
+            mask = torch.full((1,), 4, dtype=torch.int64, device="cuda")
+            flashinfer.silu_and_mul_scaled_nvfp4_experts_quantize(x3d, mask, gs)
+        else:
+            combined = torch.cat([x, r], dim=-1)
+            flashinfer.silu_and_mul(combined)
         torch.cuda.synchronize()
     except Exception as e:
         logger.warning("JIT warmup partial failure (ok): %s", e)
@@ -111,14 +133,16 @@ def generate_reference(kernel_type: str, shape: tuple, seed: int = 42) -> Option
 
 def _baseline_add_rmsnorm(shape: tuple) -> float:
     rows, hidden = shape
-    torch.manual_seed(0)
-    inp = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
-    res = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
-    w   = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
+    # L2 cycling: multiple input buffers, cycled per iteration
+    inps, ress = [], []
+    for i in range(_L2_CYCLE_BUFS):
+        torch.manual_seed(i)
+        inps.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
+        ress.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
+    w = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
 
-    def run():
-        # Single fused call matching KernelArena: add + rmsnorm + fp4quant
-        flashinfer.add_rmsnorm_fp4quant(inp, res, w, eps=1e-6)
+    def run(buf_idx):
+        flashinfer.add_rmsnorm_fp4quant(inps[buf_idx], ress[buf_idx], w, eps=1e-6)
 
     return _time_fn(run)
 
@@ -146,20 +170,39 @@ def _reference_add_rmsnorm(shape: tuple, seed: int) -> dict:
 
 def _baseline_silu_mul(shape: tuple) -> float:
     b, m, k = shape
-    torch.manual_seed(0)
-    # silu_and_mul expects single concatenated tensor of shape (N, 2*K)
-    # where first half is gate, second half is up
-    gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
-    up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
-    combined = torch.cat([gate, up], dim=-1)  # (B*M, 2*K)
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
-    def run():
-        # silu_and_mul + fp4_quantize (no single fused API available)
-        out = flashinfer.silu_and_mul(combined)
-        flashinfer.fp4_quantize(out, global_scale=global_scale)
+    if _HAS_FUSED_SILU:
+        # KernelArena reference: single fused kernel (3D expert-batched, swizzled)
+        # Input: (B, M, 2*K) bf16 — gate and up concatenated on last dim
+        # mask: (B,) int — per-expert token count (all M for uniform batches)
+        xs = []
+        for i in range(_L2_CYCLE_BUFS):
+            torch.manual_seed(i)
+            xs.append(torch.randn(b, m, 2 * k, dtype=torch.bfloat16, device="cuda"))
+        mask = torch.full((b,), m, dtype=torch.int64, device="cuda")
 
-    return _time_fn(run)
+        def run(buf_idx):
+            flashinfer.silu_and_mul_scaled_nvfp4_experts_quantize(
+                xs[buf_idx], mask, global_scale
+            )
+
+        return _time_fn(run)
+    else:
+        # Fallback: two separate calls (NOT comparable to KernelArena)
+        logger.warning("Using unfused silu_mul baseline — speedup NOT comparable to KernelArena")
+        combineds = []
+        for i in range(_L2_CYCLE_BUFS):
+            torch.manual_seed(i)
+            gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+            up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+            combineds.append(torch.cat([gate, up], dim=-1))
+
+        def run(buf_idx):
+            out = flashinfer.silu_and_mul(combineds[buf_idx])
+            flashinfer.fp4_quantize(out, global_scale=global_scale)
+
+        return _time_fn(run)
 
 
 def _reference_silu_mul(shape: tuple, seed: int) -> dict:
@@ -176,12 +219,14 @@ def _reference_silu_mul(shape: tuple, seed: int) -> dict:
 
 def _baseline_nvfp4_quantize(shape: tuple) -> float:
     m, k = shape
-    torch.manual_seed(0)
-    inp = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    inps = []
+    for i in range(_L2_CYCLE_BUFS):
+        torch.manual_seed(i)
+        inps.append(torch.randn(m, k, dtype=torch.bfloat16, device="cuda"))
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
-    def run():
-        flashinfer.fp4_quantize(inp, global_scale=global_scale)
+    def run(buf_idx):
+        flashinfer.fp4_quantize(inps[buf_idx], global_scale=global_scale)
 
     return _time_fn(run)
 
@@ -198,18 +243,23 @@ def _reference_nvfp4_quantize(shape: tuple, seed: int) -> dict:
 # ── Timing utility ───────────────────────────────────────────────────────────
 
 def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> float:
-    """Time a function using CUDA events. Returns microseconds per call."""
-    # Warmup
-    for _ in range(warmup):
-        fn()
+    """Time a function with L2 cache cycling. Returns microseconds per call.
+
+    fn(buf_idx) is called with a rotating buffer index to prevent L2 cache
+    hits from inflating performance — matching benchmark.py's candidate timing.
+    """
+    nbufs = _L2_CYCLE_BUFS
+    # Warmup with L2 cycling
+    for i in range(warmup):
+        fn(i % nbufs)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end   = torch.cuda.Event(enable_timing=True)
 
     start.record()
-    for _ in range(iters):
-        fn()
+    for i in range(iters):
+        fn(i % nbufs)
     end.record()
     torch.cuda.synchronize()
 
