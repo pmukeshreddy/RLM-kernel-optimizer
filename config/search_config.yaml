@@ -1,0 +1,71 @@
+# RLM Beam Search Configuration
+
+models:
+  root_model: "claude-opus-4-6"          # decomposition (Opus everywhere)
+  sub_model: "claude-opus-4-6"          # codegen (best CUDA quality)
+  combine_model: "claude-opus-4-6"      # combination (needs sophistication)
+
+beam:
+  width: 4                    # parallel strategy variants
+  refine_rounds: 4            # NCU feedback iterations
+  max_sub_calls_per_round: 2  # cap recursive depth
+  combine_top_k: 2            # merge top-K into final
+  diversity_mode: "bottleneck_cluster"  # cluster-based pruning
+
+strategies:
+  enabled:
+    - vectorize_loads
+    - tma_prefetch
+    - warp_reduction
+    - fuse_passes
+    - register_tiling
+    - async_pipeline
+    - fp4_lut
+    - fast_math_expf
+    - thread_coarsening
+    - ldg_readonly
+    - vectorized_stores
+  disabled: []
+
+profiler:
+  # Profiler mode: "ncu" (NCU only), "hybrid" (skip NCU, use analytical),
+  #                "auto" (try NCU first, fall back to hybrid on permission/importer errors)
+  tool: "auto"
+  ncu_path: "/usr/local/cuda/bin/ncu"
+  warmup_iters: 3
+  profile_iters: 10
+  sections:
+    - "SpeedOfLight"
+    - "MemoryWorkloadAnalysis"
+    - "ComputeWorkloadAnalysis"
+    - "WarpStateStatistics"
+    - "SchedulerStatistics"
+
+bottleneck:
+  memory_bound_threshold_pct: 70
+  compute_bound_threshold_pct: 60
+  sync_bound_threshold_pct: 30
+  latency_bound_threshold_pct: 40
+
+cost_control:
+  max_tokens_per_sub_call: 8192
+  max_total_api_cost_usd: 25.0  # hard stop per kernel problem (Opus is ~5x Sonnet)
+  max_total_cost_all_problems: 100.0
+
+eval:
+  correctness_atol: 1e-2
+  correctness_rtol: 1e-3
+  benchmark_warmup: 500
+  benchmark_iters: 100
+  # Shapes are now per-task (passed via problem_shape in run.py).
+  # These are fallback defaults only — not used during normal WaferBench runs.
+  problem_shapes:
+    - [128, 2048]    # add_rmsnorm_fp4quant_b128xh2048
+    - [128, 4096]    # add_rmsnorm_fp4quant_b128xh4096
+    - [128, 8192]    # add_rmsnorm_fp4quant_b128xh8192
+
+output:
+  save_all_candidates: true
+  save_ncu_reports: true
+  output_dir: "outputs/"
+  log_level: "INFO"
