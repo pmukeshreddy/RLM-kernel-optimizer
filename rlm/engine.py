@@ -594,6 +594,13 @@ CRITICAL RULES:
 
     # ── Synchronous wrappers (for beam_search.py) ─────────────────────────────
 
+    def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
+        """Reuse a single event loop to avoid 'Event loop is closed' errors
+        from AsyncAnthropic's httpx connection pool cleanup."""
+        if not hasattr(self, '_loop') or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+        return self._loop
+
     def run_decompose(self) -> list:
         return self.decompose()
 
@@ -601,9 +608,11 @@ CRITICAL RULES:
         self, strategies: list, kernel_slice: str,
         current_metrics: dict = None, round_num: int = 0,
     ) -> list:
-        return asyncio.run(
+        loop = self._get_or_create_loop()
+        return loop.run_until_complete(
             self.generate_beams(strategies, kernel_slice, current_metrics, round_num)
         )
 
     def run_refine_beams(self, survivors: list, round_num: int) -> list:
-        return asyncio.run(self.refine_beams(survivors, round_num))
+        loop = self._get_or_create_loop()
+        return loop.run_until_complete(self.refine_beams(survivors, round_num))
