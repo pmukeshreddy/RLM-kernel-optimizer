@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 import yaml
@@ -198,6 +199,36 @@ def optimize_kernel(
     return submission
 
 
+def _lock_gpu_clocks():
+    """Lock GPU clocks to max frequency for stable benchmarking.
+
+    Prevents thermal throttling from inflating/deflating speedup numbers
+    across runs. Falls back gracefully if nvidia-smi isn't available or
+    permissions are insufficient.
+    """
+    try:
+        # Query max supported clocks
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.max.sm", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            max_clock = int(r.stdout.strip().split("\n")[0])
+            # Lock SM clocks to max
+            r2 = subprocess.run(
+                ["nvidia-smi", "-lgc", str(max_clock)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode == 0:
+                logger.info("GPU clocks locked to %d MHz for stable benchmarking", max_clock)
+            else:
+                logger.warning("Could not lock GPU clocks (need root?): %s", r2.stderr.strip())
+        else:
+            logger.warning("Could not query GPU max clocks: %s", r.stderr.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError) as e:
+        logger.warning("GPU clock locking unavailable: %s", e)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="RLM + NCU-guided beam search kernel optimizer for WaferBench NVFP4"
@@ -213,6 +244,9 @@ def main():
     args = parser.parse_args()
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    # Lock GPU clocks to max to prevent thermal throttling variance
+    _lock_gpu_clocks()
 
     config_path = args.config or PROJECT_ROOT / "config" / "search_config.yaml"
     with open(config_path) as f:
