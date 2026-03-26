@@ -84,13 +84,12 @@ class NCURunner:
             "--launch-skip", str(self.warmup),
             "--launch-count", str(self.profile_iter),
             "--metrics", NCU_METRICS_QUERY,
-            "--csv",
             "-o", str(report_path),
             "-f",
             str(binary_path),
         ]
 
-        logger.info("Profiling: %s ...", " ".join(ncu_cmd[:5]))
+        logger.info("NCU cmd: %s", " ".join(ncu_cmd))
         result = subprocess.run(ncu_cmd, capture_output=True, text=True, timeout=300)
 
         logger.info("NCU finished: rc=%d report_exists=%s stdout=%d bytes stderr=%d bytes",
@@ -106,7 +105,8 @@ class NCURunner:
             return self._export_and_parse(report_path)
         if result.stdout and "Metric Name" in result.stdout:
             return self._parse_ncu_csv(result.stdout)
-        logger.warning("NCU: no report file and no CSV in stdout. stderr: %s", result.stderr[:300])
+        logger.warning("NCU: no report file and no CSV in stdout.\n  stdout: %s\n  stderr: %s",
+                       result.stdout[:500], result.stderr[:300])
         return None
 
     def _export_and_parse(self, report_path: Path) -> Optional[KernelMetrics]:
