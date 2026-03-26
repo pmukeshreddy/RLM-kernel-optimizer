@@ -191,22 +191,14 @@ int main(int argc, char** argv) {{
             kernel_src=candidate.code, harness_src=harness, output_name=name,
         )
         if not compile_ok:
-            logger.error("  === COMPILE FAIL [%s] ===\n%s", candidate.strategy, err_msg[:600])
-            # Dump the key API calls for debugging
-            for i, line in enumerate(candidate.code.split("\n"), 1):
-                if any(kw in line for kw in ["tma_load", "mbar_wait", "mbar_init", "issue_prefetch", "PipelineState"]):
-                    logger.error("  LINE %d: %s", i, line.strip())
+            logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
         if compile_ok:
             self.env.compile_passes += 1
             passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
                                                           kernel_type=self.env.kernel_type)
             if not passed:
-                logger.warning("  Correctness FAIL for [%s] (err=%.4f): %s",
+                logger.warning("  Correctness FAIL [%s] (err=%.4f): %s",
                                candidate.strategy, max_err, msg[:200])
-                # Dump TMA-related lines for debugging
-                for i, line in enumerate(candidate.code.split("\n"), 1):
-                    if any(kw in line for kw in ["tma_load", "mbar_wait", "mbar_init", "issue_prefetch"]):
-                        logger.warning("  LINE %d: %s", i, line.strip())
             else:
                 self.env.correctness_passes += 1
                 candidate.correct = True
@@ -217,9 +209,6 @@ int main(int argc, char** argv) {{
                     if metrics:
                         metrics.duration_us = timing_us
                         metrics.speedup = speedup
-                        logger.info("  NCU metrics: %s", metrics.summary_str())
-                    else:
-                        logger.warning("  NCU profiling returned no metrics for [%s]", candidate.strategy)
                 ok = True
         candidate.compile_ok = ok
 
