@@ -196,6 +196,13 @@ Apply this optimization to the kernel below:
 ## Optimization: {strat_name}
 {strat_desc}
 
+## B200 Hardware (use these numbers to guide your optimization):
+- HBM3e: 8 TB/s bandwidth — use float4/uint4 (128-bit) loads to saturate it
+- 142 SMs, 228 KB shared memory per SM, 255 registers per thread
+- Warp shuffle (__shfl_xor_sync) costs ~2 cycles vs shared mem reduction ~10+ cycles
+- Fast math SFU: __expf ~4 cycles vs expf ~20 cycles; __frcp_rn for reciprocal
+- For bf16: load 8 values at once via reinterpret_cast<uint4*>, unpack to float for compute
+
 ## Full kernel source (headers expanded inline between === markers):
 ```cuda
 {kernel_slice}
@@ -252,23 +259,175 @@ CRITICAL RULES:
         ]
         return list(await asyncio.gather(*tasks))
 
-    # ── Refinement rounds ─────────────────────────────────────────────────────
+    # ── Refinement rounds (reflection-based, inspired by Apex) ────────────────
+
+    def _build_reflection_prompt(self, candidate) -> str:
+        """Build a targeted refinement prompt based on candidate's performance profile.
+
+        Classifies the result into failure modes and gives specific hints,
+        rather than just picking a new strategy name.
+        """
+        env = self.env
+        code = candidate.code if candidate.code else env.kernel_src
+        metrics = candidate.metrics or {}
+        speedup = candidate.speedup
+        bottleneck = candidate.bottleneck
+
+        # ── Classify result into failure mode ──
+        if not candidate.compile_ok:
+            mode = "compile_fail"
+            feedback = (
+                "The previous attempt FAILED TO COMPILE. Common causes:\n"
+                "- Missing #include directives\n"
+                "- Using undefined functions (only use functions from the included headers)\n"
+                "- Changed the launch_* function signature\n"
+                "- Syntax errors in template code\n"
+                "Focus on producing CORRECT, COMPILABLE code first."
+            )
+        elif not candidate.correct:
+            mode = "correctness_fail"
+            feedback = (
+                "The previous attempt COMPILED but PRODUCED WRONG RESULTS.\n"
+                "- Check index calculations carefully (off-by-one, stride errors)\n"
+                "- Verify vectorized loads unpack in the correct order\n"
+                "- Ensure reductions accumulate all elements (no partial sums lost)\n"
+                "- Check that the NVFP4 quantization block alignment is correct\n"
+                "Fix the correctness bug while keeping the optimization approach."
+            )
+        elif speedup < 1.05:
+            mode = "no_improvement"
+            feedback = (
+                f"The previous attempt compiled and was correct but achieved only {speedup:.3f}x "
+                f"speedup (essentially no improvement). The optimization was too conservative "
+                f"or didn't target the actual bottleneck.\n"
+                f"Try a FUNDAMENTALLY DIFFERENT approach — don't just tweak, restructure."
+            )
+        elif speedup < 1.3:
+            mode = "below_target"
+            feedback = (
+                f"The previous attempt achieved {speedup:.3f}x speedup — decent but not enough. "
+                f"Target is >1.5x over FlashInfer baseline.\n"
+                f"Build on what worked but apply MORE AGGRESSIVE optimizations."
+            )
+        else:
+            mode = "good_but_improve"
+            feedback = (
+                f"The previous attempt achieved {speedup:.3f}x speedup — good! "
+                f"Push further by combining multiple techniques or finding the remaining bottleneck."
+            )
+
+        # ── Build NCU metrics feedback ──
+        metrics_section = ""
+        if metrics:
+            mem_pct = metrics.get("mem_throughput_pct", 0)
+            compute_pct = metrics.get("compute_throughput_pct", 0)
+            occupancy = metrics.get("sm_occupancy", 0)
+            stall_mem = metrics.get("stall_memory", 0)
+            stall_bar = metrics.get("stall_barrier", 0)
+            l2_hit = metrics.get("l2_hit_rate", 0)
+
+            metrics_section = f"""
+## NCU Profiler Results from Previous Attempt:
+- Memory bandwidth utilization: {mem_pct:.1f}% of peak
+- Compute utilization: {compute_pct:.1f}% of peak
+- SM occupancy: {occupancy:.1f}%
+- Memory stall rate: {stall_mem:.1f}%
+- Barrier stall rate: {stall_bar:.1f}%
+- L2 cache hit rate: {l2_hit:.1f}%
+
+"""
+            # Add bottleneck-specific hints
+            if stall_mem > 30:
+                metrics_section += (
+                    "BOTTLENECK: Memory-bound (high memory stalls). Priorities:\n"
+                    "- Use float4/uint4 vectorized loads (128-bit per transaction)\n"
+                    "- Fuse passes to reduce global memory round-trips\n"
+                    "- Use __ldg() for read-only data to leverage texture cache\n"
+                    "- Cache intermediate results in registers, not global memory\n\n"
+                )
+            elif stall_bar > 20:
+                metrics_section += (
+                    "BOTTLENECK: Sync-bound (high barrier stalls). Priorities:\n"
+                    "- Replace __syncthreads() reductions with warp shuffles\n"
+                    "- Reduce number of synchronization points\n"
+                    "- Use warp-level primitives (__shfl_xor_sync, __shfl_down_sync)\n\n"
+                )
+            elif occupancy < 40:
+                metrics_section += (
+                    "BOTTLENECK: Low occupancy. Priorities:\n"
+                    "- Reduce register pressure (fewer local variables, smaller arrays)\n"
+                    "- Reduce shared memory usage per block\n"
+                    "- Consider smaller block sizes or fewer registers per thread\n\n"
+                )
+            elif compute_pct > 60:
+                metrics_section += (
+                    "BOTTLENECK: Compute-bound. Priorities:\n"
+                    "- Use fast math intrinsics (__expf, __frcp_rn, __frsqrt_rn)\n"
+                    "- Increase ILP with register tiling (process 4+ elements per iteration)\n"
+                    "- Use FP4 lookup tables instead of arithmetic encoding\n\n"
+                )
+
+        # ── B200 hardware context ──
+        hw_context = (
+            "## B200 Hardware (use these numbers to guide optimization):\n"
+            "- HBM3e: 8 TB/s bandwidth → for 128×2048 bf16 (512 KB input), theoretical min = 0.06 us\n"
+            "- 142 SMs, 228 KB shared memory per SM, 255 registers per thread\n"
+            "- Warp size: 32, max 2048 threads per SM\n"
+            "- 128-bit load/store transactions (float4 = 4×fp32, uint4 = 8×bf16)\n"
+            "- Fast math SFU: __expf ~4 cycles vs expf ~20 cycles\n"
+            "- Warp shuffle: __shfl_xor_sync costs ~2 cycles vs shared mem reduction ~10+ cycles\n"
+        )
+
+        return f"""\
+You are an expert CUDA kernel optimizer. You are refining a previous optimization attempt.
+
+## Status: {mode.upper().replace('_', ' ')}
+{feedback}
+{metrics_section}
+{hw_context}
+
+## Previous kernel code (your starting point — improve it):
+```cuda
+{code}
+```
+
+CRITICAL RULES:
+1. Return the COMPLETE .cu file in a single ```cuda code block
+2. Keep all #includes (use the original #include directives, NOT the expanded content)
+3. Keep ALL kernel functions and the launch_* wrapper function
+4. Do NOT change the launch_* function signature
+5. Output must match reference within atol=1e-2
+6. No explanations — just the code block
+7. You may call any function defined in the included headers. Do NOT invent
+   helper functions that aren't defined in the headers.
+"""
 
     async def refine_beams(self, survivors: list, round_num: int) -> list:
         tasks = []
         for candidate in survivors:
-            strategy     = self._bottleneck_to_strategy(candidate.bottleneck, candidate.strategy)
-            # Pass the full candidate code so the LLM returns a complete compilable file
-            kernel_slice = candidate.code if candidate.code else self.env.kernel_src
-            tasks.append(
-                self._generate_single_beam(
-                    strategy=strategy,
-                    kernel_slice=kernel_slice,
-                    current_metrics=candidate.metrics,
-                    round_num=round_num,
-                )
-            )
+            prompt = self._build_reflection_prompt(candidate)
+            tasks.append(self._refine_single_beam(prompt, candidate, round_num))
         return list(await asyncio.gather(*tasks))
+
+    async def _refine_single_beam(self, prompt: str, parent: 'KernelCandidate', round_num: int) -> 'KernelCandidate':
+        """Run a reflection-based refinement for a single candidate."""
+        try:
+            response, _, _ = await self._call_llm_async(
+                prompt, model=self.sub_model, temperature=0.4
+            )
+        except RuntimeError as e:
+            logger.error("Budget exceeded during refine %s: %s", parent.strategy, e)
+            return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
+
+        code = self._extract_cuda_code(response)
+        if not code:
+            logger.warning("No CUDA code extracted for refinement of %s", parent.strategy)
+        return KernelCandidate(
+            code=code,
+            strategy=f"{parent.strategy}_r{round_num}",
+            round_num=round_num,
+            compile_ok=bool(code),
+        )
 
     # ── Combination step ──────────────────────────────────────────────────────
 
