@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .metrics import KernelMetrics, NCU_METRICS_QUERY, parse_ncu_csv_line, metrics_from_dict
+from .metrics import KernelMetrics, CompilerMetrics, NCU_METRICS_QUERY, parse_ncu_csv_line, metrics_from_dict
 from .hybrid_profiler import HybridProfiler
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,7 @@ class NCURunner:
                 hw_spec = {}
         self.hybrid = HybridProfiler(config, hw_spec)
         self._ncu_failed_permanently = False  # sticky flag after permission error
+        self._last_compiler_metrics = None    # set during compile_kernel
 
     # ── Compilation ───────────────────────────────────────────────────────────
 
@@ -65,7 +66,8 @@ class NCURunner:
         harness_src: str,
         output_name: str = "kernel_bench",
     ) -> tuple:
-        """Compile kernel + harness. Returns (success, error_msg, binary_path)."""
+        """Compile kernel + harness. Returns (success, error_msg, binary_path).
+        Also extracts compiler metrics (registers, spills) via -Xptxas,-v."""
         build_dir = self.output_dir / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,7 +75,8 @@ class NCURunner:
         binary_file = build_dir / output_name
         kernel_file.write_text(kernel_src + "\n\n" + harness_src)
 
-        cmd = [self.nvcc] + self.nvcc_flags + [str(kernel_file), "-o", str(binary_file)]
+        # Add -Xptxas,-v to get register/spill info from compiler
+        cmd = [self.nvcc] + self.nvcc_flags + ["-Xptxas,-v", str(kernel_file), "-o", str(binary_file)]
         logger.info("Compiling: %s", " ".join(cmd[:4]) + " ...")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -81,7 +84,135 @@ class NCURunner:
             logger.warning("Compilation failed:\n%s", result.stderr[:400])
             return False, result.stderr, binary_file
 
+        # Parse compiler metrics from ptxas verbose output
+        compiler_metrics = self._parse_ptxas_verbose(result.stderr)
+
+        # Run SASS disassembly for instruction mix
+        sass_metrics = self._parse_sass_disassembly(binary_file)
+        if sass_metrics:
+            compiler_metrics.sass_total_instructions = sass_metrics.sass_total_instructions
+            compiler_metrics.sass_ldg_32 = sass_metrics.sass_ldg_32
+            compiler_metrics.sass_ldg_64 = sass_metrics.sass_ldg_64
+            compiler_metrics.sass_ldg_128 = sass_metrics.sass_ldg_128
+            compiler_metrics.sass_stg_32 = sass_metrics.sass_stg_32
+            compiler_metrics.sass_stg_64 = sass_metrics.sass_stg_64
+            compiler_metrics.sass_stg_128 = sass_metrics.sass_stg_128
+            compiler_metrics.sass_lds = sass_metrics.sass_lds
+            compiler_metrics.sass_sts = sass_metrics.sass_sts
+            compiler_metrics.sass_ldl = sass_metrics.sass_ldl
+            compiler_metrics.sass_stl = sass_metrics.sass_stl
+            compiler_metrics.sass_ffma = sass_metrics.sass_ffma
+            compiler_metrics.sass_hfma2 = sass_metrics.sass_hfma2
+            compiler_metrics.sass_mufu = sass_metrics.sass_mufu
+            compiler_metrics.sass_fadd = sass_metrics.sass_fadd
+            compiler_metrics.sass_fmul = sass_metrics.sass_fmul
+            compiler_metrics.sass_bar = sass_metrics.sass_bar
+            compiler_metrics.sass_shfl = sass_metrics.sass_shfl
+            compiler_metrics.sass_bra = sass_metrics.sass_bra
+
+        logger.info("Compiler metrics: %s", compiler_metrics.summary_str())
+
+        # Store on the instance so profiler can access it
+        self._last_compiler_metrics = compiler_metrics
+
         return True, "", binary_file
+
+    def _parse_ptxas_verbose(self, stderr: str) -> CompilerMetrics:
+        """Parse nvcc -Xptxas,-v output for register count, spills, shared memory."""
+        cm = CompilerMetrics()
+
+        # Match: Used N registers, M bytes smem, K bytes cmem[0]
+        reg_match = re.search(r'Used\s+(\d+)\s+registers', stderr)
+        if reg_match:
+            cm.registers_per_thread = int(reg_match.group(1))
+
+        smem_match = re.search(r'(\d+)\s+bytes\s+smem', stderr)
+        if smem_match:
+            cm.static_smem_bytes = int(smem_match.group(1))
+
+        cmem_match = re.search(r'(\d+)\s+bytes\s+cmem\[0\]', stderr)
+        if cmem_match:
+            cm.cmem_bytes = int(cmem_match.group(1))
+
+        # Match: N bytes stack frame, M bytes spill stores, K bytes spill loads
+        stack_match = re.search(r'(\d+)\s+bytes\s+stack\s+frame', stderr)
+        if stack_match:
+            cm.stack_frame_bytes = int(stack_match.group(1))
+
+        spill_st = re.search(r'(\d+)\s+bytes\s+spill\s+stores', stderr)
+        if spill_st:
+            cm.spill_stores_bytes = int(spill_st.group(1))
+
+        spill_ld = re.search(r'(\d+)\s+bytes\s+spill\s+loads', stderr)
+        if spill_ld:
+            cm.spill_loads_bytes = int(spill_ld.group(1))
+
+        return cm
+
+    def _parse_sass_disassembly(self, binary_path: Path) -> Optional[CompilerMetrics]:
+        """Disassemble binary with cuobjdump -sass and count instruction types."""
+        try:
+            result = subprocess.run(
+                ["cuobjdump", "-sass", str(binary_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.debug("cuobjdump failed: %s", result.stderr[:200])
+                return None
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            logger.debug("cuobjdump not available or timed out")
+            return None
+
+        sass = result.stdout
+        cm = CompilerMetrics()
+
+        # Count instruction opcodes from SASS output
+        # SASS lines look like: /*0080*/  LDG.E.128.SYS R4, [R2] ;
+        instructions = re.findall(r'/\*[0-9a-f]+\*/\s+([A-Z][A-Z0-9_.]+)', sass)
+        cm.sass_total_instructions = len(instructions)
+
+        for inst in instructions:
+            # Global loads by width
+            if inst.startswith("LDG"):
+                if ".128" in inst:
+                    cm.sass_ldg_128 += 1
+                elif ".64" in inst:
+                    cm.sass_ldg_64 += 1
+                else:
+                    cm.sass_ldg_32 += 1
+            elif inst.startswith("STG"):
+                if ".128" in inst:
+                    cm.sass_stg_128 += 1
+                elif ".64" in inst:
+                    cm.sass_stg_64 += 1
+                else:
+                    cm.sass_stg_32 += 1
+            elif inst.startswith("LDS"):
+                cm.sass_lds += 1
+            elif inst.startswith("STS"):
+                cm.sass_sts += 1
+            elif inst.startswith("LDL"):
+                cm.sass_ldl += 1
+            elif inst.startswith("STL"):
+                cm.sass_stl += 1
+            elif inst.startswith("FFMA"):
+                cm.sass_ffma += 1
+            elif inst.startswith("HFMA2"):
+                cm.sass_hfma2 += 1
+            elif inst.startswith("MUFU"):
+                cm.sass_mufu += 1
+            elif inst.startswith("FADD"):
+                cm.sass_fadd += 1
+            elif inst.startswith("FMUL"):
+                cm.sass_fmul += 1
+            elif inst == "BAR" or inst.startswith("BAR."):
+                cm.sass_bar += 1
+            elif inst.startswith("SHFL"):
+                cm.sass_shfl += 1
+            elif inst.startswith("BRA"):
+                cm.sass_bra += 1
+
+        return cm if cm.sass_total_instructions > 0 else None
 
     # ── Profiling ─────────────────────────────────────────────────────────────
 
@@ -205,6 +336,7 @@ class NCURunner:
             kernel_type=kernel_type,
             problem_shape=problem_shape,
             baseline_us=baseline_us,
+            compiler_metrics=self._last_compiler_metrics,
         )
 
     def _export_and_parse(self, report_path: Path) -> Optional[KernelMetrics]:

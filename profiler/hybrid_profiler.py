@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .metrics import KernelMetrics
+from .metrics import KernelMetrics, CompilerMetrics
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -202,71 +202,85 @@ class HybridProfiler:
         kernel_type: str,
         problem_shape: tuple,
         baseline_us: float = 0.0,
+        compiler_metrics: Optional[CompilerMetrics] = None,
     ) -> Optional[KernelMetrics]:
         if timing_us <= 0:
             return None
 
         timing_sec = timing_us / 1e6
+        cm = compiler_metrics or CompilerMetrics()
 
-        # ── 0. Analyze source patterns ────────────────────────────────────
+        # ── 0. Analyze source patterns (fallback for missing compiler data) ─
         sp = analyze_source(kernel_src)
 
-        # ── 1. Source-adjusted data movement ──────────────────────────────
+        # ── 1. Data movement (analytical baseline) ──────────────────────────
         base_read, base_write = self._compute_data_movement(kernel_type, problem_shape)
-        mem_eff = self._memory_efficiency_factor(sp)
-        effective_read = base_read * mem_eff
-        effective_write = base_write * mem_eff
-        total_bytes = effective_read + effective_write
+        total_bytes = base_read + base_write
 
-        # ── 2. Source-adjusted FLOPs ──────────────────────────────────────
-        base_flops = self._estimate_flops(kernel_type, problem_shape)
-        compute_eff = self._compute_efficiency_factor(sp)
-        effective_flops = base_flops * compute_eff
-
-        # ── 3. Bandwidth & throughput percentages ─────────────────────────
+        # ── 2. ACHIEVED bandwidth from TIMING (primary signal) ──────────────
+        # This is the REAL metric — different candidates with different timings
+        # get genuinely different bandwidth numbers
         achieved_bw = total_bytes / timing_sec
         mem_throughput_pct = min(100.0, (achieved_bw / self.peak_mem_bw_bytes_per_sec) * 100)
+        dram_read_bw_gbps = base_read / timing_sec / 1e9
 
-        achieved_flops_rate = effective_flops / timing_sec
+        # ── 3. Compute throughput from SASS or analytical ───────────────────
+        if cm.sass_total_instructions > 0:
+            # Real FLOPs from SASS disassembly
+            total_flops = (cm.sass_ffma * 2 + cm.sass_fadd + cm.sass_fmul +
+                           cm.sass_hfma2 * 4 + cm.sass_mufu)
+            achieved_flops_rate = total_flops / timing_sec if total_flops > 0 else 0
+        else:
+            base_flops = self._estimate_flops(kernel_type, problem_shape)
+            achieved_flops_rate = base_flops / timing_sec
+
         compute_throughput_pct = min(100.0, (achieved_flops_rate / self.peak_fp32_flops) * 100)
         fp32_throughput_pct = compute_throughput_pct
 
-        dram_read_bw_gbps = effective_read / timing_sec / 1e9
-
-        # ── 4. Occupancy (CUDA API with actual register pressure) ─────────
+        # ── 4. Occupancy from CUDA API (uses real register count) ───────────
         block_size, shared_mem = self._parse_launch_config(kernel_src)
+        # Override shared_mem with compiler's exact value if available
+        if cm.static_smem_bytes > 0:
+            shared_mem = cm.static_smem_bytes
         gpu_occupancy = self._query_occupancy_from_binary(kernel_src, block_size, shared_mem)
         if gpu_occupancy is None:
-            gpu_occupancy = self._compute_theoretical_occupancy(block_size, shared_mem)
+            gpu_occupancy = self._compute_theoretical_occupancy(
+                block_size, shared_mem, cm.registers_per_thread
+            )
 
-        # ── 5. Source-differentiated stall estimates ──────────────────────
-        stall_memory, stall_barrier, stall_no_inst, stall_mio = self._estimate_stalls(
-            sp, mem_throughput_pct, compute_throughput_pct, gpu_occupancy
+        # ── 5. Stall estimates from SASS + timing ──────────────────────────
+        stall_memory, stall_barrier, stall_no_inst, stall_mio = self._estimate_stalls_from_compiler(
+            cm, sp, mem_throughput_pct, compute_throughput_pct, gpu_occupancy
         )
 
-        # ── 6. Source-adjusted instruction estimates ──────────────────────
-        inst_load, inst_store, inst_fp32, inst_fp16 = self._estimate_instructions(
-            kernel_type, problem_shape, sp
-        )
-        inst_executed = inst_load + inst_store + inst_fp32 + inst_fp16
+        # ── 6. Instructions from SASS (real) or analytical (fallback) ──────
+        if cm.sass_total_instructions > 0:
+            inst_load = float(cm.sass_ldg_32 + cm.sass_ldg_64 + cm.sass_ldg_128 + cm.sass_lds)
+            inst_store = float(cm.sass_stg_32 + cm.sass_stg_64 + cm.sass_stg_128 + cm.sass_sts)
+            inst_fp32 = float(cm.sass_ffma + cm.sass_fadd + cm.sass_fmul + cm.sass_mufu)
+            inst_fp16 = float(cm.sass_hfma2)
+            inst_executed = float(cm.sass_total_instructions)
+        else:
+            inst_load, inst_store, inst_fp32, inst_fp16 = self._estimate_instructions(
+                kernel_type, problem_shape, sp
+            )
+            inst_executed = inst_load + inst_store + inst_fp32 + inst_fp16
 
-        # ── 7. Cycle estimates ────────────────────────────────────────────
+        # ── 7. Cycle estimates ─────────────────────────────────────────────
         sm_clock_ghz = 2.1
         elapsed_cycles = timing_us * 1e-6 * sm_clock_ghz * 1e9 * self.sm_count
         active_cycles = elapsed_cycles * gpu_occupancy / 100.0
 
-        # ── 8. L2 cache estimates (source-aware) ─────────────────────────
-        l2_hit_rate = self._estimate_l2_hit_rate(sp, base_read + base_write, total_bytes, timing_sec)
+        # ── 8. L2 cache estimates ──────────────────────────────────────────
+        l2_hit_rate = self._estimate_l2_hit_rate(sp, total_bytes, total_bytes, timing_sec)
         l2_sector_size = 32
-        l2_read_sectors = effective_read / l2_sector_size
-        l2_write_sectors = effective_write / l2_sector_size
+        l2_read_sectors = base_read / l2_sector_size
+        l2_write_sectors = base_write / l2_sector_size
 
-        # L1/L2 throughput: adjusted by access patterns
-        l1_boost = 1.3 if sp.has_smem_caching else 1.1
-        l1_throughput_pct = min(100.0, mem_throughput_pct * l1_boost)
+        l1_throughput_pct = min(100.0, mem_throughput_pct * 1.2)
         l2_throughput_pct = min(100.0, mem_throughput_pct * 1.1)
 
-        # ── 9. Speedup ───────────────────────────────────────────────────
+        # ── 9. Speedup ────────────────────────────────────────────────────
         speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 1.0
 
         metrics = KernelMetrics(
@@ -284,8 +298,8 @@ class HybridProfiler:
             l2_hit_rate=round(l2_hit_rate, 2),
             l2_read_sectors=round(l2_read_sectors, 2),
             l2_write_sectors=round(l2_write_sectors, 2),
-            dram_read_bytes=round(effective_read, 2),
-            dram_write_bytes=round(effective_write, 2),
+            dram_read_bytes=round(base_read, 2),
+            dram_write_bytes=round(base_write, 2),
             dram_read_bw_gbps=round(dram_read_bw_gbps, 2),
             inst_executed=round(inst_executed, 2),
             inst_fp32=round(inst_fp32, 2),
@@ -298,15 +312,27 @@ class HybridProfiler:
             speedup=speedup,
         )
 
-        logger.info(
-            "Hybrid profiler: mem=%.1f%% compute=%.1f%% occ=%.1f%% "
-            "stall_mem=%.1f%% stall_bar=%.1f%% bw=%.1f GB/s "
-            "[vec_ld=%d smem=%d sync=%d shfl=%d mem_eff=%.2f]",
-            mem_throughput_pct, compute_throughput_pct, gpu_occupancy,
-            stall_memory, stall_barrier, dram_read_bw_gbps,
-            sp.vectorized_loads, sp.smem_declarations, sp.syncthreads,
-            sp.shfl_ops, mem_eff,
-        )
+        # Store compiler metrics on the KernelMetrics for the reflection prompt
+        metrics._compiler_metrics = cm
+
+        # Build log message with real data
+        log_parts = [
+            f"mem={mem_throughput_pct:.1f}%",
+            f"compute={compute_throughput_pct:.1f}%",
+            f"occ={gpu_occupancy:.1f}%",
+            f"stall_mem={stall_memory:.1f}%",
+            f"stall_bar={stall_barrier:.1f}%",
+            f"bw={dram_read_bw_gbps:.1f} GB/s",
+        ]
+        if cm.registers_per_thread > 0:
+            log_parts.append(f"regs={cm.registers_per_thread}")
+        if cm.has_spills:
+            log_parts.append(f"SPILLS={cm.spill_stores_bytes}B")
+        if cm.sass_total_instructions > 0:
+            log_parts.append(f"sass={cm.sass_total_instructions}")
+            log_parts.append(f"vec_ld%={cm.vectorized_load_pct:.0f}")
+
+        logger.info("Hybrid profiler: %s", " ".join(log_parts))
         return metrics
 
     # ── Source-Aware Efficiency Factors ─────────────────────────────────────
@@ -527,11 +553,22 @@ int main() {{
             logger.debug("Occupancy query failed: %s", e)
         return None
 
-    def _compute_theoretical_occupancy(self, block_size: int, shared_mem: int) -> float:
+    def _compute_theoretical_occupancy(
+        self, block_size: int, shared_mem: int, registers_per_thread: int = 0
+    ) -> float:
         warps_per_block = math.ceil(block_size / self.warp_size)
         max_by_warps = self.max_warps_per_sm // warps_per_block if warps_per_block > 0 else 0
         max_by_smem = int(self.shared_mem_per_sm / shared_mem) if shared_mem > 0 else self.max_blocks_per_sm
-        active_blocks = min(max_by_warps, max_by_smem, self.max_blocks_per_sm)
+
+        # Register-based occupancy limit (B200: 65536 registers per SM)
+        regs_per_sm = 65536
+        if registers_per_thread > 0:
+            regs_per_block = registers_per_thread * block_size
+            max_by_regs = regs_per_sm // regs_per_block if regs_per_block > 0 else self.max_blocks_per_sm
+        else:
+            max_by_regs = self.max_blocks_per_sm
+
+        active_blocks = min(max_by_warps, max_by_smem, max_by_regs, self.max_blocks_per_sm)
         active_warps = active_blocks * warps_per_block
         return min(100.0, max(0.0, active_warps / self.max_warps_per_sm * 100.0))
 
@@ -602,6 +639,80 @@ int main() {{
             stall_mio = min(30.0, sp.smem_declarations * 3.0 + sp.smem_reads * 0.3)
         else:
             stall_mio = max(1.0, mem_pct * 0.05)
+
+        return stall_memory, stall_barrier, stall_no_inst, stall_mio
+
+    # ── Compiler-Aware Stall Estimation ────────────────────────────────────
+
+    def _estimate_stalls_from_compiler(
+        self,
+        cm: CompilerMetrics,
+        sp: SourceProfile,
+        mem_pct: float,
+        compute_pct: float,
+        occupancy_pct: float,
+    ) -> tuple[float, float, float, float]:
+        """Estimate stalls from COMPILER METRICS (real data) + source patterns.
+        Uses SASS instruction counts and register pressure for differentiation."""
+
+        has_sass = cm.sass_total_instructions > 0
+        both_low = mem_pct < 30 and compute_pct < 30
+
+        # ── Memory stall: based on spills + memory instruction ratio ──────
+        if has_sass:
+            # Spills are a strong signal of memory pressure
+            spill_penalty = cm.spill_instruction_ratio * 5.0  # each % of spills = 5% stall
+            mem_inst_ratio = cm.memory_instruction_ratio
+
+            if both_low:
+                stall_memory = max(35.0, 50.0 + spill_penalty - occupancy_pct * 0.2)
+            elif mem_pct > 50:
+                stall_memory = mem_pct * 0.7 + spill_penalty
+            else:
+                stall_memory = max(10.0, mem_inst_ratio * 0.8 + spill_penalty)
+
+            # Vectorized loads reduce stalls
+            if cm.vectorized_load_pct > 50:
+                stall_memory *= max(0.5, 1.0 - cm.vectorized_load_pct / 200.0)
+        else:
+            # Fallback to source-based
+            stall_memory, _, _, _ = self._estimate_stalls(
+                sp, mem_pct, compute_pct, occupancy_pct
+            )
+
+        stall_memory = max(3.0, min(80.0, stall_memory))
+
+        # ── Barrier stall: from SASS BAR count ────────────────────────────
+        if has_sass:
+            bar_ratio = (cm.sass_bar / cm.sass_total_instructions * 100) if cm.sass_total_instructions > 0 else 0
+            stall_barrier = min(55.0, bar_ratio * 15.0 + cm.sass_bar * 2.0)
+            # Warp shuffles replace barriers
+            if cm.sass_shfl > 0:
+                stall_barrier *= max(0.4, 1.0 - cm.sass_shfl / max(cm.sass_bar, 1) * 0.3)
+        else:
+            stall_barrier = min(55.0, sp.syncthreads * 4.0)
+            if sp.has_warp_level_ops:
+                stall_barrier *= 0.6
+
+        stall_barrier = max(1.0, stall_barrier)
+
+        # ── No-instruction stall: from occupancy + register pressure ──────
+        if cm.registers_per_thread > 0:
+            # High register count → fewer warps → more no-instruction stalls
+            reg_pressure = max(0, cm.registers_per_thread - 32) * 1.5
+            stall_no_inst = (100.0 - occupancy_pct) * 0.3 + reg_pressure
+        elif occupancy_pct < 50:
+            stall_no_inst = (100.0 - occupancy_pct) * 0.4
+        else:
+            stall_no_inst = max(2.0, (100.0 - occupancy_pct) * 0.15)
+        stall_no_inst = max(2.0, min(40.0, stall_no_inst))
+
+        # ── MIO throttle: from shared memory access density ───────────────
+        if has_sass:
+            smem_density = ((cm.sass_lds + cm.sass_sts) / cm.sass_total_instructions * 100) if cm.sass_total_instructions > 0 else 0
+            stall_mio = min(30.0, smem_density * 3.0)
+        else:
+            stall_mio = min(30.0, sp.smem_declarations * 3.0 + sp.smem_reads * 0.3) if sp.smem_declarations > 0 else max(1.0, mem_pct * 0.05)
 
         return stall_memory, stall_barrier, stall_no_inst, stall_mio
 

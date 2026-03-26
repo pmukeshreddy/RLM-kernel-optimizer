@@ -316,7 +316,7 @@ CRITICAL RULES:
                 f"Push further by combining multiple techniques or finding the remaining bottleneck."
             )
 
-        # ── Build NCU metrics feedback ──
+        # ── Build profiler metrics feedback ──
         metrics_section = ""
         if metrics:
             mem_pct = metrics.get("mem_throughput_pct", 0)
@@ -325,59 +325,111 @@ CRITICAL RULES:
             stall_mem = metrics.get("stall_memory", 0)
             stall_bar = metrics.get("stall_barrier", 0)
             l2_hit = metrics.get("l2_hit_rate", 0)
+            bw_gbps = metrics.get("dram_read_bw_gbps", 0)
 
             metrics_section = f"""
-## NCU Profiler Results from Previous Attempt:
-- Memory bandwidth utilization: {mem_pct:.1f}% of peak
+## Profiler Results from Previous Attempt:
+### Timing (MEASURED):
+- Speedup: {speedup:.3f}x
+- Achieved bandwidth: {bw_gbps:.1f} GB/s ({mem_pct:.1f}% of 6.0 TB/s peak)
 - Compute utilization: {compute_pct:.1f}% of peak
 - SM occupancy: {occupancy:.1f}%
 - Memory stall rate: {stall_mem:.1f}%
 - Barrier stall rate: {stall_bar:.1f}%
-- L2 cache hit rate: {l2_hit:.1f}%
-
 """
+
+            # ── Compiler metrics (registers, spills, SASS) ──
+            cm = metrics.get("_compiler", {})
+            if cm:
+                regs = cm.get("registers_per_thread", 0)
+                spill_st = cm.get("spill_stores_bytes", 0)
+                spill_ld = cm.get("spill_loads_bytes", 0)
+                smem = cm.get("static_smem_bytes", 0)
+                sass_total = cm.get("sass_total_instructions", 0)
+
+                metrics_section += f"""
+### Binary Analysis (FROM COMPILER — exact values):
+- Registers per thread: {regs} {'(>32 limits occupancy!)' if regs > 32 else '(good)'}
+- Register spills: {spill_ld + spill_st} bytes {'⚠ SPILLING TO SLOW LOCAL MEMORY' if spill_ld + spill_st > 0 else '(none — good)'}
+- Shared memory: {smem} bytes
+"""
+                if sass_total > 0:
+                    ldg_128 = cm.get("sass_ldg_128", 0)
+                    ldg_32 = cm.get("sass_ldg_32", 0)
+                    ldg_64 = cm.get("sass_ldg_64", 0)
+                    stg_128 = cm.get("sass_stg_128", 0)
+                    stg_32 = cm.get("sass_stg_32", 0)
+                    lds = cm.get("sass_lds", 0)
+                    sts = cm.get("sass_sts", 0)
+                    ldl = cm.get("sass_ldl", 0)
+                    stl = cm.get("sass_stl", 0)
+                    ffma = cm.get("sass_ffma", 0)
+                    hfma2 = cm.get("sass_hfma2", 0)
+                    mufu = cm.get("sass_mufu", 0)
+                    bar = cm.get("sass_bar", 0)
+                    shfl = cm.get("sass_shfl", 0)
+
+                    total_ldg = ldg_32 + ldg_64 + ldg_128
+                    vec_pct = (ldg_128 / total_ldg * 100) if total_ldg > 0 else 0
+
+                    metrics_section += f"""
+### SASS Instruction Mix (FROM DISASSEMBLY — ground truth):
+- Total instructions: {sass_total}
+- Global loads: {total_ldg} [128-bit: {ldg_128}, 64-bit: {ldg_64}, 32-bit: {ldg_32}] → vectorization: {vec_pct:.0f}%
+- Global stores: {stg_32 + stg_128} [128-bit: {stg_128}, 32-bit: {stg_32}]
+- Shared mem: {lds} loads, {sts} stores
+- Spill instructions: {ldl + stl} {'⚠ REGISTER SPILLS IN BINARY' if ldl + stl > 0 else '(none)'}
+- Compute: FFMA={ffma} HFMA2={hfma2} MUFU(SFU)={mufu}
+- Barriers: {bar}  Shuffles: {shfl}
+"""
+
             # Add bottleneck-specific hints
-            if mem_pct < 30 and compute_pct < 30:
-                # Latency-bound: problem too small to saturate B200's massive bandwidth
+            regs = cm.get("registers_per_thread", 0) if cm else 0
+            has_spills = (cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)) > 0 if cm else False
+
+            if has_spills:
                 metrics_section += (
-                    "BOTTLENECK: Latency-bound (problem too small to saturate B200's 8 TB/s bandwidth).\n"
-                    "The kernel is fast but hardware is underutilized. Priorities:\n"
+                    "\n⚠ CRITICAL: Kernel has REGISTER SPILLS. This means the compiler ran out of\n"
+                    "registers and is using slow local memory. This is likely your #1 performance issue.\n"
+                    "- Reduce local variables and arrays\n"
+                    "- Use fewer registers per thread (simpler per-thread logic)\n"
+                    "- Consider smaller block size to give each thread more registers\n\n"
+                )
+            elif regs > 32 and occupancy < 60:
+                metrics_section += (
+                    f"\nBOTTLENECK: Register pressure ({regs} regs/thread → occupancy={occupancy:.0f}%).\n"
+                    f"With {regs} registers, fewer warps can be active simultaneously.\n"
+                    "- Reduce register usage: fewer local variables, recompute instead of caching\n"
+                    "- Target ≤32 registers for 100% occupancy on B200\n\n"
+                )
+            elif mem_pct < 30 and compute_pct < 30:
+                metrics_section += (
+                    "\nBOTTLENECK: Latency-bound (both bandwidth and compute underutilized).\n"
+                    "Priorities:\n"
                     "- REDUCE PASSES: fuse all operations into a single pass over data\n"
-                    "- MINIMIZE GLOBAL MEMORY READS: cache intermediate values in registers\n"
-                    "  (e.g., compute add+norm+quantize on each element in one pass, no residual_out rewrite)\n"
-                    "- MAXIMIZE ILP: each thread should process 8-16 elements with loop unrolling\n"
+                    "- MINIMIZE GLOBAL READS: cache in registers, not residual_out rewrite\n"
+                    "- MAXIMIZE ILP: each thread processes 8-16 elements with unrolling\n"
                     "- Use warp shuffles for reductions instead of shared memory + __syncthreads\n"
-                    "- Consider processing multiple rows per block to increase work per kernel launch\n"
-                    "- Avoid extra kernel launches or multi-phase approaches\n\n"
+                    "- Process multiple rows per block to increase work per launch\n\n"
                 )
             elif stall_mem > 30 and mem_pct > 30:
                 metrics_section += (
-                    "BOTTLENECK: Memory-bound (high memory stalls at high bandwidth utilization). Priorities:\n"
+                    "\nBOTTLENECK: Memory-bound. Priorities:\n"
                     "- Use float4/uint4 vectorized loads (128-bit per transaction)\n"
                     "- Fuse passes to reduce global memory round-trips\n"
-                    "- Use __ldg() for read-only data to leverage texture cache\n"
-                    "- Cache intermediate results in registers, not global memory\n\n"
+                    "- Use __ldg() for read-only data\n\n"
                 )
             elif stall_bar > 20:
                 metrics_section += (
-                    "BOTTLENECK: Sync-bound (high barrier stalls). Priorities:\n"
+                    "\nBOTTLENECK: Sync-bound (high barrier stalls). Priorities:\n"
                     "- Replace __syncthreads() reductions with warp shuffles\n"
-                    "- Reduce number of synchronization points\n"
-                    "- Use warp-level primitives (__shfl_xor_sync, __shfl_down_sync)\n\n"
-                )
-            elif occupancy < 40:
-                metrics_section += (
-                    "BOTTLENECK: Low occupancy. Priorities:\n"
-                    "- Reduce register pressure (fewer local variables, smaller arrays)\n"
-                    "- Reduce shared memory usage per block\n"
-                    "- Consider smaller block sizes or fewer registers per thread\n\n"
+                    "- Use __shfl_xor_sync, __shfl_down_sync\n\n"
                 )
             elif compute_pct > 60:
                 metrics_section += (
-                    "BOTTLENECK: Compute-bound. Priorities:\n"
-                    "- Use fast math intrinsics (__expf, __frcp_rn, __frsqrt_rn)\n"
-                    "- Increase ILP with register tiling (process 4+ elements per iteration)\n"
-                    "- Use FP4 lookup tables instead of arithmetic encoding\n\n"
+                    "\nBOTTLENECK: Compute-bound. Priorities:\n"
+                    "- Use fast math (__expf, __frcp_rn, __frsqrt_rn)\n"
+                    "- Increase ILP with register tiling\n\n"
                 )
 
         # ── B200 hardware context ──
