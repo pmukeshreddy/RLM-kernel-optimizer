@@ -31,6 +31,35 @@ def available() -> bool:
     return _HAS_FLASHINFER and torch.cuda.is_available()
 
 
+_jit_warmed_up = False
+
+def _jit_warmup():
+    """Trigger FlashInfer JIT compilation before any timing.
+
+    FlashInfer uses Triton/TVM backends that JIT-compile on first call.
+    This inflates the first baseline measurement if not pre-warmed.
+    """
+    global _jit_warmed_up
+    if _jit_warmed_up:
+        return
+    logger.info("FlashInfer JIT warmup (first call triggers compilation)...")
+    try:
+        # Small tensors to trigger JIT with minimal time
+        x = torch.randn(4, 256, dtype=torch.bfloat16, device="cuda")
+        r = torch.randn(4, 256, dtype=torch.bfloat16, device="cuda")
+        w = torch.ones(256, dtype=torch.bfloat16, device="cuda")
+        flashinfer.add_rmsnorm_fp4quant(x, r, w, eps=1e-6)
+        gs = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        flashinfer.fp4_quantize(x, global_scale=gs)
+        combined = torch.cat([x, r], dim=-1)
+        flashinfer.silu_and_mul(combined)
+        torch.cuda.synchronize()
+    except Exception as e:
+        logger.warning("JIT warmup partial failure (ok): %s", e)
+    _jit_warmed_up = True
+    logger.info("FlashInfer JIT warmup complete")
+
+
 def measure_baseline(kernel_type: str, shape: tuple) -> Optional[float]:
     """Measure FlashInfer baseline timing in microseconds.
 
@@ -38,6 +67,8 @@ def measure_baseline(kernel_type: str, shape: tuple) -> Optional[float]:
     """
     if not available():
         return None
+
+    _jit_warmup()
 
     try:
         if kernel_type == "add_rmsnorm":
