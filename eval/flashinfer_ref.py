@@ -84,12 +84,10 @@ def _baseline_add_rmsnorm(shape: tuple) -> float:
     inp = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
     res = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
     w   = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
-    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def run():
-        # Must include FP4 quantization — our kernel does add+rmsnorm+fp4quant fused
-        flashinfer.fused_add_rmsnorm(inp, res, w, eps=1e-6)
-        flashinfer.fp4_quantize(inp, global_scale=global_scale)
+        # Single fused call matching KernelArena: add + rmsnorm + fp4quant
+        flashinfer.add_rmsnorm_fp4quant(inp, res, w, eps=1e-6)
 
     return _time_fn(run)
 
@@ -117,17 +115,15 @@ def _reference_add_rmsnorm(shape: tuple, seed: int) -> dict:
 
 def _baseline_silu_mul(shape: tuple) -> float:
     b, m, k = shape
-    n = b * m * k
     torch.manual_seed(0)
-    gate = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-    up   = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-
+    gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def run():
-        # Must include FP4 quantization — our kernel does silu*mul+fp4quant fused
-        out = torch.nn.functional.silu(gate) * up
-        flashinfer.fp4_quantize(out.view(b * m, k), global_scale=global_scale)
+        # silu_and_mul + fp4_quantize (no single fused API available)
+        out = flashinfer.silu_and_mul(gate, up)
+        flashinfer.fp4_quantize(out, global_scale=global_scale)
 
     return _time_fn(run)
 
