@@ -153,22 +153,12 @@ def optimize_kernel(
 
     benchmarker = Benchmarker(env.search_config, kernel_type=kernel_type)
 
-    # Use FlashInfer baseline (already measured) or measure reference kernel
+    # Reuse the baseline measured at start (before GPU was hot from search)
+    # Re-measuring here gives inflated numbers due to thermal throttling
     baseline_per_shape = {}
     for s in env.problem_shapes:
-        fi_baseline = flashinfer_ref.measure_baseline(kernel_type, s)
-        if fi_baseline is not None:
-            baseline_per_shape[s] = fi_baseline
-            logger.info("FlashInfer baseline for shape %s: %.2f us", s, fi_baseline)
-        else:
-            ref_src = src_path.read_text()
-            measured = benchmarker._compile_and_time(ref_src, s)
-            if measured is not None:
-                baseline_per_shape[s] = measured
-                logger.info("Reference kernel baseline for %s: %.2f us", s, measured)
-            else:
-                baseline_per_shape[s] = baseline
-                logger.warning("Baseline measurement failed for %s, using %.2f us", s, baseline)
+        baseline_per_shape[s] = baseline
+    logger.info("Using search-time baseline for eval: %.2f us", baseline)
 
     bench_results = benchmarker.benchmark(best.code, baseline_per_shape)
 
