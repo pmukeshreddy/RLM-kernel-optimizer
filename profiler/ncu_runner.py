@@ -133,7 +133,7 @@ class NCURunner:
         ncu_cmd = [
             self.ncu_path,
             "--target-processes", "all",
-            "--kernel-name-base", kernel_regex,
+            "--kernel-name", kernel_regex,
             "--launch-skip", str(self.warmup),
             "--launch-count", str(self.profile_iter),
             "--metrics", NCU_METRICS_QUERY,
@@ -153,14 +153,23 @@ class NCURunner:
                     result.returncode, report_path.exists(),
                     len(result.stdout), len(result.stderr))
 
-        # Detect permanent failures (permissions, missing importer)
-        stderr_lower = result.stderr.lower()
-        if "err_nvgpuctrperm" in stderr_lower or "permission" in stderr_lower:
-            logger.warning("NCU permission error detected — switching to hybrid profiler permanently")
+        # Detect permanent failures (permissions, missing importer, version too old)
+        combined_output = (result.stderr + result.stdout).lower()
+        if "err_nvgpuctrperm" in combined_output or "permission" in combined_output:
+            logger.warning("NCU permission error — switching to hybrid profiler permanently")
             self._ncu_failed_permanently = True
             return None
-        if "importer" in stderr_lower and "not found" in stderr_lower:
+        if "importer" in combined_output and "not found" in combined_output:
             logger.warning("NCU importer missing — switching to hybrid profiler permanently")
+            self._ncu_failed_permanently = True
+            return None
+        if "no kernels were profiled" in combined_output:
+            logger.warning("NCU: no kernels profiled (NCU version may be too old for this GPU) "
+                          "— switching to hybrid profiler permanently")
+            self._ncu_failed_permanently = True
+            return None
+        if "argument" in combined_output and "invalid" in combined_output:
+            logger.warning("NCU: unsupported argument — switching to hybrid profiler permanently")
             self._ncu_failed_permanently = True
             return None
 
