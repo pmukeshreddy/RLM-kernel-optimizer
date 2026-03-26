@@ -86,7 +86,9 @@ def _baseline_add_rmsnorm(shape: tuple) -> float:
     w   = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
 
     def run():
+        # Must include FP4 quantization — our kernel does add+rmsnorm+fp4quant fused
         flashinfer.fused_add_rmsnorm(inp, res, w, eps=1e-6)
+        flashinfer.fp4_quantize(inp, block_size=16)
 
     return _time_fn(run)
 
@@ -120,7 +122,9 @@ def _baseline_silu_mul(shape: tuple) -> float:
     up   = torch.randn(n, dtype=torch.bfloat16, device="cuda")
 
     def run():
-        torch.nn.functional.silu(gate) * up
+        # Must include FP4 quantization — our kernel does silu*mul+fp4quant fused
+        out = torch.nn.functional.silu(gate) * up
+        flashinfer.fp4_quantize(out, block_size=16)
 
     return _time_fn(run)
 
