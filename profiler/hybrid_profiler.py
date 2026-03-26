@@ -225,10 +225,19 @@ class HybridProfiler:
         dram_read_bw_gbps = base_read / timing_sec / 1e9
 
         # ── 3. Compute throughput from SASS or analytical ───────────────────
+        # NOTE: SASS instruction counts are PER-THREAD. Must multiply by total
+        # threads launched to get actual FLOPs executed on the GPU.
+        block_size, shared_mem = self._parse_launch_config(kernel_src)
+        n_elements = self._shape_to_n(problem_shape)
+        # Estimate grid size: typically ceil(N / block_size) or ceil(rows / blocks)
+        grid_size = max(1, (n_elements + block_size - 1) // block_size)
+        total_threads = grid_size * block_size
+
         if cm.sass_total_instructions > 0:
-            # Real FLOPs from SASS disassembly
-            total_flops = (cm.sass_ffma * 2 + cm.sass_fadd + cm.sass_fmul +
-                           cm.sass_hfma2 * 4 + cm.sass_mufu)
+            # Real FLOPs from SASS disassembly — per thread
+            flops_per_thread = (cm.sass_ffma * 2 + cm.sass_fadd + cm.sass_fmul +
+                                cm.sass_hfma2 * 4 + cm.sass_mufu)
+            total_flops = flops_per_thread * total_threads
             achieved_flops_rate = total_flops / timing_sec if total_flops > 0 else 0
         else:
             base_flops = self._estimate_flops(kernel_type, problem_shape)
@@ -238,7 +247,7 @@ class HybridProfiler:
         fp32_throughput_pct = compute_throughput_pct
 
         # ── 4. Occupancy from CUDA API (uses real register count) ───────────
-        block_size, shared_mem = self._parse_launch_config(kernel_src)
+        # block_size already parsed above in step 3
         # Override shared_mem with compiler's exact value if available
         if cm.static_smem_bytes > 0:
             shared_mem = cm.static_smem_bytes
@@ -665,7 +674,9 @@ int main() {{
             mem_inst_ratio = cm.memory_instruction_ratio
 
             if both_low:
-                stall_memory = max(35.0, 50.0 + spill_penalty - occupancy_pct * 0.2)
+                # Latency-bound: base stall from memory instruction density,
+                # not a hardcoded floor — different kernels have different SASS mixes
+                stall_memory = 20.0 + mem_inst_ratio * 0.6 + spill_penalty - occupancy_pct * 0.1
             elif mem_pct > 50:
                 stall_memory = mem_pct * 0.7 + spill_penalty
             else:
