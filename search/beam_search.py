@@ -192,7 +192,7 @@ int main(int argc, char** argv) {{
         with self._env_lock:
             self.env.total_attempts += 1
 
-        compile_ok, err_msg, binary = self.profiler.compile_kernel(
+        compile_ok, err_msg, binary, compiler_metrics = self.profiler.compile_kernel(
             kernel_src=candidate.code, harness_src=harness, output_name=name,
         )
         if not compile_ok:
@@ -219,6 +219,7 @@ int main(int argc, char** argv) {{
                         problem_shape=problem_shape,
                         baseline_us=baseline_us,
                         timing_us=timing_us,
+                        compiler_metrics=compiler_metrics,
                     )
                     if metrics:
                         metrics.duration_us = timing_us

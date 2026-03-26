@@ -56,7 +56,6 @@ class NCURunner:
                 hw_spec = {}
         self.hybrid = HybridProfiler(config, hw_spec)
         self._ncu_failed_permanently = False  # sticky flag after permission error
-        self._last_compiler_metrics = None    # set during compile_kernel
 
     # ── Compilation ───────────────────────────────────────────────────────────
 
@@ -82,7 +81,7 @@ class NCURunner:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             logger.warning("Compilation failed:\n%s", result.stderr[:400])
-            return False, result.stderr, binary_file
+            return False, result.stderr, binary_file, None
 
         # Parse compiler metrics from ptxas verbose output
         compiler_metrics = self._parse_ptxas_verbose(result.stderr)
@@ -112,10 +111,7 @@ class NCURunner:
 
         logger.info("Compiler metrics: %s", compiler_metrics.summary_str())
 
-        # Store on the instance so profiler can access it
-        self._last_compiler_metrics = compiler_metrics
-
-        return True, "", binary_file
+        return True, "", binary_file, compiler_metrics
 
     def _parse_ptxas_verbose(self, stderr: str) -> CompilerMetrics:
         """Parse nvcc -Xptxas,-v output for register count, spills, shared memory."""
@@ -226,6 +222,7 @@ class NCURunner:
         problem_shape: tuple = (),
         baseline_us: float = 0.0,
         timing_us: float = 0.0,
+        compiler_metrics: 'CompilerMetrics' = None,
     ) -> Optional[KernelMetrics]:
         """
         Profile a compiled CUDA binary.
@@ -235,7 +232,8 @@ class NCURunner:
         # Skip NCU entirely if mode is hybrid or NCU has permanently failed
         if self.profiler_mode == "hybrid" or self._ncu_failed_permanently:
             return self._hybrid_fallback(
-                kernel_src, timing_us, kernel_type, problem_shape, baseline_us
+                kernel_src, timing_us, kernel_type, problem_shape, baseline_us,
+                compiler_metrics,
             )
 
         # Try NCU
@@ -245,7 +243,8 @@ class NCURunner:
         if metrics is None and kernel_src and kernel_type and problem_shape:
             logger.info("NCU returned no metrics — falling back to hybrid profiler")
             return self._hybrid_fallback(
-                kernel_src, timing_us, kernel_type, problem_shape, baseline_us
+                kernel_src, timing_us, kernel_type, problem_shape, baseline_us,
+                compiler_metrics,
             )
 
         return metrics
@@ -324,6 +323,7 @@ class NCURunner:
         kernel_type: str,
         problem_shape: tuple,
         baseline_us: float,
+        compiler_metrics: 'CompilerMetrics' = None,
     ) -> Optional[KernelMetrics]:
         """Use hybrid profiler as fallback."""
         if not kernel_src or not kernel_type or not problem_shape or timing_us <= 0:
@@ -336,7 +336,7 @@ class NCURunner:
             kernel_type=kernel_type,
             problem_shape=problem_shape,
             baseline_us=baseline_us,
-            compiler_metrics=self._last_compiler_metrics,
+            compiler_metrics=compiler_metrics,
         )
 
     def _export_and_parse(self, report_path: Path) -> Optional[KernelMetrics]:
@@ -408,7 +408,7 @@ class NCURunner:
         problem_shape: tuple = (),
     ) -> tuple:
         """Returns (compile_ok, metrics_or_None, speedup)."""
-        ok, err, binary = self.compile_kernel(kernel_src, harness_src, name)
+        ok, err, binary, cm = self.compile_kernel(kernel_src, harness_src, name)
         if not ok:
             return False, None, 0.0
 
@@ -421,7 +421,7 @@ class NCURunner:
             binary, report_name=name,
             kernel_src=kernel_src, kernel_type=kernel_type,
             problem_shape=problem_shape, baseline_us=baseline_us,
-            timing_us=timing_us,
+            timing_us=timing_us, compiler_metrics=cm,
         )
         if metrics:
             metrics.duration_us = timing_us
