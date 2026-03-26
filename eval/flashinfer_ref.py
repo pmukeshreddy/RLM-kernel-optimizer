@@ -84,11 +84,12 @@ def _baseline_add_rmsnorm(shape: tuple) -> float:
     inp = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
     res = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
     w   = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def run():
         # Must include FP4 quantization — our kernel does add+rmsnorm+fp4quant fused
         flashinfer.fused_add_rmsnorm(inp, res, w, eps=1e-6)
-        flashinfer.fp4_quantize(inp)
+        flashinfer.fp4_quantize(inp, global_scale=global_scale)
 
     return _time_fn(run)
 
@@ -121,10 +122,12 @@ def _baseline_silu_mul(shape: tuple) -> float:
     gate = torch.randn(n, dtype=torch.bfloat16, device="cuda")
     up   = torch.randn(n, dtype=torch.bfloat16, device="cuda")
 
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
     def run():
         # Must include FP4 quantization — our kernel does silu*mul+fp4quant fused
         out = torch.nn.functional.silu(gate) * up
-        flashinfer.fp4_quantize(out.view(b * m, k))
+        flashinfer.fp4_quantize(out.view(b * m, k), global_scale=global_scale)
 
     return _time_fn(run)
 
@@ -145,9 +148,10 @@ def _baseline_nvfp4_quantize(shape: tuple) -> float:
     m, k = shape
     torch.manual_seed(0)
     inp = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def run():
-        flashinfer.fp4_quantize(inp)
+        flashinfer.fp4_quantize(inp, global_scale=global_scale)
 
     return _time_fn(run)
 
@@ -156,7 +160,8 @@ def _reference_nvfp4_quantize(shape: tuple, seed: int) -> dict:
     m, k = shape
     torch.manual_seed(seed)
     inp = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
-    packed, scales = flashinfer.fp4_quantize(inp)
+    global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    packed, scales = flashinfer.fp4_quantize(inp, global_scale=global_scale)
     return {"input": inp, "packed": packed, "scales": scales}
 
 
