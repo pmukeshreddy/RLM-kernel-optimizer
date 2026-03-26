@@ -217,6 +217,9 @@ int main(int argc, char** argv) {{
                     if metrics:
                         metrics.duration_us = timing_us
                         metrics.speedup = speedup
+                        logger.info("  NCU metrics: %s", metrics.summary_str())
+                    else:
+                        logger.warning("  NCU profiling returned no metrics for [%s]", candidate.strategy)
                 ok = True
         candidate.compile_ok = ok
 

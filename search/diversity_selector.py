@@ -43,15 +43,27 @@ class DiversitySelector:
             clusters.setdefault(bottleneck, []).append((candidate, metrics))
 
         survivors = []
-        for bottleneck, group in clusters.items():
-            # Rank by candidate.speedup (set from timing), not metrics.speedup
-            # (which defaults to 1.0 when NCU profiling returns None)
-            best_c, best_m = max(group, key=lambda x: x[0].speedup)
-            best_c.bottleneck = bottleneck.value
-            best_c.metrics    = best_m.to_dict()
-            survivors.append(best_c)
-            logger.info("Cluster %s: best=%s speedup=%.3fx",
-                        bottleneck.value, best_c.strategy, best_c.speedup)
+        if len(clusters) == 1:
+            # All in one cluster (e.g., all "unknown") — keep top-K by speedup
+            # instead of just 1, so we don't waste beam width
+            group = list(clusters.values())[0]
+            bottleneck = list(clusters.keys())[0]
+            group.sort(key=lambda x: -x[0].speedup)
+            for c, m in group[:max_survivors]:
+                c.bottleneck = bottleneck.value
+                c.metrics = m.to_dict()
+                survivors.append(c)
+                logger.info("Cluster %s: %s speedup=%.3fx",
+                            bottleneck.value, c.strategy, c.speedup)
+        else:
+            for bottleneck, group in clusters.items():
+                # Rank by candidate.speedup (set from timing), not metrics.speedup
+                best_c, best_m = max(group, key=lambda x: x[0].speedup)
+                best_c.bottleneck = bottleneck.value
+                best_c.metrics    = best_m.to_dict()
+                survivors.append(best_c)
+                logger.info("Cluster %s: best=%s speedup=%.3fx",
+                            bottleneck.value, best_c.strategy, best_c.speedup)
 
         survivors.sort(key=lambda c: -c.speedup)
         return survivors[:max_survivors]

@@ -98,17 +98,22 @@ class NCURunner:
             return None
 
         if report_path.exists():
+            logger.debug("NCU report saved to %s", report_path)
             return self._export_and_parse(report_path)
         if result.stdout and "Metric Name" in result.stdout:
             return self._parse_ncu_csv(result.stdout)
+        # Log why we got nothing
+        logger.warning("NCU produced no report file and no CSV stdout. rc=%d stderr=%s stdout=%s",
+                       result.returncode, result.stderr[:200], result.stdout[:200])
         return None
 
     def _export_and_parse(self, report_path: Path) -> Optional[KernelMetrics]:
         export_cmd = [self.ncu_path, "--import", str(report_path), "--csv", "--page", "raw"]
         result = subprocess.run(export_cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
-            logger.error("NCU export failed: %s", result.stderr[:200])
+            logger.warning("NCU export failed (rc=%d): %s", result.returncode, result.stderr[:300])
             return None
+        logger.debug("NCU CSV export: %d bytes", len(result.stdout))
         return self._parse_ncu_csv(result.stdout)
 
     def _parse_ncu_csv(self, csv_text: str) -> Optional[KernelMetrics]:
@@ -124,8 +129,11 @@ class NCURunner:
             if metric_id in id_to_field:
                 raw[id_to_field[metric_id]] = parse_ncu_csv_line(metric_id, value_str)
         if not raw:
-            logger.warning("No recognizable metrics in NCU CSV")
+            logger.warning("No recognizable metrics in NCU CSV. Columns: %s, rows: %d",
+                          list(reader.fieldnames) if hasattr(reader, 'fieldnames') else 'unknown',
+                          sum(1 for _ in csv.DictReader(lines)))
             return None
+        logger.debug("Parsed %d NCU metrics: %s", len(raw), list(raw.keys()))
         return metrics_from_dict(raw)
 
     # ── Timing ────────────────────────────────────────────────────────────────
