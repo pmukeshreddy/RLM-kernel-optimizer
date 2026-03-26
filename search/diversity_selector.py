@@ -44,25 +44,26 @@ class DiversitySelector:
 
         survivors = []
         for bottleneck, group in clusters.items():
-            best_c, best_m = max(group, key=lambda x: x[1].speedup)
+            # Rank by candidate.speedup (set from timing), not metrics.speedup
+            # (which defaults to 1.0 when NCU profiling returns None)
+            best_c, best_m = max(group, key=lambda x: x[0].speedup)
             best_c.bottleneck = bottleneck.value
             best_c.metrics    = best_m.to_dict()
-            best_c.speedup    = best_m.speedup
             survivors.append(best_c)
             logger.info("Cluster %s: best=%s speedup=%.3fx",
-                        bottleneck.value, best_c.strategy, best_m.speedup)
+                        bottleneck.value, best_c.strategy, best_c.speedup)
 
         survivors.sort(key=lambda c: -c.speedup)
         return survivors[:max_survivors]
 
     def _top_k_select(self, candidates_with_metrics: list, max_survivors: int) -> list:
         viable = [(c, m) for c, m in candidates_with_metrics if c.compile_ok]
-        viable.sort(key=lambda x: -x[1].speedup)
+        # Rank by candidate.speedup (from timing), not metrics.speedup
+        viable.sort(key=lambda x: -x[0].speedup)
         survivors = []
         for candidate, metrics in viable[:max_survivors]:
             candidate.bottleneck = self.classifier.classify(metrics).value
             candidate.metrics    = metrics.to_dict()
-            candidate.speedup    = metrics.speedup
             survivors.append(candidate)
         return survivors
 

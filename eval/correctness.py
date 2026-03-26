@@ -341,7 +341,11 @@ class CorrectnessChecker:
             # Save reference tensors as raw binary
             for name, tensor in ref_data.items():
                 if isinstance(tensor, torch.Tensor):
-                    tensor.cpu().numpy().tofile(f"{tmpdir}/{name}.bin")
+                    # Use raw bytes to avoid numpy bf16 unsupported error
+                    with open(f"{tmpdir}/{name}.bin", "wb") as bf:
+                        bf.write(tensor.cpu().contiguous().numpy(force=True).tobytes()
+                                 if tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+                                 else bytes(tensor.cpu().contiguous().untyped_storage()))
 
             harness = _generate_flashinfer_harness(kernel_type, shape, tmpdir,
                                                     self.atol, self.rtol)
