@@ -337,9 +337,22 @@ CRITICAL RULES:
 
 """
             # Add bottleneck-specific hints
-            if stall_mem > 30:
+            if mem_pct < 30 and compute_pct < 30:
+                # Latency-bound: problem too small to saturate B200's massive bandwidth
                 metrics_section += (
-                    "BOTTLENECK: Memory-bound (high memory stalls). Priorities:\n"
+                    "BOTTLENECK: Latency-bound (problem too small to saturate B200's 8 TB/s bandwidth).\n"
+                    "The kernel is fast but hardware is underutilized. Priorities:\n"
+                    "- REDUCE PASSES: fuse all operations into a single pass over data\n"
+                    "- MINIMIZE GLOBAL MEMORY READS: cache intermediate values in registers\n"
+                    "  (e.g., compute add+norm+quantize on each element in one pass, no residual_out rewrite)\n"
+                    "- MAXIMIZE ILP: each thread should process 8-16 elements with loop unrolling\n"
+                    "- Use warp shuffles for reductions instead of shared memory + __syncthreads\n"
+                    "- Consider processing multiple rows per block to increase work per kernel launch\n"
+                    "- Avoid extra kernel launches or multi-phase approaches\n\n"
+                )
+            elif stall_mem > 30 and mem_pct > 30:
+                metrics_section += (
+                    "BOTTLENECK: Memory-bound (high memory stalls at high bandwidth utilization). Priorities:\n"
                     "- Use float4/uint4 vectorized loads (128-bit per transaction)\n"
                     "- Fuse passes to reduce global memory round-trips\n"
                     "- Use __ldg() for read-only data to leverage texture cache\n"
