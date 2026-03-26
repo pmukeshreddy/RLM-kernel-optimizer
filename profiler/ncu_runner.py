@@ -76,7 +76,7 @@ class NCURunner:
         kernel_file.write_text(kernel_src + "\n\n" + harness_src)
 
         # Add -Xptxas,-v to get register/spill info from compiler
-        cmd = [self.nvcc] + self.nvcc_flags + ["-Xptxas,-v", str(kernel_file), "-o", str(binary_file)]
+        cmd = [self.nvcc] + self.nvcc_flags + ["-Xptxas", "-v", str(kernel_file), "-o", str(binary_file)]
         logger.info("Compiling: %s", " ".join(cmd[:4]) + " ...")
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
