@@ -81,6 +81,12 @@ class Benchmarker:
         src_hash = hashlib.md5(cuda_src.encode()).hexdigest()[:12]
         mod_name = f"bench_{self.kernel_type}_{src_hash}"
 
+        print("\n" + "="*80)
+        print(f"DEBUG: Printing generated kernel source for shape {shape}")
+        print("="*80)
+        print(kernel_src)
+        print("="*80 + "\n")
+
         module = load_inline(
             name=mod_name,
             cuda_sources=[cuda_src],
