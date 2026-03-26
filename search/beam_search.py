@@ -234,7 +234,7 @@ int main(int argc, char** argv) {{
 
         # Runtime hack checks — run after compile confirms the kernel is valid CUDA
         if ok:
-            rt_clean, rt_hack = run_runtime_checks(candidate.code)
+            rt_clean, rt_hack = run_runtime_checks(candidate.code, kernel_type=self.env.kernel_type)
             if not rt_clean:
                 logger.warning("Runtime hack detected in candidate [%s]: %s — rejecting",
                                candidate.strategy, rt_hack)

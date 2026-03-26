@@ -116,13 +116,16 @@ def _reference_add_rmsnorm(shape: tuple, seed: int) -> dict:
 def _baseline_silu_mul(shape: tuple) -> float:
     b, m, k = shape
     torch.manual_seed(0)
+    # silu_and_mul expects single concatenated tensor of shape (N, 2*K)
+    # where first half is gate, second half is up
     gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
     up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    combined = torch.cat([gate, up], dim=-1)  # (B*M, 2*K)
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def run():
         # silu_and_mul + fp4_quantize (no single fused API available)
-        out = flashinfer.silu_and_mul(gate, up)
+        out = flashinfer.silu_and_mul(combined)
         flashinfer.fp4_quantize(out, global_scale=global_scale)
 
     return _time_fn(run)
@@ -130,12 +133,12 @@ def _baseline_silu_mul(shape: tuple) -> float:
 
 def _reference_silu_mul(shape: tuple, seed: int) -> dict:
     b, m, k = shape
-    n = b * m * k
     torch.manual_seed(seed)
-    gate = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-    up   = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-    out  = torch.nn.functional.silu(gate) * up
-    return {"gate": gate, "up": up, "output": out}
+    gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
+    combined = torch.cat([gate, up], dim=-1)  # (B*M, 2*K)
+    out  = flashinfer.silu_and_mul(combined)
+    return {"gate": gate.flatten(), "up": up.flatten(), "output": out.flatten()}
 
 
 # ── NVFP4 Quantize ──────────────────────────────────────────────────────────

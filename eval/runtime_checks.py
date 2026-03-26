@@ -372,12 +372,16 @@ class RuntimeChecker:
         return results
 
 
-def run_runtime_checks(kernel_src: str) -> tuple[bool, str]:
+def run_runtime_checks(kernel_src: str, kernel_type: str = "add_rmsnorm") -> tuple[bool, str]:
     """
     Convenience wrapper matching is_clean() signature.
     Returns (clean, hack_type_or_empty).
     Only runs if nvcc is available — silently skips otherwise.
+    Currently only supports add_rmsnorm kernel type; others are skipped.
     """
+    if kernel_type != "add_rmsnorm":
+        logger.debug("Runtime checks only support add_rmsnorm — skipping for %s", kernel_type)
+        return True, ""
     try:
         checker = RuntimeChecker()
         results = checker.check(kernel_src)
