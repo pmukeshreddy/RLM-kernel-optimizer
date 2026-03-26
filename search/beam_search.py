@@ -7,6 +7,8 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +49,7 @@ class BeamSearch:
         self.checker  = CorrectnessChecker(env.search_config)
         self.beam_w   = env.search_config["beam"]["width"]
         self.rounds   = env.search_config["beam"]["refine_rounds"]
+        self._env_lock = threading.Lock()  # guards shared env counters
 
     def _build_harness(self, problem_shape: tuple) -> str:
         kt = self.env.kernel_type
@@ -170,22 +173,24 @@ int main(int argc, char** argv) {{
             candidate.compile_ok = False
             candidate.speedup    = 0.0
             candidate.bottleneck = "unknown"
-            self.env.hack_rejections.append(
-                {"strategy": candidate.strategy, "hack_type": hack_type,
-                 "round": candidate.round_num}
-            )
+            with self._env_lock:
+                self.env.hack_rejections.append(
+                    {"strategy": candidate.strategy, "hack_type": hack_type,
+                     "round": candidate.round_num}
+                )
             return None
 
         harness = self._build_harness(problem_shape)
         # Sanitize strategy name for filesystem (freeform names may have spaces/slashes)
         safe_strat = re.sub(r'[^a-zA-Z0-9_-]', '_', candidate.strategy)
-        name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}"
+        name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}_{id(candidate)}"
 
         # Single-shot: compile, check correctness, profile — no retries
         ok = False
         metrics = None
         speedup = 0.0
-        self.env.total_attempts += 1
+        with self._env_lock:
+            self.env.total_attempts += 1
 
         compile_ok, err_msg, binary = self.profiler.compile_kernel(
             kernel_src=candidate.code, harness_src=harness, output_name=name,
@@ -193,14 +198,16 @@ int main(int argc, char** argv) {{
         if not compile_ok:
             logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
         if compile_ok:
-            self.env.compile_passes += 1
+            with self._env_lock:
+                self.env.compile_passes += 1
             passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
                                                           kernel_type=self.env.kernel_type)
             if not passed:
                 logger.warning("  Correctness FAIL [%s] (err=%.4f): %s",
                                candidate.strategy, max_err, msg[:200])
             else:
-                self.env.correctness_passes += 1
+                with self._env_lock:
+                    self.env.correctness_passes += 1
                 candidate.correct = True
                 timing_us = self.profiler.benchmark_timing(binary)
                 if timing_us is not None:
@@ -233,10 +240,11 @@ int main(int argc, char** argv) {{
                 candidate.compile_ok = False
                 candidate.speedup    = 0.0
                 candidate.bottleneck = "unknown"
-                self.env.hack_rejections.append(
-                    {"strategy": candidate.strategy, "hack_type": f"runtime:{rt_hack}",
-                     "round": candidate.round_num}
-                )
+                with self._env_lock:
+                    self.env.hack_rejections.append(
+                        {"strategy": candidate.strategy, "hack_type": f"runtime:{rt_hack}",
+                         "round": candidate.round_num}
+                    )
                 return None
 
         # Always set speedup from timing, even if NCU profiling failed
@@ -245,6 +253,36 @@ int main(int argc, char** argv) {{
             candidate.metrics    = metrics.to_dict()
             candidate.bottleneck = self.clf.classify(metrics).value
         return metrics
+
+    def _profile_candidates_parallel(
+        self,
+        candidates: list,
+        problem_shape: tuple,
+        baseline_us: float,
+    ) -> list:
+        """Profile all candidates in parallel using a thread pool.
+        Returns list of (candidate, KernelMetrics) tuples preserving input order."""
+        if not candidates:
+            return []
+
+        results = [None] * len(candidates)
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            future_to_idx = {
+                pool.submit(self._profile_candidate, c, problem_shape, baseline_us): i
+                for i, c in enumerate(candidates)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    m = future.result()
+                except Exception as e:
+                    logger.error("Profiling thread failed for [%s]: %s",
+                                 candidates[idx].strategy, e)
+                    m = None
+                results[idx] = (candidates[idx], m or KernelMetrics())
+
+        return results
 
     def run(self) -> KernelCandidate:
         """Execute the full beam search. Returns the best KernelCandidate."""
@@ -267,11 +305,9 @@ int main(int argc, char** argv) {{
             strategies=strategies, kernel_slice=kernel_slice, round_num=0
         )
 
-        logger.info("Profiling %d initial beams...", len(candidates))
-        metrics_list = []
-        for c in candidates:
-            m = self._profile_candidate(c, problem_shape, baseline_us)
-            metrics_list.append((c, m or KernelMetrics()))
+        logger.info("Profiling %d initial beams in parallel...", len(candidates))
+        metrics_list = self._profile_candidates_parallel(candidates, problem_shape, baseline_us)
+        for c, _ in metrics_list:
             env.optimization_history.record(c)
             logger.info("  %s", c.summary())
 
@@ -291,10 +327,8 @@ int main(int argc, char** argv) {{
             logger.info("--- Round %d ---", round_num)
             refined = self.engine.run_refine_beams(survivors, round_num)
 
-            new_metrics = []
-            for c in refined:
-                m = self._profile_candidate(c, problem_shape, baseline_us)
-                new_metrics.append((c, m or KernelMetrics()))
+            new_metrics = self._profile_candidates_parallel(refined, problem_shape, baseline_us)
+            for c, _ in new_metrics:
                 env.optimization_history.record(c)
                 logger.info("  Refined: %s", c.summary())
 
