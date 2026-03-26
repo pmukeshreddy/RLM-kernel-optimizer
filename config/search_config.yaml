@@ -1,9 +1,9 @@
 # RLM Beam Search Configuration
 
 models:
-  root_model: "claude-sonnet-4-6"
-  sub_model: "claude-sonnet-4-6"
-  combine_model: "claude-sonnet-4-6"
+  root_model: "claude-sonnet-4-6"       # decomposition (fast, cheap)
+  sub_model: "claude-opus-4-6"          # codegen (best CUDA quality)
+  combine_model: "claude-opus-4-6"      # combination (needs sophistication)
 
 beam:
   width: 4                    # parallel strategy variants
@@ -47,8 +47,8 @@ bottleneck:
 
 cost_control:
   max_tokens_per_sub_call: 8192
-  max_total_api_cost_usd: 10.0  # hard stop per kernel problem
-  max_total_cost_all_problems: 50.0
+  max_total_api_cost_usd: 25.0  # hard stop per kernel problem (Opus is ~5x Sonnet)
+  max_total_cost_all_problems: 100.0
 
 eval:
   correctness_atol: 1e-2
