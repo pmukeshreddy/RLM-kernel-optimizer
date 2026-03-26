@@ -107,13 +107,27 @@ class Benchmarker:
             run(i % nbufs)
         torch.cuda.synchronize()
 
-        # Timed reps
+        # Capture CUDA Graph containing all iterations
+        # Stream-specific warmup for graph capture
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for i in range(self.iters):
+                run(i % nbufs)
+        s.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for i in range(self.iters):
+                run(i % nbufs)
+
+        # Timed graph replay
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
 
+        torch.cuda.synchronize()
         start.record()
-        for i in range(self.iters):
-            run(i % nbufs)
+        g.replay()
         end.record()
         torch.cuda.synchronize()
 

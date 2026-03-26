@@ -249,17 +249,33 @@ def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> floa
     hits from inflating performance — matching benchmark.py's candidate timing.
     """
     nbufs = _L2_CYCLE_BUFS
-    # Warmup with L2 cycling
+    
+    # Pre-warmup
     for i in range(warmup):
         fn(i % nbufs)
     torch.cuda.synchronize()
 
+    # Capture CUDA Graph containing all iterations
+    # Stream-specific warmup for graph capture
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(iters):
+            fn(i % nbufs)
+    s.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for i in range(iters):
+            fn(i % nbufs)
+
+    # Timed graph replay
     start = torch.cuda.Event(enable_timing=True)
     end   = torch.cuda.Event(enable_timing=True)
 
+    torch.cuda.synchronize()
     start.record()
-    for i in range(iters):
-        fn(i % nbufs)
+    g.replay()
     end.record()
     torch.cuda.synchronize()
 
