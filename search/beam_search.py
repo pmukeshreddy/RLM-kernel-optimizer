@@ -5,6 +5,7 @@ Ties together: RLM engine, NCU profiler, diversity selection, and combination.
 
 from __future__ import annotations
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -176,7 +177,9 @@ int main(int argc, char** argv) {{
             return None
 
         harness = self._build_harness(problem_shape)
-        name    = f"{candidate.strategy}_r{candidate.round_num}_{int(time.time())}"
+        # Sanitize strategy name for filesystem (freeform names may have spaces/slashes)
+        safe_strat = re.sub(r'[^a-zA-Z0-9_-]', '_', candidate.strategy)
+        name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}"
 
         # Single-shot: compile, check correctness, profile — no retries
         ok = False
