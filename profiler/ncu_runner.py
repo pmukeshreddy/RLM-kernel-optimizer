@@ -93,22 +93,31 @@ class NCURunner:
         logger.info("Profiling: %s ...", " ".join(ncu_cmd[:5]))
         result = subprocess.run(ncu_cmd, capture_output=True, text=True, timeout=300)
 
+        logger.info("NCU finished: rc=%d report_exists=%s stdout=%d bytes stderr=%d bytes",
+                    result.returncode, report_path.exists(),
+                    len(result.stdout), len(result.stderr))
+
         if result.returncode not in (0, 1):
             logger.error("NCU failed (rc=%d): %s", result.returncode, result.stderr[:300])
             return None
 
         if report_path.exists():
+            logger.info("NCU report file: %s (%.1f KB)", report_path, report_path.stat().st_size / 1024)
             return self._export_and_parse(report_path)
         if result.stdout and "Metric Name" in result.stdout:
             return self._parse_ncu_csv(result.stdout)
+        logger.warning("NCU: no report file and no CSV in stdout. stderr: %s", result.stderr[:300])
         return None
 
     def _export_and_parse(self, report_path: Path) -> Optional[KernelMetrics]:
         export_cmd = [self.ncu_path, "--import", str(report_path), "--csv", "--page", "raw"]
+        logger.info("NCU export cmd: %s", " ".join(export_cmd[:4]))
         result = subprocess.run(export_cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
-            logger.error("NCU export failed: %s", result.stderr[:200])
+            logger.error("NCU export failed (rc=%d): %s", result.returncode, result.stderr[:300])
             return None
+        logger.info("NCU CSV export: %d bytes, first 200 chars: %s",
+                    len(result.stdout), result.stdout[:200])
         return self._parse_ncu_csv(result.stdout)
 
     def _parse_ncu_csv(self, csv_text: str) -> Optional[KernelMetrics]:
@@ -124,8 +133,15 @@ class NCURunner:
             if metric_id in id_to_field:
                 raw[id_to_field[metric_id]] = parse_ncu_csv_line(metric_id, value_str)
         if not raw:
-            logger.warning("No recognizable metrics in NCU CSV")
+            # Log what metric names we actually got vs what we expected
+            seen_metrics = set()
+            for row in csv.DictReader(lines):
+                seen_metrics.add(row.get("Metric Name", "").strip())
+            logger.warning("No recognizable metrics. Got %d unique metric names. Sample: %s",
+                          len(seen_metrics), list(seen_metrics)[:5])
+            logger.warning("Expected metrics (sample): %s", list(NCU_METRIC_IDS.values())[:3])
             return None
+        logger.info("Parsed %d NCU metrics: %s", len(raw), list(raw.keys()))
         return metrics_from_dict(raw)
 
     # ── Timing ────────────────────────────────────────────────────────────────

@@ -209,6 +209,11 @@ int main(int argc, char** argv) {{
                     if metrics:
                         metrics.duration_us = timing_us
                         metrics.speedup = speedup
+                        logger.info("  NCU: mem=%.1f%% compute=%.1f%% occ=%.1f%% stall_mem=%.1f%%",
+                                    metrics.mem_throughput_pct, metrics.compute_throughput_pct,
+                                    metrics.sm_occupancy, metrics.stall_memory)
+                    else:
+                        logger.warning("  NCU returned no metrics for [%s]", candidate.strategy)
                 ok = True
         candidate.compile_ok = ok
 
