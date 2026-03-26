@@ -35,13 +35,17 @@ class HybridProfiler:
         self.hw_spec = hw_spec
 
         # Hardware peaks from spec
+        # Use achievable peaks (75% of theoretical) for realistic percentages.
+        # Theoretical peaks are rarely hit; achievable peaks give metrics
+        # comparable to what NCU reports.
         mem = hw_spec.get("memory", {})
         comp = hw_spec.get("compute", {})
         sm = hw_spec.get("sm", {})
 
-        self.peak_mem_bw_bytes_per_sec = mem.get("hbm_bandwidth_tbs", 8.0) * 1e12
-        self.peak_fp32_flops = comp.get("fp32_tflops", 67.0) * 1e12
-        self.peak_fp16_flops = comp.get("fp16_tflops", 134.0) * 1e12
+        achievable_ratio = 0.75  # typical achievable fraction of theoretical peak
+        self.peak_mem_bw_bytes_per_sec = mem.get("hbm_bandwidth_tbs", 8.0) * 1e12 * achievable_ratio
+        self.peak_fp32_flops = comp.get("fp32_tflops", 67.0) * 1e12 * achievable_ratio
+        self.peak_fp16_flops = comp.get("fp16_tflops", 134.0) * 1e12 * achievable_ratio
         self.sm_count = sm.get("count", 142)
         self.max_warps_per_sm = sm.get("max_warps_per_sm", 64)
         self.max_blocks_per_sm = sm.get("max_blocks_per_sm", 32)
@@ -429,13 +433,20 @@ int main() {{
         barrier_points = sync_count + syncwarp_count
         shared_decls = kernel_src.count("__shared__")
 
+        # When both mem and compute are low, the kernel is latency-bound
+        # (not enough work to saturate either subsystem)
+        both_low = mem_pct < 30 and compute_pct < 30
+
         # Memory stall: dominant when memory-bound with underutilized compute
-        if mem_pct > compute_pct and mem_pct > 30:
+        if both_low:
+            # Low utilization → latency-bound, memory stalls dominate
+            stall_memory = min(80.0, max(40.0, 70.0 - mem_pct))
+        elif mem_pct > compute_pct and mem_pct > 30:
             stall_memory = min(80.0, (mem_pct - compute_pct) * 0.8 + 10.0)
         elif mem_pct > 50:
             stall_memory = min(60.0, mem_pct * 0.5)
         else:
-            stall_memory = max(5.0, 25.0 - compute_pct * 0.2)
+            stall_memory = max(10.0, 30.0 - compute_pct * 0.2)
 
         # Barrier stall: from synchronization density
         stall_barrier = min(50.0, barrier_points * 3.5)
@@ -445,6 +456,8 @@ int main() {{
         # No-instruction stall: low occupancy means fewer warps to schedule
         if occupancy_pct < 50:
             stall_no_inst = min(40.0, (100.0 - occupancy_pct) * 0.4)
+        elif both_low:
+            stall_no_inst = max(10.0, 25.0 - occupancy_pct * 0.1)
         else:
             stall_no_inst = max(2.0, (100.0 - occupancy_pct) * 0.15)
 

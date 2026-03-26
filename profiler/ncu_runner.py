@@ -133,7 +133,7 @@ class NCURunner:
         ncu_cmd = [
             self.ncu_path,
             "--target-processes", "all",
-            "--kernel-name", kernel_regex,
+            "--kernel-name-base", kernel_regex,
             "--launch-skip", str(self.warmup),
             "--launch-count", str(self.profile_iter),
             "--metrics", NCU_METRICS_QUERY,
