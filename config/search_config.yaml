@@ -1,7 +1,7 @@
 # RLM Beam Search Configuration
 
 models:
-  root_model: "claude-sonnet-4-6"       # decomposition (fast, cheap)
+  root_model: "claude-opus-4-6"          # decomposition (Opus everywhere)
   sub_model: "claude-opus-4-6"          # codegen (best CUDA quality)
   combine_model: "claude-opus-4-6"      # combination (needs sophistication)
 
