@@ -6,8 +6,8 @@ models:
   combine_model: "claude-opus-4-6"      # combination (needs sophistication)
 
 beam:
-  width: 2                    # parallel strategy variants
-  refine_rounds: 1            # NCU feedback iterations
+  width: 1                    # parallel strategy variants
+  refine_rounds: 0            # NCU feedback iterations
   max_sub_calls_per_round: 2  # cap recursive depth
   combine_top_k: 2            # merge top-K into final
   diversity_mode: "bottleneck_cluster"  # cluster-based pruning
