@@ -225,9 +225,8 @@ int main(int argc, char** argv) {{
                     if metrics:
                         metrics.duration_us = timing_us
                         metrics.speedup = speedup
-                        logger.info("  Profiler: mem=%.1f%% compute=%.1f%% occ=%.1f%% stall_mem=%.1f%%",
-                                    metrics.mem_throughput_pct, metrics.compute_throughput_pct,
-                                    metrics.sm_occupancy, metrics.stall_memory)
+                        logger.info("  Profiler: occ=%.1f%% timing=%.1fus speedup=%.3fx",
+                                    metrics.sm_occupancy, metrics.duration_us, metrics.speedup)
                     else:
                         logger.warning("  Profiler returned no metrics for [%s]", candidate.strategy)
                 ok = True

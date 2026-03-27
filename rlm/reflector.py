@@ -235,28 +235,23 @@ def _build_hw_context(hw_spec: dict) -> str:
 # ── Profile data formatter ───────────────────────────────────────────────────
 
 def _format_profile_section(metrics: dict, iteration: int) -> str:
+    """Format REAL profiler data only: timing, occupancy, compiler metrics, SASS."""
     if not metrics:
         return ""
 
     lines = [f"\n### Profiler Data (Iteration {iteration})"]
     lines.append("```")
 
-    # Runtime metrics
-    mem_pct = metrics.get("mem_throughput_pct", 0)
-    compute_pct = metrics.get("compute_throughput_pct", 0)
+    # Real runtime metrics
     occupancy = metrics.get("sm_occupancy", 0)
-    stall_mem = metrics.get("stall_memory", 0)
-    stall_bar = metrics.get("stall_barrier", 0)
-    l2_hit = metrics.get("l2_hit_rate", 0)
+    duration = metrics.get("duration_us", 0)
+    speedup = metrics.get("speedup", 1.0)
 
-    lines.append(f"Memory bandwidth utilization:  {mem_pct:.1f}%")
-    lines.append(f"Compute utilization:           {compute_pct:.1f}%")
+    lines.append(f"Kernel timing:                 {duration:.3f} us")
+    lines.append(f"Speedup:                       {speedup:.3f}x")
     lines.append(f"SM occupancy:                  {occupancy:.1f}%")
-    lines.append(f"Memory stall rate:             {stall_mem:.1f}%")
-    lines.append(f"Barrier stall rate:            {stall_bar:.1f}%")
-    lines.append(f"L2 cache hit rate:             {l2_hit:.1f}%")
 
-    # Compiler metrics
+    # Compiler metrics (from nvcc -Xptxas -v)
     cm = metrics.get("_compiler", {})
     if cm:
         regs = cm.get("registers_per_thread", 0)
@@ -268,7 +263,7 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
         lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
         lines.append(f"Shared memory:                 {smem} bytes")
 
-        # SASS instruction breakdown
+        # SASS instruction breakdown (from cuobjdump -sass)
         sass_total = cm.get("sass_total_instructions", 0)
         if sass_total > 0:
             ldg_128 = cm.get("sass_ldg_128", 0)
@@ -302,29 +297,35 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 # ── Round-over-round delta ───────────────────────────────────────────────────
 
 def _format_delta_section(current: dict, previous: dict) -> str:
+    """Format round-over-round deltas using only real measured data."""
     if not previous or not current:
         return ""
 
     lines = ["\n### Changes vs Previous Round"]
     lines.append("```")
 
-    _DELTA_KEYS = [
-        ("mem_throughput_pct", "Memory bandwidth"),
-        ("compute_throughput_pct", "Compute utilization"),
-        ("sm_occupancy", "SM occupancy"),
-        ("stall_memory", "Memory stalls"),
-        ("stall_barrier", "Barrier stalls"),
-    ]
+    # Timing delta
+    cur_timing = current.get("duration_us", 0)
+    prev_timing = previous.get("duration_us", 0)
+    if cur_timing > 0 and prev_timing > 0:
+        delta_us = cur_timing - prev_timing
+        arrow = "v" if delta_us < 0 else "^" if delta_us > 0 else "="
+        better = "  (faster)" if delta_us < 0 else "  (slower)" if delta_us > 0 else ""
+        lines.append(f"{'Kernel timing (us)':30s}  {prev_timing:9.3f} -> {cur_timing:9.3f}  ({arrow} {abs(delta_us):.3f}){better}")
 
-    for key, label in _DELTA_KEYS:
-        cur = current.get(key, 0)
-        prev = previous.get(key, 0)
-        if prev == 0 and cur == 0:
-            continue
-        delta = cur - prev
+    # Speedup delta
+    cur_spd = current.get("speedup", 1.0)
+    prev_spd = previous.get("speedup", 1.0)
+    if cur_spd != prev_spd:
+        lines.append(f"{'Speedup':30s}  {prev_spd:9.3f}x -> {cur_spd:9.3f}x")
+
+    # Occupancy delta
+    cur_occ = current.get("sm_occupancy", 0)
+    prev_occ = previous.get("sm_occupancy", 0)
+    if cur_occ != prev_occ and (cur_occ > 0 or prev_occ > 0):
+        delta = cur_occ - prev_occ
         arrow = "^" if delta > 0 else "v" if delta < 0 else "="
-        # For stalls, down is good; for utilization, up is good
-        lines.append(f"{label:30s}  {prev:6.1f}% -> {cur:6.1f}%  ({arrow} {abs(delta):.1f})")
+        lines.append(f"{'SM occupancy':30s}  {prev_occ:6.1f}% -> {cur_occ:6.1f}%  ({arrow} {abs(delta):.1f})")
 
     # Compiler metric deltas
     cur_cm = current.get("_compiler", {})
@@ -345,6 +346,16 @@ def _format_delta_section(current: dict, previous: dict) -> str:
         prev_sass = prev_cm.get("sass_total_instructions", 0)
         if cur_sass != prev_sass and cur_sass > 0 and prev_sass > 0:
             lines.append(f"{'SASS instructions':30s}  {prev_sass:6d}  -> {cur_sass:6d}")
+
+        # Vectorization delta
+        cur_ldg128 = cur_cm.get("sass_ldg_128", 0)
+        prev_ldg128 = prev_cm.get("sass_ldg_128", 0)
+        cur_ldg_total = cur_cm.get("sass_ldg_32", 0) + cur_cm.get("sass_ldg_64", 0) + cur_ldg128
+        prev_ldg_total = prev_cm.get("sass_ldg_32", 0) + prev_cm.get("sass_ldg_64", 0) + prev_ldg128
+        cur_vec = (cur_ldg128 / cur_ldg_total * 100) if cur_ldg_total > 0 else 0
+        prev_vec = (prev_ldg128 / prev_ldg_total * 100) if prev_ldg_total > 0 else 0
+        if cur_vec != prev_vec and (cur_ldg_total > 0 or prev_ldg_total > 0):
+            lines.append(f"{'Load vectorization':30s}  {prev_vec:5.0f}%  -> {cur_vec:5.0f}%")
 
         # Spill instruction delta
         cur_spill_insts = cur_cm.get("sass_ldl", 0) + cur_cm.get("sass_stl", 0)

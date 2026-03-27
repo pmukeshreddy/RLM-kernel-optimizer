@@ -77,12 +77,8 @@ class KernelMetrics:
 
     def summary_str(self) -> str:
         return (
-            f"mem={self.mem_throughput_pct:.1f}% "
-            f"compute={self.compute_throughput_pct:.1f}% "
+            f"timing={self.duration_us:.1f}us "
             f"occupancy={self.sm_occupancy:.1f}% "
-            f"stall_mem={self.stall_memory:.1f}% "
-            f"stall_bar={self.stall_barrier:.1f}% "
-            f"l2_hit={self.l2_hit_rate:.1f}% "
             f"speedup={self.speedup:.3f}x"
         )
 
