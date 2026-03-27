@@ -15,7 +15,7 @@ from anthropic import AsyncAnthropic
 from .environment import RLMEnvironment, KernelCandidate
 from .root_prompts import SYSTEM_PROMPT, decompose_prompt, combine_prompt
 from .sub_prompts import get_prompt_for_strategy
-from .reflector import reflect
+from .reflector import reflect, _get_launch_signature
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,7 @@ Respond with ONLY the JSON array, nothing else."""
 
         if strat_desc:
             # Freeform mode: use the LLM's own description as the instruction
+            launch_sig = _get_launch_signature(self.env.kernel_type)
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -210,14 +211,18 @@ Apply this optimization to the kernel below:
 {kernel_slice}
 ```
 
+{launch_sig}
+
 CRITICAL RULES:
 1. Return the COMPLETE .cu file in a single ```cuda code block
 2. Keep all #includes (use the original #include directives, NOT the expanded content)
-3. Keep ALL kernel functions and the launch_* wrapper function
-4. Do NOT change the launch_* function signature
-5. Output must match reference within atol=1e-2
-6. No explanations — just the code block
-7. You may call any function defined in the expanded headers above. Do NOT invent
+3. Do NOT use torch headers (torch/extension.h, ATen, c10) — this is standalone CUDA
+4. Keep ALL kernel functions and the launch_* wrapper function
+5. The launch_* function signature MUST match the "Required Launch Function" section EXACTLY.
+   If you change it, you will get "undefined reference" linker errors.
+6. Output must match reference within atol=1e-2
+7. No explanations — just the code block
+8. You may call any function defined in the expanded headers above. Do NOT invent
    helper functions that aren't defined in the headers.
 """
         else:

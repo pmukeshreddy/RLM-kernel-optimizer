@@ -76,7 +76,13 @@ class NCURunner:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             error_lines = [l for l in result.stderr.splitlines()
-                           if not l.strip().startswith("ptxas info")]
+                           if not l.strip().startswith("ptxas info")
+                           and "bytes stack frame" not in l
+                           and "bytes spill stores" not in l
+                           and "bytes spill loads" not in l
+                           and "bytes cmem" not in l
+                           and "bytes smem" not in l
+                           and "Remark: The warnings can be suppressed" not in l]
             error_msg = "\n".join(error_lines).strip() or result.stderr.strip()
             logger.warning("Compilation failed:\n%s", error_msg[:800])
             return False, error_msg, binary_file, None
