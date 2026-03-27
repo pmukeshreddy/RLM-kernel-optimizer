@@ -280,4 +280,7 @@ def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> floa
     torch.cuda.synchronize()
 
     ms = start.elapsed_time(end)
-    return ms * 1000.0 / iters  # convert ms → µs per iteration
+    t_us = ms * 1000.0 / iters
+    print(f"\n---> [BASELINE TIMING] Graph replay took {ms:.4f} ms for {iters} iterations.")
+    print(f"---> [BASELINE TIMING] 1 Iteration = {t_us:.4f} us\n")
+    return t_us  # convert ms → µs per iteration

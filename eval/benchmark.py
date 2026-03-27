@@ -138,7 +138,10 @@ class Benchmarker:
         torch.cuda.synchronize()
 
         ms = start.elapsed_time(end)
-        return ms * 1000.0 / self.iters  # µs per iteration
+        t_us = ms * 1000.0 / self.iters
+        print(f"\n---> [CANDIDATE TIMING] Graph replay took {ms:.4f} ms for {self.iters} iterations.")
+        print(f"---> [CANDIDATE TIMING] 1 Iteration = {t_us:.4f} us\n")
+        return t_us  # µs per iteration
 
     # ── C bridge: extern "C" void* wrapper in CUDA source ────────────────────
 
