@@ -1,9 +1,9 @@
 # RLM Beam Search Configuration
 
 models:
-  root_model: "claude-3-opus-20240229"        # decomposition
-  sub_model: "claude-3-opus-20240229"        # codegen
-  combine_model: "claude-3-opus-20240229"    # combination
+  root_model: "claude-opus-4-6"        # decomposition
+  sub_model: "claude-opus-4-6"        # codegen
+  combine_model: "claude-opus-4-6"    # combination
 
 beam:
   width: 4                    # parallel strategy variants
