@@ -298,10 +298,27 @@ CRITICAL RULES:
         metrics = parent.metrics or {}
         prev_metrics = parent.prev_metrics
 
-        # Build data-only sections for strategy call
-        profile_section = _format_profile_section(metrics, round_num)
-        suggestions_section = _format_suggestions_section(metrics)
-        delta_section = _format_delta_section(metrics, prev_metrics)
+        # Close the feedback loop: when prev_metrics has been updated from a
+        # viable refinement attempt, use it for profile/suggestions so the LLM
+        # sees FRESH data (e.g. "I vectorized loads but timing didn't improve")
+        # instead of the same frozen round-0 profile every round.
+        # `prev_metrics is metrics` means it was never updated (same object from init).
+        has_fresh_data = prev_metrics and prev_metrics is not metrics
+
+        if has_fresh_data:
+            # Show the LAST ATTEMPT's profile — LLM sees what its changes produced
+            profile_section = _format_profile_section(prev_metrics, round_num)
+            suggestions_section = _format_suggestions_section(prev_metrics)
+            # Delta: how last attempt differs from the current best code
+            delta_section = _format_delta_section(prev_metrics, metrics,
+                                                  title="Last Attempt vs Current Best")
+        else:
+            # No viable refinement yet — show the current best's profile
+            profile_section = _format_profile_section(metrics, round_num)
+            suggestions_section = _format_suggestions_section(metrics)
+            # Don't show a misleading "= 0.000" delta
+            delta_section = ""
+
         stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num, candidate=parent)
         last_error_section = _format_last_error_section(parent)
         history_section = _format_history_section(parent)
@@ -310,15 +327,23 @@ CRITICAL RULES:
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
 
         # Debug: what data sections are populated?
-        logger.info("STRATEGY DATA [%s]: profile=%d suggestions=%d delta=%d stagnation=%d history=%d last_err=%d chars",
-            parent.strategy, len(profile_section), len(suggestions_section),
+        logger.info("STRATEGY DATA [%s]: fresh=%s profile=%d suggestions=%d delta=%d stagnation=%d history=%d last_err=%d chars",
+            parent.strategy, has_fresh_data, len(profile_section), len(suggestions_section),
             len(delta_section), len(stagnation_section), len(history_section),
             len(last_error_section))
 
         # ── Turn 1: Strategy — DATA ONLY, no code ─────────────────────────
+        if has_fresh_data:
+            last_spd = prev_metrics.get("speedup", 0)
+            header = (f"You are optimizing a CUDA kernel. Best so far: {parent.speedup:.3f}x. "
+                      f"Last attempt: {last_spd:.3f}x.\n"
+                      f"Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).")
+        else:
+            header = (f"You are optimizing a CUDA kernel currently at {parent.speedup:.3f}x speedup.\n"
+                      f"Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).")
+
         strategy_prompt = f"""\
-You are optimizing a CUDA kernel currently at {parent.speedup:.3f}x speedup.
-Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).
+{header}
 {profile_section}
 {suggestions_section}
 {delta_section}

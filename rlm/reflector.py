@@ -344,12 +344,13 @@ def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int
 
 # ── Round-over-round delta ───────────────────────────────────────────────────
 
-def _format_delta_section(current: dict, previous: dict) -> str:
+def _format_delta_section(current: dict, previous: dict,
+                          title: str = "Changes vs Previous Round") -> str:
     """Format round-over-round deltas using only real measured data."""
     if not previous or not current:
         return ""
 
-    lines = ["\n### Changes vs Previous Round"]
+    lines = [f"\n### {title}"]
     lines.append("```")
 
     # Timing delta
