@@ -313,6 +313,9 @@ int main(int argc, char** argv) {{
             logger.info("  %s", c.summary())
 
         survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
+        # Snapshot metrics so stagnation is detectable in round 2+
+        for s in survivors:
+            s.prev_metrics = s.metrics
 
         # ── Rounds 1-N: Refine ─────────────────────────────────────────────
         for round_num in range(1, self.rounds + 1):
@@ -338,6 +341,9 @@ int main(int argc, char** argv) {{
                 for s in survivors
             ] + new_metrics
             survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
+            # Snapshot metrics so stagnation is detectable in next round
+            for s in survivors:
+                s.prev_metrics = s.metrics
 
         # ── Final: Combine top-2 ───────────────────────────────────────────
         top_for_combine = self.selector.select_for_combination(survivors)

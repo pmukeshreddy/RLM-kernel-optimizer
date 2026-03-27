@@ -93,6 +93,7 @@ PERFORMANCE_REFLECTION = dedent("""\
     **Reward: {reward:.0f}** ({reward_breakdown})
     {profile_section}
     {delta_section}
+    {stagnation_section}
 
     ### Your previous solution
     ```cuda
@@ -186,6 +187,29 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 
     lines.append("```")
     return "\n".join(lines)
+
+
+# ── Stagnation detection ─────────────────────────────────────────────────────
+
+def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int) -> str:
+    """Detect reward stagnation and tell the model to change approach.
+    Only triggers at iteration >= 2 with flat speedup."""
+    if not metrics or not prev_metrics or iteration < 2:
+        return ""
+
+    cur_speedup = metrics.get("speedup", 1.0)
+    prev_speedup = prev_metrics.get("speedup", 1.0)
+    delta = abs(cur_speedup - prev_speedup)
+
+    if delta < 0.02:  # Less than 2% improvement = stagnant
+        return dedent(f"""\
+
+            ### Stagnation Detected
+            Speedup has NOT improved: {prev_speedup:.3f}x -> {cur_speedup:.3f}x
+            Your previous optimization approach is not working.
+            Do NOT make small tweaks to the same approach — try a completely different optimization technique.
+        """)
+    return ""
 
 
 # ── Round-over-round delta ───────────────────────────────────────────────────
@@ -363,6 +387,7 @@ def reflect(
     launch_sig = _get_launch_signature(kernel_type)
     profile_section = _format_profile_section(metrics, iteration)
     delta_section = _format_delta_section(metrics, prev_metrics)
+    stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration)
 
     reward, reward_breakdown = compute_reward(
         candidate.compile_ok, candidate.correct, speedup
@@ -396,4 +421,5 @@ def reflect(
         solution=solution,
         profile_section=profile_section,
         delta_section=delta_section,
+        stagnation_section=stagnation_section,
     ) + footer
