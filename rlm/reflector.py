@@ -55,11 +55,9 @@ def compute_reward(compile_ok: bool, correct: bool, speedup: float) -> tuple[flo
 # ── Reflection templates ─────────────────────────────────────────────────────
 
 COMPILE_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}: Compilation Failure
+    ## Iteration {iteration}
 
     **Reward: {reward:.0f}** ({reward_breakdown})
-
-    Your previous solution **failed to compile**.
 
     ### Compiler error
     ```
@@ -71,100 +69,38 @@ COMPILE_REFLECTION = dedent("""\
     {solution}
     ```
 
-    ### What to fix
-    - Read the compiler error above carefully and fix the exact issue.
-    - Do NOT invent header files (e.g. "fp4_utils.cuh") -- only use the original #includes.
-    - Only call functions defined in the included headers -- do NOT invent helpers.
-    - If you see "undefined reference" to the launch function, you changed its signature.
-    {hints}
-
-    ### Instructions
-    Write a corrected kernel that compiles successfully.
-    Return the COMPLETE .cu file in a single ```cuda code block.
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
 """)
 
 
 CORRECTNESS_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}: Correctness Failure
+    ## Iteration {iteration}
 
     **Reward: {reward:.0f}** ({reward_breakdown})
-
-    Your solution compiled but **produced wrong results** (atol > {atol}).
 
     ### Your previous solution
     ```cuda
     {solution}
     ```
 
-    ### What to fix
-    - Check index calculations carefully (off-by-one, stride, base offset errors).
-    - Verify vectorized loads/stores unpack in the correct element order.
-    - Ensure reductions accumulate ALL elements -- no partial sums lost at boundaries.
-    - Check NVFP4 quantization block alignment (blocks of 16 elements).
-    - Verify bf16 <-> float conversions round correctly.
-    {hints}
-
-    ### Instructions
-    Fix the correctness bug while keeping the optimization approach.
-    Return the COMPLETE .cu file in a single ```cuda code block.
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
 """)
 
 
 PERFORMANCE_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}
+    ## Iteration {iteration}
 
     **Reward: {reward:.0f}** ({reward_breakdown})
-
-    ### Timing
-    - Baseline: {baseline_us:.3f} us
-    - Your solution: {optimized_us:.3f} us
-    - Speedup: {speedup:.3f}x
+    {profile_section}
+    {delta_section}
 
     ### Your previous solution
     ```cuda
     {solution}
     ```
-    {profile_section}
-    {delta_section}
 
-    ### How to improve
-    - Study the profiler data above. Use it to guide your next optimization.
-    - Higher reward = better. Maximize speedup while keeping correctness.
-    {hints}
-
-    ### Instructions
-    Write a faster kernel. Correctness must still pass (atol < 1e-2).
-    Return the COMPLETE .cu file in a single ```cuda code block.
+    Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
 """)
-
-
-# ── Kernel-type-specific hints ───────────────────────────────────────────────
-
-def _get_hints(kernel_type: str) -> str:
-    hints_map = {
-        "add_rmsnorm": (
-            "- add+RMSNorm+quantize is memory-bound: maximize bandwidth utilization.\n"
-            "- Fuse add, norm, and FP4 quantize into ONE pass -- avoid writing residual_out then re-reading it.\n"
-            "- Use uint4 loads for 8 bf16 values per 128-bit transaction.\n"
-            "- Use warp shuffles (__shfl_xor_sync) for the sum-of-squares reduction.\n"
-            "- Each thread should own one NVFP4 block (16 elements) and cache in registers."
-        ),
-        "silu_mul": (
-            "- SiLU(x)*y is pure elementwise -- should run at near memory bandwidth.\n"
-            "- Use vectorized loads (uint4 = 8 bf16) and stores.\n"
-            "- Use __expf() instead of expf() for the sigmoid (fast math SFU).\n"
-            "- Fuse SiLU activation with the FP4 quantization in one pass.\n"
-            "- Thread coarsening: each thread processes multiple elements."
-        ),
-        "nvfp4_quantize": (
-            "- Quantize-only is bandwidth-bound: read once, write packed FP4.\n"
-            "- Use 128-bit vectorized loads for input bf16 data.\n"
-            "- Pack 8 FP4 pairs into uint64_t for a single 8-byte coalesced store.\n"
-            "- Each thread handles one 16-element quantization block.\n"
-            "- Minimize register pressure -- keep the quantization logic simple."
-        ),
-    }
-    return hints_map.get(kernel_type, "")
 
 
 # ── Hardware context builder ─────────────────────────────────────────────────
@@ -423,7 +359,6 @@ def reflect(
     solution = candidate.code or "# (no code generated)"
     metrics = candidate.metrics or {}
     speedup = candidate.speedup
-    hints = _get_hints(kernel_type)
     hw_context = _build_hw_context(hw_spec)
     launch_sig = _get_launch_signature(kernel_type)
     profile_section = _format_profile_section(metrics, iteration)
@@ -438,38 +373,27 @@ def reflect(
 
     if not candidate.compile_ok:
         error = getattr(candidate, 'compile_error', '') or "Unknown compilation error"
-        prompt = COMPILE_REFLECTION.format(
+        return COMPILE_REFLECTION.format(
             iteration=iteration,
             reward=reward,
             reward_breakdown=reward_breakdown,
             error=error,
             solution=solution,
-            hints=hints,
-        )
-        return prompt + footer
+        ) + footer
 
     if not candidate.correct:
-        prompt = CORRECTNESS_REFLECTION.format(
+        return CORRECTNESS_REFLECTION.format(
             iteration=iteration,
             reward=reward,
             reward_breakdown=reward_breakdown,
             solution=solution,
-            atol=atol,
-            hints=hints,
-        )
-        return prompt + footer
+        ) + footer
 
-    optimized_us = baseline_us / speedup if speedup > 0 else 0.0
-    prompt = PERFORMANCE_REFLECTION.format(
+    return PERFORMANCE_REFLECTION.format(
         iteration=iteration,
         reward=reward,
         reward_breakdown=reward_breakdown,
         solution=solution,
-        speedup=speedup,
-        baseline_us=baseline_us,
-        optimized_us=optimized_us,
         profile_section=profile_section,
         delta_section=delta_section,
-        hints=hints,
-    )
-    return prompt + footer
+    ) + footer
