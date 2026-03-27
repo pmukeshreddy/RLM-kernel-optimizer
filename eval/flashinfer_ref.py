@@ -251,14 +251,11 @@ def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> floa
     """
     nbufs = _L2_CYCLE_BUFS
     
-    t0_warmup = time.perf_counter()
     # Pre-warmup
     for i in range(warmup):
         fn(i % nbufs)
     torch.cuda.synchronize()
-    print(f"---> [BASELINE TIMING] Python loop warmup took: {time.perf_counter() - t0_warmup:.4f} s")
 
-    t0_cap = time.perf_counter()
     # Capture CUDA Graph containing all iterations
     # Stream-specific warmup for graph capture
     s = torch.cuda.Stream()
@@ -272,23 +269,16 @@ def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> floa
     with torch.cuda.graph(g):
         for i in range(iters):
             fn(i % nbufs)
-    print(f"---> [BASELINE TIMING] Graph capture took: {time.perf_counter() - t0_cap:.4f} s")
 
     # Timed graph replay
     start = torch.cuda.Event(enable_timing=True)
     end   = torch.cuda.Event(enable_timing=True)
 
     torch.cuda.synchronize()
-    t0_replay = time.perf_counter()
     start.record()
     g.replay()
     end.record()
     torch.cuda.synchronize()
-    cpu_wait_ms = (time.perf_counter() - t0_replay) * 1000.0
 
     ms = start.elapsed_time(end)
-    t_us = ms * 1000.0 / iters
-    print(f"\n---> [BASELINE TIMING] CPU time waiting for sync: {cpu_wait_ms:.4f} ms")
-    print(f"---> [BASELINE TIMING] GPU Event Graph replay took {ms:.4f} ms for {iters} iterations.")
-    print(f"---> [BASELINE TIMING] 1 Iteration = {t_us:.4f} us\n")
-    return t_us  # convert ms → µs per iteration
+    return ms * 1000.0 / iters  # convert ms → µs per iteration
