@@ -336,8 +336,8 @@ int main(int argc, char** argv) {{
                 env.optimization_history.record(c)
                 logger.info("  Refined: %s", c.summary())
 
-            # Track failed refinement errors on parent survivors so next
-            # round's reflection can warn the model about its mistakes
+            # Track what happened with each refinement attempt so the model
+            # learns from failures AND regressions, not just compile errors
             for i, (refined_c, _) in enumerate(new_metrics):
                 if i < len(survivors):
                     parent = survivors[i]
@@ -345,8 +345,23 @@ int main(int argc, char** argv) {{
                         parent.last_refine_error = refined_c.compile_error or "Compile failure"
                     elif not refined_c.correct:
                         parent.last_refine_error = "Correctness failure (output mismatch or kernel hung)"
+                    elif refined_c.speedup < parent.speedup - 0.001:
+                        # Refinement compiled and was correct but REGRESSED
+                        msg = f"Your refinement compiled and was correct but was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
+                        rm = refined_c.metrics or {}
+                        rc = rm.get("_compiler", {})
+                        pm = parent.metrics or {}
+                        pc = pm.get("_compiler", {})
+                        if rc and pc:
+                            r_regs = rc.get("registers_per_thread", 0)
+                            p_regs = pc.get("registers_per_thread", 0)
+                            r_occ = rm.get("sm_occupancy", 0)
+                            p_occ = pm.get("sm_occupancy", 0)
+                            if r_regs != p_regs or r_occ != p_occ:
+                                msg += f" Registers: {p_regs}->{r_regs}, Occupancy: {p_occ:.0f}%->{r_occ:.0f}%."
+                        parent.last_refine_error = msg
                     else:
-                        parent.last_refine_error = ""  # clear on success
+                        parent.last_refine_error = ""  # clear on actual improvement
 
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
