@@ -85,35 +85,14 @@ Rules:
 
 
 def _constraint_for_speedup(speedup: float) -> str:
-    """Dynamic constraint scaling — more freedom when far from target.
-
-    < 1.0x  → full rewrite allowed (current code is SLOWER than baseline)
-    < 1.3x  → moderate changes (up to 40 lines, algorithmic changes OK)
-    >= 1.3x → surgical only (5-15 lines, preserve what's working)
-    """
-    if speedup < 1.0:
+    """Constraint guard: only restrict changes when kernel is already fast."""
+    if speedup >= 1.6:
         return (
-            "- The kernel is SLOWER than baseline — aggressive rewrite is allowed.\n"
-            "- You may restructure the entire kernel, change the algorithm, "
-            "replace the reduction pattern, add shared memory, change thread mapping.\n"
-            "- You are NOT required to keep existing code patterns — replace them "
-            "with better ones."
-        )
-    elif speedup < 1.3:
-        return (
-            "- Moderate changes allowed (up to ~40 lines). Algorithmic changes "
-            "(adding warp shuffles, shared memory, changing reduction pattern) "
-            "are encouraged.\n"
-            "- You MAY replace existing optimization patterns with better ones "
-            "(e.g., replace shared memory reduction with warp shuffles).\n"
-            "- Don't just tweak — make structural improvements."
-        )
-    else:
-        return (
-            "- Surgical changes only (5-15 lines). The kernel is performing well.\n"
+            "- Surgical changes only (5-15 lines). The kernel is already 1.6x+.\n"
             "- Keep all existing optimizations — do not regress.\n"
             "- Make targeted micro-optimizations, do not rewrite from scratch."
         )
+    return "- Structural changes, algorithmic rewrites, and new optimization patterns are all allowed."
 
 
 def _build_refine_system_prompt(speedup: float) -> str:
