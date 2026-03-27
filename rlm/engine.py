@@ -289,6 +289,7 @@ CRITICAL RULES:
                 baseline_us=baseline_us,
                 prev_metrics=candidate.prev_metrics,
                 atol=atol,
+                original_kernel_src=self.env.kernel_src,
             )
             tasks.append(self._refine_single_beam(prompt, candidate, round_num))
         return list(await asyncio.gather(*tasks))

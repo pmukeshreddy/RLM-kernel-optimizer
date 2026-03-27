@@ -393,6 +393,7 @@ def reflect(
     baseline_us: float = 0.0,
     prev_metrics: dict = None,
     atol: float = 1e-2,
+    original_kernel_src: str = "",
     **kwargs,  # absorb unused args (target_speedup, min_speedup) from callers
 ) -> str:
     """Generate a reflection prompt based on the candidate's result.
@@ -416,8 +417,19 @@ def reflect(
         candidate.compile_ok, candidate.correct, speedup
     )
 
-    # Common footer: launch signature + hw context + rules
-    footer = "\n" + launch_sig + "\n" + hw_context + "\n" + CRITICAL_RULES
+    # Reference source section — gives the model the original headers/types
+    ref_section = ""
+    if original_kernel_src:
+        ref_section = dedent(f"""\
+
+            ### Reference kernel (headers expanded — use these types and functions):
+            ```cuda
+            {original_kernel_src}
+            ```
+        """)
+
+    # Common footer: reference source + launch signature + hw context + rules
+    footer = "\n" + ref_section + "\n" + launch_sig + "\n" + hw_context + "\n" + CRITICAL_RULES
 
     if not candidate.compile_ok:
         error = getattr(candidate, 'compile_error', '') or "Unknown compilation error"
