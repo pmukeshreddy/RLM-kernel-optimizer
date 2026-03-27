@@ -257,6 +257,26 @@ int main(int argc, char** argv) {{
             candidate.bottleneck = self.clf.classify(metrics).value
         return metrics
 
+    def _make_inner_profile_fn(self, problem_shape, baseline_us):
+        """Create a profiling callback for the engine's inner refinement loop."""
+        def fn(code, strategy, round_num):
+            temp = KernelCandidate(
+                code=code,
+                strategy=f"{strategy}_inner",
+                round_num=round_num,
+                compile_ok=bool(code),
+            )
+            self._profile_candidate(temp, problem_shape, baseline_us)
+            return {
+                "compile_ok": temp.compile_ok,
+                "correct": temp.correct,
+                "speedup": temp.speedup,
+                "metrics": temp.metrics,
+                "bottleneck": temp.bottleneck,
+                "error": getattr(temp, 'compile_error', ''),
+            }
+        return fn
+
     def _profile_candidates_parallel(
         self,
         candidates: list,
@@ -362,10 +382,12 @@ int main(int argc, char** argv) {{
                     to_refine.append(s)
                     # Don't increment here — increment based on outcome below
 
-            # Refine non-stagnant survivors
+            # Refine non-stagnant survivors (inner loop profiles via callback)
             refined = []
             if to_refine:
-                refined = self.engine.run_refine_beams(to_refine, round_num)
+                profile_fn = self._make_inner_profile_fn(problem_shape, baseline_us)
+                refined = self.engine.run_refine_beams(
+                    to_refine, round_num, profile_fn=profile_fn)
 
             # Fill stagnant slots: first retry failed strategies, then use reserves
             fresh = []
@@ -407,8 +429,20 @@ int main(int argc, char** argv) {{
                     strategies=fresh_strats, kernel_slice=best_code, round_num=round_num
                 )
 
-            all_new = refined + fresh
-            new_metrics = self._profile_candidates_parallel(all_new, problem_shape, baseline_us)
+            # Refined candidates are already profiled by the inner loop.
+            # Only fresh beams need profiling.
+            if fresh:
+                fresh_metrics = self._profile_candidates_parallel(
+                    fresh, problem_shape, baseline_us)
+            else:
+                fresh_metrics = []
+
+            # Combine: refined (already profiled) + fresh (just profiled)
+            new_metrics = [
+                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
+                for c in refined
+            ] + fresh_metrics
+
             for c, _ in new_metrics:
                 env.optimization_history.record(c)
                 logger.info("  New: %s", c.summary())
