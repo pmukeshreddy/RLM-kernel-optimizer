@@ -226,6 +226,7 @@ class RLMEnvironment:
             "claude-opus-4-6":           {"in": 15.0, "out": 75.0},
             "claude-haiku-4-6":          {"in": 0.25, "out": 1.25},
             "claude-3-haiku-20240307":    {"in": 0.25, "out": 1.25},
+            "claude-haiku-4-5-20251001":  {"in": 0.25, "out": 1.25},
             "claude-3-opus-20240229":     {"in": 15.0, "out": 75.0},
         }
         p = _costs_per_million.get(model, {"in": 3.0, "out": 15.0})
