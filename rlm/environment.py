@@ -29,6 +29,7 @@ class KernelCandidate:
     prev_metrics: Optional[dict] = None  # parent's metrics for delta comparison
     compile_error: str = ""  # compiler error message for reflection
     last_refine_error: str = ""  # error from last failed refinement attempt
+    refinement_history: list = field(default_factory=list)  # [{round, strategy, outcome, speedup}]
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

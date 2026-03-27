@@ -313,9 +313,10 @@ int main(int argc, char** argv) {{
             logger.info("  %s", c.summary())
 
         survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
-        # Snapshot metrics so stagnation is detectable in round 2+
+        # Bug 1 fix: only set prev_metrics on candidates that don't have it yet
         for s in survivors:
-            s.prev_metrics = s.metrics
+            if s.prev_metrics is None:
+                s.prev_metrics = s.metrics
 
         # ── Rounds 1-N: Refine ─────────────────────────────────────────────
         for round_num in range(1, self.rounds + 1):
@@ -336,18 +337,22 @@ int main(int argc, char** argv) {{
                 env.optimization_history.record(c)
                 logger.info("  Refined: %s", c.summary())
 
-            # Track what happened with each refinement attempt so the model
-            # learns from failures AND regressions, not just compile errors
+            # Track refinement outcomes on parent survivors + build history
             for i, (refined_c, _) in enumerate(new_metrics):
                 if i < len(survivors):
                     parent = survivors[i]
+                    entry = {"round": round_num, "strategy": refined_c.strategy,
+                             "speedup": refined_c.speedup}
+
                     if not refined_c.compile_ok:
+                        entry["outcome"] = "compile_fail"
                         parent.last_refine_error = refined_c.compile_error or "Compile failure"
                     elif not refined_c.correct:
+                        entry["outcome"] = "correctness_fail"
                         parent.last_refine_error = "Correctness failure (output mismatch or kernel hung)"
                     elif refined_c.speedup < parent.speedup - 0.001:
-                        # Refinement compiled and was correct but REGRESSED
-                        msg = f"Your refinement compiled and was correct but was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
+                        entry["outcome"] = "regression"
+                        msg = f"Your refinement was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
                         rm = refined_c.metrics or {}
                         rc = rm.get("_compiler", {})
                         pm = parent.metrics or {}
@@ -360,17 +365,30 @@ int main(int argc, char** argv) {{
                             if r_regs != p_regs or r_occ != p_occ:
                                 msg += f" Registers: {p_regs}->{r_regs}, Occupancy: {p_occ:.0f}%->{r_occ:.0f}%."
                         parent.last_refine_error = msg
+                    elif refined_c.speedup > parent.speedup + 0.02:
+                        entry["outcome"] = "improved"
+                        parent.last_refine_error = ""
                     else:
-                        parent.last_refine_error = ""  # clear on actual improvement
+                        # Bug 3 fix: neutral result — don't clear, warn about stagnation
+                        entry["outcome"] = "stagnant"
+                        parent.last_refine_error = (
+                            f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
+                            f"{parent.speedup:.3f}x). Try a fundamentally different approach."
+                        )
+
+                    # Bug 4: append to history and propagate to refined candidate
+                    parent.refinement_history.append(entry)
+                    refined_c.refinement_history = list(parent.refinement_history)
 
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
                 for s in survivors
             ] + new_metrics
             survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
-            # Snapshot metrics so stagnation is detectable in next round
+            # Bug 1 fix: only set prev_metrics on newly promoted candidates
             for s in survivors:
-                s.prev_metrics = s.metrics
+                if s.prev_metrics is None:
+                    s.prev_metrics = s.metrics
 
         # ── Final: Combine top-2 ───────────────────────────────────────────
         top_for_combine = self.selector.select_for_combination(survivors)

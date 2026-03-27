@@ -95,6 +95,7 @@ PERFORMANCE_REFLECTION = dedent("""\
     {delta_section}
     {stagnation_section}
     {last_error_section}
+    {history_section}
 
     ### Your previous solution
     ```cuda
@@ -211,12 +212,29 @@ def _format_last_error_section(candidate) -> str:
     """)
 
 
+# ── Refinement history ────────────────────────────────────────────────────────
+
+def _format_history_section(candidate) -> str:
+    """Show the model what optimizations were already tried across rounds."""
+    history = getattr(candidate, 'refinement_history', [])
+    if not history:
+        return ""
+    lines = ["\n### Refinement History (do NOT repeat failed/stagnant approaches)"]
+    for entry in history:
+        outcome = entry.get("outcome", "?")
+        speedup = entry.get("speedup", 0)
+        strategy = entry.get("strategy", "?")
+        rnd = entry.get("round", "?")
+        lines.append(f"- Round {rnd}: {strategy} → {outcome} ({speedup:.3f}x)")
+    return "\n".join(lines)
+
+
 # ── Stagnation detection ─────────────────────────────────────────────────────
 
 def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int) -> str:
     """Detect reward stagnation and tell the model to change approach.
-    Only triggers at iteration >= 2 with flat speedup."""
-    if not metrics or not prev_metrics or iteration < 2:
+    Triggers from round 1 onward with flat speedup."""
+    if not metrics or not prev_metrics or iteration < 1:
         return ""
 
     cur_speedup = metrics.get("speedup", 1.0)
@@ -412,6 +430,7 @@ def reflect(
     delta_section = _format_delta_section(metrics, prev_metrics)
     stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration)
     last_error_section = _format_last_error_section(candidate)
+    history_section = _format_history_section(candidate)
 
     reward, reward_breakdown = compute_reward(
         candidate.compile_ok, candidate.correct, speedup
@@ -458,4 +477,5 @@ def reflect(
         delta_section=delta_section,
         stagnation_section=stagnation_section,
         last_error_section=last_error_section,
+        history_section=history_section,
     ) + footer
