@@ -1,11 +1,18 @@
 """
-reflector.py — Reflection / iteration logic for the RLM kernel-optimization pipeline.
+reflector.py — Reflection + reward system for the RLM kernel-optimization pipeline.
 
-After each profiling round, analyses the KernelCandidate and generates a structured
-reflection prompt that feeds back into the LLM for the next attempt.
+After each profiling round, computes a numerical reward score and generates a
+reflection prompt with real profiler data for the next LLM attempt.
 
-Modelled on AMD Apex's reflector pattern: separate templates per failure mode,
-kernel-type-specific hints, dual speedup thresholds, raw profiler data as code blocks.
+3 templates only:
+  1. Compile failure  → show error, fix it
+  2. Correctness failure → show code, fix the math
+  3. Performance → show reward score + profiler data, make it faster
+
+Reward scoring:
+  +20  if kernel compiles
+  +100 if correctness passes
+  +(baseline_us / optimized_us) × 100  for speedup (e.g. 1.5x = 150 pts)
 """
 
 from __future__ import annotations
@@ -16,10 +23,41 @@ from textwrap import dedent
 logger = logging.getLogger(__name__)
 
 
+# ── Reward computation ────────────────────────────────────────────────────────
+
+def compute_reward(compile_ok: bool, correct: bool, speedup: float) -> tuple[float, str]:
+    """Compute numerical reward score.
+    Returns (total_score, breakdown_string)."""
+    score = 0.0
+    parts = []
+
+    if compile_ok:
+        score += 20
+        parts.append("compile: +20")
+    else:
+        parts.append("compile: +0 (FAILED)")
+        return score, " | ".join(parts)
+
+    if correct:
+        score += 100
+        parts.append("correctness: +100")
+    else:
+        parts.append("correctness: +0 (FAILED)")
+        return score, " | ".join(parts)
+
+    perf_score = speedup * 100
+    score += perf_score
+    parts.append(f"speedup: +{perf_score:.0f} ({speedup:.3f}x)")
+
+    return score, " | ".join(parts)
+
+
 # ── Reflection templates ─────────────────────────────────────────────────────
 
 COMPILE_REFLECTION = dedent("""\
     ## Reflection -- Iteration {iteration}: Compilation Failure
+
+    **Reward: {reward:.0f}** ({reward_breakdown})
 
     Your previous solution **failed to compile**.
 
@@ -37,7 +75,6 @@ COMPILE_REFLECTION = dedent("""\
     - Read the compiler error above carefully and fix the exact issue.
     - Do NOT invent header files (e.g. "fp4_utils.cuh") -- only use the original #includes.
     - Only call functions defined in the included headers -- do NOT invent helpers.
-    - The launch_* wrapper signature must not change.
     - If you see "undefined reference" to the launch function, you changed its signature.
     {hints}
 
@@ -49,6 +86,8 @@ COMPILE_REFLECTION = dedent("""\
 
 CORRECTNESS_REFLECTION = dedent("""\
     ## Reflection -- Iteration {iteration}: Correctness Failure
+
+    **Reward: {reward:.0f}** ({reward_breakdown})
 
     Your solution compiled but **produced wrong results** (atol > {atol}).
 
@@ -71,60 +110,15 @@ CORRECTNESS_REFLECTION = dedent("""\
 """)
 
 
-PERF_REGRESSION_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}: Performance Regression
+PERFORMANCE_REFLECTION = dedent("""\
+    ## Reflection -- Iteration {iteration}
 
-    Your solution is correct but **slower than baseline** ({speedup:.2f}x).
-
-    ### Speedup thresholds
-    | Threshold | Value | Status |
-    |-----------|-------|--------|
-    | Baseline  | 1.00x | REGRESSED |
-    | Integration minimum | {min_speedup:.2f}x | NOT MET |
-    | Target | {target_speedup:.1f}x | NOT MET |
+    **Reward: {reward:.0f}** ({reward_breakdown})
 
     ### Timing
     - Baseline: {baseline_us:.3f} us
     - Your solution: {optimized_us:.3f} us
-    - Speedup: {speedup:.2f}x
-
-    ### Your previous solution
-    ```cuda
-    {solution}
-    ```
-    {profile_section}
-
-    ### What to fix
-    - Your optimization made things worse. Check for:
-      * Unnecessary global memory round-trips (writing then re-reading)
-      * Excessive __syncthreads() barriers
-      * Register spills from too many local variables
-      * Uncoalesced memory access patterns
-    - Consider reverting to a simpler approach and optimizing incrementally.
-    {hints}
-
-    ### Instructions
-    Write an optimized kernel that is faster than the baseline.
-    Correctness must still pass. Return the COMPLETE .cu file in a single ```cuda code block.
-""")
-
-
-BELOW_THRESHOLD_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}: Below Target
-
-    Your solution is correct with {speedup:.2f}x speedup -- progress, but not enough.
-
-    ### Speedup thresholds
-    | Threshold | Value | Status |
-    |-----------|-------|--------|
-    | Baseline  | 1.00x | PASSED |
-    | Integration minimum | {min_speedup:.2f}x | {min_status} |
-    | Target | {target_speedup:.1f}x | NOT MET |
-
-    ### Timing
-    - Baseline: {baseline_us:.3f} us
-    - Your solution: {optimized_us:.3f} us
-    - Speedup: {speedup:.2f}x (need >= {target_speedup:.1f}x)
+    - Speedup: {speedup:.3f}x
 
     ### Your previous solution
     ```cuda
@@ -133,50 +127,14 @@ BELOW_THRESHOLD_REFLECTION = dedent("""\
     {profile_section}
     {delta_section}
 
-    ### What to fix
-    - You need a more aggressive approach. Consider:
-      * Fuse ALL passes into a single pass over the data
-      * Cache intermediate values in registers, not global memory
-      * Use 128-bit vectorized loads/stores (uint4 for 8 bf16 values)
-      * Replace shared memory reductions with warp shuffles
-      * Increase per-thread work (each thread handles 16+ elements)
+    ### How to improve
+    - Study the profiler data above. Use it to guide your next optimization.
+    - Higher reward = better. Maximize speedup while keeping correctness.
     {hints}
 
     ### Instructions
-    Write a significantly faster kernel targeting {target_speedup:.1f}x+ speedup.
-    Correctness must still pass. Return the COMPLETE .cu file in a single ```cuda code block.
-""")
-
-
-IMPROVEMENT_REFLECTION = dedent("""\
-    ## Reflection -- Iteration {iteration}: Good Progress
-
-    Your solution achieves **{speedup:.2f}x speedup** -- solid work.
-
-    ### Speedup thresholds
-    | Threshold | Value | Status |
-    |-----------|-------|--------|
-    | Baseline  | 1.00x | PASSED |
-    | Integration minimum | {min_speedup:.2f}x | PASSED |
-    | Target | {target_speedup:.1f}x | {target_status} |
-
-    ### Timing
-    - Baseline: {baseline_us:.3f} us
-    - Your solution: {optimized_us:.3f} us
-    - Speedup: {speedup:.2f}x
-    {profile_section}
-    {delta_section}
-
-    ### Push further
-    - Current: {speedup:.2f}x -> target: {target_speedup:.1f}x+
-    - Look at the profiler data above for the remaining bottleneck.
-    - Consider combining multiple techniques (vectorized loads + warp shuffles + register caching).
-    - Reduce total instruction count -- simpler code often runs faster on GPUs.
-    {hints}
-
-    ### Instructions
-    Write an improved kernel pushing closer to {target_speedup:.1f}x+ speedup.
-    Correctness must still pass. Return the COMPLETE .cu file in a single ```cuda code block.
+    Write a faster kernel. Correctness must still pass (atol < 1e-2).
+    Return the COMPLETE .cu file in a single ```cuda code block.
 """)
 
 
@@ -450,24 +408,17 @@ def reflect(
     iteration: int,
     hw_spec: dict,
     kernel_type: str = "",
-    target_speedup: float = 1.5,
-    min_speedup: float = 1.05,
     baseline_us: float = 0.0,
     prev_metrics: dict = None,
     atol: float = 1e-2,
+    **kwargs,  # absorb unused args (target_speedup, min_speedup) from callers
 ) -> str:
-    """Generate a reflection prompt based on the candidate's performance.
+    """Generate a reflection prompt based on the candidate's result.
 
-    Args:
-        candidate: KernelCandidate with compile_ok, correct, speedup, metrics, code.
-        iteration: Current refinement round number.
-        hw_spec: Hardware specification dict (from b200_spec.yaml).
-        kernel_type: Kernel type for type-specific hints.
-        target_speedup: Stretch goal speedup.
-        min_speedup: Minimum speedup for the result to be considered useful.
-        baseline_us: Baseline kernel timing in microseconds.
-        prev_metrics: Previous round's metrics dict for delta comparison.
-        atol: Correctness tolerance.
+    3 paths:
+      1. compile_ok=False → COMPILE_REFLECTION + compiler error
+      2. correct=False    → CORRECTNESS_REFLECTION
+      3. otherwise        → PERFORMANCE_REFLECTION + reward score + profiler data
     """
     solution = candidate.code or "# (no code generated)"
     metrics = candidate.metrics or {}
@@ -478,15 +429,19 @@ def reflect(
     profile_section = _format_profile_section(metrics, iteration)
     delta_section = _format_delta_section(metrics, prev_metrics)
 
+    reward, reward_breakdown = compute_reward(
+        candidate.compile_ok, candidate.correct, speedup
+    )
+
     # Common footer: launch signature + hw context + rules
     footer = "\n" + launch_sig + "\n" + hw_context + "\n" + CRITICAL_RULES
-
-    optimized_us = baseline_us / speedup if speedup > 0 else 0.0
 
     if not candidate.compile_ok:
         error = getattr(candidate, 'compile_error', '') or "Unknown compilation error"
         prompt = COMPILE_REFLECTION.format(
             iteration=iteration,
+            reward=reward,
+            reward_breakdown=reward_breakdown,
             error=error,
             solution=solution,
             hints=hints,
@@ -496,54 +451,23 @@ def reflect(
     if not candidate.correct:
         prompt = CORRECTNESS_REFLECTION.format(
             iteration=iteration,
+            reward=reward,
+            reward_breakdown=reward_breakdown,
             solution=solution,
             atol=atol,
             hints=hints,
         )
         return prompt + footer
 
-    if speedup < 1.0:
-        prompt = PERF_REGRESSION_REFLECTION.format(
-            iteration=iteration,
-            solution=solution,
-            speedup=speedup,
-            baseline_us=baseline_us,
-            optimized_us=optimized_us,
-            min_speedup=min_speedup,
-            target_speedup=target_speedup,
-            profile_section=profile_section,
-            hints=hints,
-        )
-        return prompt + footer
-
-    if speedup < min_speedup:
-        prompt = BELOW_THRESHOLD_REFLECTION.format(
-            iteration=iteration,
-            solution=solution,
-            speedup=speedup,
-            baseline_us=baseline_us,
-            optimized_us=optimized_us,
-            min_speedup=min_speedup,
-            min_status="NOT MET",
-            target_speedup=target_speedup,
-            profile_section=profile_section,
-            delta_section=delta_section,
-            hints=hints,
-        )
-        return prompt + footer
-
-    # speedup >= min_speedup: good progress, push further
-    min_status = "PASSED" if speedup >= min_speedup else "NOT MET"
-    target_status = "PASSED" if speedup >= target_speedup else "NOT MET"
-    prompt = IMPROVEMENT_REFLECTION.format(
+    optimized_us = baseline_us / speedup if speedup > 0 else 0.0
+    prompt = PERFORMANCE_REFLECTION.format(
         iteration=iteration,
+        reward=reward,
+        reward_breakdown=reward_breakdown,
         solution=solution,
         speedup=speedup,
         baseline_us=baseline_us,
         optimized_us=optimized_us,
-        min_speedup=min_speedup,
-        target_speedup=target_speedup,
-        target_status=target_status,
         profile_section=profile_section,
         delta_section=delta_section,
         hints=hints,
