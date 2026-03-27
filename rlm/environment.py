@@ -30,6 +30,7 @@ class KernelCandidate:
     compile_error: str = ""  # compiler error message for reflection
     last_refine_error: str = ""  # error from last failed refinement attempt
     refinement_history: list = field(default_factory=list)  # [{round, strategy, outcome, speedup}]
+    refine_attempts: int = 0  # times this candidate was refined without improvement
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

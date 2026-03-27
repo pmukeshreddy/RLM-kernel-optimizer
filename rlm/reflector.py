@@ -92,16 +92,19 @@ PERFORMANCE_REFLECTION = dedent("""\
 
     **Reward: {reward:.0f}** ({reward_breakdown})
     {profile_section}
+    {suggestions_section}
     {delta_section}
     {stagnation_section}
     {last_error_section}
     {history_section}
 
-    ### Your previous solution
+    ### Your previous solution (achieves {speedup:.3f}x)
     ```cuda
     {solution}
     ```
 
+    Do NOT rewrite from scratch. Keep all working optimizations intact.
+    Apply ONE targeted change based on the optimization targets above.
     Maximize reward. Return the COMPLETE .cu file in a single ```cuda code block.
 """)
 
@@ -210,6 +213,79 @@ def _format_last_error_section(candidate) -> str:
         ```
         Do NOT repeat this mistake. Fix the error while improving performance.
     """)
+
+
+# ── Data-driven optimization suggestions ─────────────────────────────────────
+
+def _format_suggestions_section(metrics: dict) -> str:
+    """Generate concrete actionable suggestions from profiler data."""
+    if not metrics:
+        return ""
+
+    suggestions = []
+    cm = metrics.get("_compiler", {})
+
+    if cm:
+        ldg_128 = cm.get("sass_ldg_128", 0)
+        ldg_64 = cm.get("sass_ldg_64", 0)
+        ldg_32 = cm.get("sass_ldg_32", 0)
+        total_ldg = ldg_32 + ldg_64 + ldg_128
+        if total_ldg > 0:
+            vec_pct = ldg_128 / total_ldg * 100
+            if vec_pct < 80:
+                suggestions.append(
+                    f"Only {vec_pct:.0f}% of loads are 128-bit vectorized — "
+                    f"convert remaining {ldg_32 + ldg_64} scalar loads to uint4 "
+                    f"(8 bf16 values per load)"
+                )
+
+        bars = cm.get("sass_bar", 0)
+        shfls = cm.get("sass_shfl", 0)
+        if bars > 0 and shfls == 0:
+            suggestions.append(
+                f"{bars} barrier instructions but 0 warp shuffles — "
+                f"replace shared memory reductions with __shfl_down_sync"
+            )
+
+        spills = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
+        if spills > 0:
+            suggestions.append(
+                f"{spills} bytes of register spills — reduce register pressure"
+            )
+
+        mufu = cm.get("sass_mufu", 0)
+        if mufu == 0:
+            suggestions.append(
+                "No MUFU (fast math SFU) instructions — "
+                "use __expf/__rsqrtf instead of expf/rsqrtf"
+            )
+
+        stg_128 = cm.get("sass_stg_128", 0)
+        stg_32 = cm.get("sass_stg_32", 0)
+        if stg_32 > 0 and stg_128 == 0:
+            suggestions.append(
+                f"All {stg_32} stores are 32-bit — vectorize stores with uint4"
+            )
+
+    occ = metrics.get("sm_occupancy", 0)
+    if occ >= 95:
+        suggestions.append(
+            "Occupancy is maxed — focus on instruction-level parallelism "
+            "or memory access patterns, not thread count"
+        )
+    elif 0 < occ < 50:
+        suggestions.append(
+            f"SM occupancy is only {occ:.0f}% — reduce registers or "
+            f"shared memory to increase occupancy"
+        )
+
+    if not suggestions:
+        return ""
+
+    lines = ["\n### Optimization Targets (from profiler data)"]
+    for s in suggestions:
+        lines.append(f"- {s}")
+    return "\n".join(lines)
 
 
 # ── Refinement history ────────────────────────────────────────────────────────
@@ -431,6 +507,7 @@ def reflect(
     stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration)
     last_error_section = _format_last_error_section(candidate)
     history_section = _format_history_section(candidate)
+    suggestions_section = _format_suggestions_section(metrics)
 
     reward, reward_breakdown = compute_reward(
         candidate.compile_ok, candidate.correct, speedup
@@ -472,8 +549,10 @@ def reflect(
         iteration=iteration,
         reward=reward,
         reward_breakdown=reward_breakdown,
+        speedup=speedup,
         solution=solution,
         profile_section=profile_section,
+        suggestions_section=suggestions_section,
         delta_section=delta_section,
         stagnation_section=stagnation_section,
         last_error_section=last_error_section,

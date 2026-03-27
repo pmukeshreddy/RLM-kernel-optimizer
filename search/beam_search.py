@@ -297,8 +297,11 @@ int main(int argc, char** argv) {{
         logger.info("="*60)
 
         # ── Round 0: Decompose + generate initial beams ────────────────────
-        strategies = self.engine.run_decompose()
-        logger.info("Strategies: %s", strategies)
+        all_strategies = self.engine.run_decompose()
+        strategies = all_strategies[:self.beam_w]
+        self._reserve_strategies = all_strategies[self.beam_w:]
+        logger.info("Active strategies: %s", [s.get("name", s) if isinstance(s, dict) else s for s in strategies])
+        logger.info("Reserve strategies: %s", [s.get("name", s) if isinstance(s, dict) else s for s in self._reserve_strategies])
         env.current_round = 0
 
         kernel_slice = env.kernel_src
@@ -313,7 +316,6 @@ int main(int argc, char** argv) {{
             logger.info("  %s", c.summary())
 
         survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
-        # Bug 1 fix: only set prev_metrics on candidates that don't have it yet
         for s in survivors:
             if s.prev_metrics is None:
                 s.prev_metrics = s.metrics
@@ -330,17 +332,46 @@ int main(int argc, char** argv) {{
                 break
 
             logger.info("--- Round %d ---", round_num)
-            refined = self.engine.run_refine_beams(survivors, round_num)
 
-            new_metrics = self._profile_candidates_parallel(refined, problem_shape, baseline_us)
+            # Problem 1: split survivors into refineable vs stagnant
+            to_refine = []
+            stagnant = []
+            for s in survivors:
+                if s.refine_attempts >= 2:
+                    stagnant.append(s)
+                    logger.info("  Retiring stagnant [%s] after %d failed refine attempts",
+                                s.strategy, s.refine_attempts)
+                else:
+                    to_refine.append(s)
+                    s.refine_attempts += 1
+
+            # Refine non-stagnant survivors
+            refined = []
+            if to_refine:
+                refined = self.engine.run_refine_beams(to_refine, round_num)
+
+            # Generate fresh beams for stagnant slots using reserve strategies
+            fresh = []
+            if stagnant and self._reserve_strategies:
+                n_fresh = min(len(stagnant), len(self._reserve_strategies))
+                fresh_strats = self._reserve_strategies[:n_fresh]
+                self._reserve_strategies = self._reserve_strategies[n_fresh:]
+                logger.info("  Replacing %d stagnant beams with fresh strategies: %s",
+                            n_fresh, [s.get("name", s) if isinstance(s, dict) else s for s in fresh_strats])
+                fresh = self.engine.run_generate_beams(
+                    strategies=fresh_strats, kernel_slice=kernel_slice, round_num=round_num
+                )
+
+            all_new = refined + fresh
+            new_metrics = self._profile_candidates_parallel(all_new, problem_shape, baseline_us)
             for c, _ in new_metrics:
                 env.optimization_history.record(c)
-                logger.info("  Refined: %s", c.summary())
+                logger.info("  New: %s", c.summary())
 
             # Track refinement outcomes on parent survivors + build history
             for i, (refined_c, _) in enumerate(new_metrics):
-                if i < len(survivors):
-                    parent = survivors[i]
+                if i < len(to_refine):
+                    parent = to_refine[i]
                     entry = {"round": round_num, "strategy": refined_c.strategy,
                              "speedup": refined_c.speedup}
 
@@ -368,22 +399,33 @@ int main(int argc, char** argv) {{
                     elif refined_c.speedup > parent.speedup + 0.02:
                         entry["outcome"] = "improved"
                         parent.last_refine_error = ""
+                        parent.refine_attempts = 0  # reset on real improvement
                     else:
-                        # Bug 3 fix: neutral result — don't clear, warn about stagnation
                         entry["outcome"] = "stagnant"
                         parent.last_refine_error = (
                             f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
                             f"{parent.speedup:.3f}x). Try a fundamentally different approach."
                         )
 
-                    # Bug 4: append to history and propagate to refined candidate
                     parent.refinement_history.append(entry)
                     refined_c.refinement_history = list(parent.refinement_history)
+
+            # Problem 2: only promote refinements that actually improved
+            improved_new = []
+            for i, (refined_c, m) in enumerate(new_metrics):
+                if i < len(to_refine):
+                    parent = to_refine[i]
+                    if refined_c.speedup > parent.speedup:
+                        improved_new.append((refined_c, m))
+                    # else: regressed/stagnant — don't pollute the beam
+                else:
+                    # Fresh beams always enter the pool
+                    improved_new.append((refined_c, m))
 
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
                 for s in survivors
-            ] + new_metrics
+            ] + improved_new
             survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
             # Bug 1 fix: only set prev_metrics on newly promoted candidates
             for s in survivors:

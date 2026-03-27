@@ -118,12 +118,18 @@ class RLMEngine:
         env = self.env
         kernel_src = env.kernel_src  # expanded includes
 
+        num_strategies = self.beam_width * 2  # extra strategies held in reserve
+        example_lines = "\n".join(
+            f'  {{"name": "short_name", "what": "one line description of the concrete change"}},'
+            for _ in range(num_strategies)
+        )
         prompt = f"""\
-You are a CUDA optimization expert. Analyze this kernel and propose exactly {self.beam_width}
-optimization techniques that would give the biggest speedup.
+You are a CUDA optimization expert. Analyze this kernel and propose exactly {num_strategies}
+DIVERSE optimization techniques that would give the biggest speedup.
 
 You are NOT limited to any predefined list. Propose whatever CUDA optimizations
 you think are most impactful for THIS SPECIFIC kernel. Be specific and concrete.
+Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
 
 Kernel type: {env.kernel_type}
 Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 142 SMs)
@@ -136,10 +142,7 @@ For each optimization, give a short name and one-line description of what to do.
 
 Return as a JSON array of objects, most impactful first:
 [
-  {{"name": "short_name", "what": "one line description of the concrete change"}},
-  {{"name": "short_name", "what": "one line description of the concrete change"}},
-  {{"name": "short_name", "what": "one line description of the concrete change"}},
-  {{"name": "short_name", "what": "one line description of the concrete change"}}
+{example_lines}
 ]
 
 Respond with ONLY the JSON array, nothing else."""
@@ -160,14 +163,14 @@ Respond with ONLY the JSON array, nothing else."""
                 pass
 
         if strategies:
-            names = [s["name"] for s in strategies[:self.beam_width]]
-            logger.info("LLM-proposed strategies: %s", names)
-            return strategies[:self.beam_width]
+            names = [s["name"] for s in strategies]
+            logger.info("LLM-proposed strategies (%d): %s", len(names), names)
+            return strategies  # return ALL — caller splits active vs reserve
 
         # Fallback: use kernel-aware defaults from strategy bank
         from search.strategy_bank import select_for_kernel
         fallback = select_for_kernel(
-            kernel_type=env.kernel_type, tried=[], beam_width=self.beam_width)
+            kernel_type=env.kernel_type, tried=[], beam_width=num_strategies)
         logger.info("Fallback to kernel-aware strategies: %s", fallback)
         return [{"name": s, "what": ""} for s in fallback]
 
