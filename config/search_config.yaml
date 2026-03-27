@@ -52,6 +52,9 @@ cost_control:
   max_total_api_cost_usd: 25.0  # hard stop per kernel problem (Opus is ~5x Sonnet)
   max_total_cost_all_problems: 100.0
 
+target:
+  min_speedup: 1.5               # target speedup over baseline
+
 eval:
   correctness_atol: 1e-2
   correctness_rtol: 1e-3
