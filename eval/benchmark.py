@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
+import time
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -87,6 +88,7 @@ class Benchmarker:
         print(kernel_src)
         print("="*80 + "\n")
 
+        t0_comp = time.perf_counter()
         module = load_inline(
             name=mod_name,
             cuda_sources=[cuda_src],
@@ -96,7 +98,9 @@ class Benchmarker:
             ] + [f"-I{d}" for d in self.include_dirs],
             verbose=False,
         )
+        print(f"---> [CANDIDATE TIMING] Compilation (load_inline) took: {time.perf_counter() - t0_comp:.4f} s")
 
+        t0_alloc = time.perf_counter()
         # Create L2-cycling input sets + shared outputs
         nbufs = _L2_CYCLE_BUFS
         input_sets = []
@@ -104,15 +108,19 @@ class Benchmarker:
             torch.manual_seed(42 + i)
             input_sets.append(self._create_inputs(shape))
         outputs = self._create_outputs(shape)
+        print(f"---> [CANDIDATE TIMING] Tensor allocation took: {time.perf_counter() - t0_alloc:.4f} s")
 
         def run(buf_idx):
             module.run_kernel(*input_sets[buf_idx], *outputs)
 
+        t0_warmup = time.perf_counter()
         # Warmup with L2 cycling
         for i in range(self.warmup):
             run(i % nbufs)
         torch.cuda.synchronize()
+        print(f"---> [CANDIDATE TIMING] Python loop warmup took: {time.perf_counter() - t0_warmup:.4f} s")
 
+        t0_cap = time.perf_counter()
         # Capture CUDA Graph containing all iterations
         # Stream-specific warmup for graph capture
         s = torch.cuda.Stream()
@@ -126,20 +134,24 @@ class Benchmarker:
         with torch.cuda.graph(g):
             for i in range(self.iters):
                 run(i % nbufs)
+        print(f"---> [CANDIDATE TIMING] Graph capture took: {time.perf_counter() - t0_cap:.4f} s")
 
         # Timed graph replay
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
 
         torch.cuda.synchronize()
+        t0_replay = time.perf_counter()
         start.record()
         g.replay()
         end.record()
         torch.cuda.synchronize()
+        cpu_wait_ms = (time.perf_counter() - t0_replay) * 1000.0
 
         ms = start.elapsed_time(end)
         t_us = ms * 1000.0 / self.iters
-        print(f"\n---> [CANDIDATE TIMING] Graph replay took {ms:.4f} ms for {self.iters} iterations.")
+        print(f"\n---> [CANDIDATE TIMING] CPU time waiting for sync: {cpu_wait_ms:.4f} ms")
+        print(f"---> [CANDIDATE TIMING] GPU Event Graph replay took {ms:.4f} ms for {self.iters} iterations.")
         print(f"---> [CANDIDATE TIMING] 1 Iteration = {t_us:.4f} us\n")
         return t_us  # µs per iteration
 
