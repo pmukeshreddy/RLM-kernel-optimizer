@@ -220,12 +220,15 @@ class RLMEnvironment:
     # ── Cost tracking ─────────────────────────────────────────────────────────
 
     def record_api_cost(self, tokens_in: int, tokens_out: int, model: str) -> float:
-        pricing = {
+        _costs_per_million = {
+            "claude-3-5-sonnet-20241022": {"in": 3.0,  "out": 15.0},
             "claude-sonnet-4-6":         {"in": 3.0,  "out": 15.0},
             "claude-opus-4-6":           {"in": 15.0, "out": 75.0},
-            "claude-haiku-4-5-20251001": {"in": 0.25, "out": 1.25},
+            "claude-haiku-4-6":          {"in": 0.25, "out": 1.25},
+            "claude-3-haiku-20240307":    {"in": 0.25, "out": 1.25},
+            "claude-3-opus-20240229":     {"in": 15.0, "out": 75.0},
         }
-        p = pricing.get(model, {"in": 3.0, "out": 15.0})
+        p = _costs_per_million.get(model, {"in": 3.0, "out": 15.0})
         cost = (tokens_in * p["in"] + tokens_out * p["out"]) / 1_000_000
         self.total_api_cost_usd += cost
         return cost
