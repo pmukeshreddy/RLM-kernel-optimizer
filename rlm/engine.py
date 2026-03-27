@@ -382,7 +382,7 @@ CRITICAL RULES:
         """
         metrics = parent.metrics or {}
         prev_metrics = parent.prev_metrics
-        has_fresh_data = prev_metrics and prev_metrics is not metrics
+        has_fresh_data = bool(prev_metrics) and prev_metrics != metrics
 
         # Build profiler observation
         if has_fresh_data:

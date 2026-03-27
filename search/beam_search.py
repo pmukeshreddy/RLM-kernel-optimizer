@@ -185,7 +185,8 @@ int main(int argc, char** argv) {{
         safe_strat = re.sub(r'[^a-zA-Z0-9_-]', '_', candidate.strategy)
         name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}_{id(candidate)}"
 
-        # Single-shot: compile, check correctness, profile — no retries
+        # Compile, check correctness, profile.
+        # Note: counters reflect ALL attempts including inner refinement retries.
         ok = False
         metrics = None
         speedup = 0.0
@@ -267,13 +268,18 @@ int main(int argc, char** argv) {{
                 compile_ok=bool(code),
             )
             self._profile_candidate(temp, problem_shape, baseline_us)
+            error = temp.compile_error
+            if not error and not temp.compile_ok:
+                error = "Rejected: code did not pass validation checks"
+            if not error and not temp.correct:
+                error = "Correctness failure: output mismatch"
             return {
                 "compile_ok": temp.compile_ok,
                 "correct": temp.correct,
                 "speedup": temp.speedup,
                 "metrics": temp.metrics,
                 "bottleneck": temp.bottleneck,
-                "error": getattr(temp, 'compile_error', ''),
+                "error": error,
             }
         return fn
 
