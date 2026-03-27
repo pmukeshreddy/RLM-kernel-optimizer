@@ -319,11 +319,12 @@ def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int
     if not metrics or not prev_metrics or iteration < 1:
         return ""
 
-    # Don't trigger stagnation if this beam hasn't been refined yet —
-    # metrics and prev_metrics are identical for fresh survivors
+    # Don't trigger stagnation if this beam hasn't had a failed refinement yet —
+    # metrics and prev_metrics are identical for fresh/newly-promoted survivors.
+    # Use refine_attempts (tracks actual failures on THIS candidate) rather than
+    # refinement_history (inherited from parent lineage).
     if candidate is not None:
-        has_history = getattr(candidate, 'refinement_history', [])
-        if not has_history:
+        if getattr(candidate, 'refine_attempts', 0) == 0:
             return ""
 
     cur_speedup = metrics.get("speedup", 1.0)
