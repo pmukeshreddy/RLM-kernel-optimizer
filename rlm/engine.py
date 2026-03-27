@@ -302,6 +302,21 @@ CRITICAL RULES:
         logger.info("Reflecting [%s_r%d]: compile=%s correct=%s speedup=%.3fx",
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
 
+        # Debug 1: What prompt sections are populated?
+        logger.info("PROMPT SECTIONS [%s]: targets=%s history=%s stagnation=%s delta=%s last_err=%s",
+            parent.strategy,
+            "### Optimization Targets" in prompt,
+            "### Refinement History" in prompt,
+            "### Stagnation Detected" in prompt,
+            "### Changes vs Previous" in prompt,
+            "### Your Last Refinement" in prompt)
+
+        # Debug 2: Prompt length + suggestions content
+        logger.info("PROMPT LENGTH [%s]: %d chars", parent.strategy, len(prompt))
+        targets_match = re.search(r'(### Optimization Targets.*?)###', prompt, re.DOTALL)
+        if targets_match:
+            logger.info("SUGGESTIONS [%s]: %s", parent.strategy, targets_match.group(1).strip()[:500])
+
         # Turn 1: Strategy — what ONE optimization to apply (cheap, exploratory)
         strategy_prompt = (
             f"{prompt}\n\n"
@@ -317,7 +332,7 @@ CRITICAL RULES:
             logger.error("Budget exceeded during strategy %s: %s", parent.strategy, e)
             return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
 
-        logger.debug("Strategy for [%s]: %s", parent.strategy, strat_response[:200])
+        logger.info("STRATEGY RESPONSE [%s]: %s", parent.strategy, strat_response[:300])
 
         # Turn 2: Implementation — apply the decided strategy precisely
         launch_sig = _get_launch_signature(self.env.kernel_type)
@@ -346,7 +361,20 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             logger.error("Budget exceeded during implement %s: %s", parent.strategy, e)
             return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
 
+        # Debug 3: Raw LLM response start
+        logger.info("LLM RESPONSE START [%s]: %s", parent.strategy, response[:300])
+
         code = self._extract_cuda_code(response)
+
+        # Debug 4: Code diff
+        if code and parent.code:
+            parent_lines = set(parent.code.strip().splitlines())
+            new_lines = set(code.strip().splitlines())
+            added = len(new_lines - parent_lines)
+            removed = len(parent_lines - new_lines)
+            logger.info("CODE DIFF [%s]: %d lines added, %d removed, %d total (parent had %d)",
+                parent.strategy, added, removed, len(code.splitlines()), len(parent.code.splitlines()))
+
         if not code:
             logger.warning("No CUDA code extracted for refinement of %s", parent.strategy)
         return KernelCandidate(
