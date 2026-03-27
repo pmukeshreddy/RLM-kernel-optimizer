@@ -65,11 +65,13 @@ class BeamSearch:
     def _harness_add_rmsnorm(self, shape: tuple) -> str:
         rows, hidden = shape
         n, nb = rows * hidden, rows * hidden // 16
+        input_bytes = n * 2 * 2 + hidden * 2  # (input+residual)*bf16 + weight
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdio.h>
+#include <stdlib.h>
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
@@ -77,30 +79,35 @@ int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
-    __nv_bfloat16 *di,*dr,*dw,*dro; unsigned char *dq; __nv_fp8_storage_t *ds;
-    cudaMalloc(&di,N*2); cudaMalloc(&dr,N*2); cudaMalloc(&dw,hidden*2);
+    // Dynamic L2 cache cycling (KernelArena/ThunderKittens 2.0 methodology)
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **di = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **dr = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 *dw, *dro; unsigned char *dq; __nv_fp8_storage_t *ds;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&di[b],N*2); cudaMalloc(&dr[b],N*2); }}
+    cudaMalloc(&dw,hidden*2);
     cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
-    // Warmup (no graph — first calls may trigger JIT)
-    for(int i=0;i<warmup;++i) launch_fused_add_rmsnorm_nvfp4(di,dr,dw,dro,dq,ds,rows,hidden,s);
+    // Warmup with L2 cycling
+    for(int i=0;i<warmup;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
     cudaStreamSynchronize(s);
-    // Capture kernel launch into CUDA graph (eliminates CPU launch overhead)
-    cudaGraph_t graph; cudaGraphExec_t graphExec;
-    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
-    for(int i=0;i<iters;++i) launch_fused_add_rmsnorm_nvfp4(di,dr,dw,dro,dq,ds,rows,hidden,s);
-    cudaStreamEndCapture(s, &graph);
-    cudaGraphInstantiate(&graphExec, graph, 0);
-    // Warmup the graph execution
-    for(int i=0;i<3;++i) {{ cudaGraphLaunch(graphExec, s); cudaStreamSynchronize(s); }}
-    // Timed graph replay
+    // Timed reps — 2 CUDA events wrapping all reps (ThunderKittens convention)
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    cudaGraphLaunch(graphExec, s);
+    for(int i=0;i<iters;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms=0; cudaEventElapsedTime(&ms,t0,t1);
     printf("timing_us: %.3f\\n", ms*1000.f/iters);
-    cudaGraphExecDestroy(graphExec); cudaGraphDestroy(graph);
-    cudaFree(di); cudaFree(dr); cudaFree(dw); cudaFree(dro); cudaFree(dq); cudaFree(ds);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(di[b]); cudaFree(dr[b]); }}
+    free(di); free(dr);
+    cudaFree(dw); cudaFree(dro); cudaFree(dq); cudaFree(ds);
     return 0;
 }}
 """
@@ -109,12 +116,14 @@ int main(int argc, char** argv) {{
         b, m, k = shape
         n = b * m * k
         nb = n // 16
+        input_bytes = n * 2 * 2  # (gate + up) * bf16
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 void launch_silu_mul_fp4quant(
     const __nv_bfloat16*, const __nv_bfloat16*,
     uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
@@ -122,26 +131,32 @@ int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int N={n}, nb={nb};
-    __nv_bfloat16 *dg,*du; uint8_t *dq; __nv_fp8_storage_t *ds;
-    cudaMalloc(&dg,N*2); cudaMalloc(&du,N*2);
+    // Dynamic L2 cache cycling
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **dg = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **du = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dq; __nv_fp8_storage_t *ds;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&dg[b],N*2); cudaMalloc(&du[b],N*2); }}
     cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
-    for(int i=0;i<warmup;++i) launch_silu_mul_fp4quant(dg,du,dq,ds,N,s);
+    for(int i=0;i<warmup;++i) launch_silu_mul_fp4quant(dg[i%nbufs],du[i%nbufs],dq,ds,N,s);
     cudaStreamSynchronize(s);
-    cudaGraph_t graph; cudaGraphExec_t graphExec;
-    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
-    for(int i=0;i<iters;++i) launch_silu_mul_fp4quant(dg,du,dq,ds,N,s);
-    cudaStreamEndCapture(s, &graph);
-    cudaGraphInstantiate(&graphExec, graph, 0);
-    for(int i=0;i<3;++i) {{ cudaGraphLaunch(graphExec, s); cudaStreamSynchronize(s); }}
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    cudaGraphLaunch(graphExec, s);
+    for(int i=0;i<iters;++i) launch_silu_mul_fp4quant(dg[i%nbufs],du[i%nbufs],dq,ds,N,s);
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms=0; cudaEventElapsedTime(&ms,t0,t1);
     printf("timing_us: %.3f\\n", ms*1000.f/iters);
-    cudaGraphExecDestroy(graphExec); cudaGraphDestroy(graph);
-    cudaFree(dg); cudaFree(du); cudaFree(dq); cudaFree(ds);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(dg[b]); cudaFree(du[b]); }}
+    free(dg); free(du);
+    cudaFree(dq); cudaFree(ds);
     return 0;
 }}
 """
@@ -150,40 +165,68 @@ int main(int argc, char** argv) {{
         m, k = shape
         n = m * k
         nb = n // 16
+        input_bytes = n * 2  # input * bf16
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 void launch_nvfp4_quantize_bf16(
     const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int N={n}, nb={nb};
-    __nv_bfloat16 *din; uint8_t *dpk; __nv_fp8_storage_t *dsc;
-    cudaMalloc(&din,N*2); cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
+    // Dynamic L2 cache cycling
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
+    __nv_bfloat16 **din = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    for(int b=0;b<nbufs;++b) {{ cudaMalloc(&din[b],N*2); }}
+    cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
     cudaStream_t s; cudaStreamCreate(&s);
-    for(int i=0;i<warmup;++i) launch_nvfp4_quantize_bf16(din,dpk,dsc,N,s);
+    for(int i=0;i<warmup;++i) launch_nvfp4_quantize_bf16(din[i%nbufs],dpk,dsc,N,s);
     cudaStreamSynchronize(s);
-    cudaGraph_t graph; cudaGraphExec_t graphExec;
-    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
-    for(int i=0;i<iters;++i) launch_nvfp4_quantize_bf16(din,dpk,dsc,N,s);
-    cudaStreamEndCapture(s, &graph);
-    cudaGraphInstantiate(&graphExec, graph, 0);
-    for(int i=0;i<3;++i) {{ cudaGraphLaunch(graphExec, s); cudaStreamSynchronize(s); }}
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    cudaGraphLaunch(graphExec, s);
+    for(int i=0;i<iters;++i) launch_nvfp4_quantize_bf16(din[i%nbufs],dpk,dsc,N,s);
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms=0; cudaEventElapsedTime(&ms,t0,t1);
     printf("timing_us: %.3f\\n", ms*1000.f/iters);
-    cudaGraphExecDestroy(graphExec); cudaGraphDestroy(graph);
-    cudaFree(din); cudaFree(dpk); cudaFree(dsc);
+    printf("l2_cycle_bufs: %d\\n", nbufs);
+    for(int b=0;b<nbufs;++b) {{ cudaFree(din[b]); }}
+    free(din);
+    cudaFree(dpk); cudaFree(dsc);
     return 0;
 }}
 """
+
+    def measure_search_baseline(self, problem_shape: tuple) -> Optional[float]:
+        """Measure reference kernel timing with the SAME harness used for candidates.
+
+        Ensures symmetric measurement: both baseline and candidate see the same
+        L2 cache cycling, same CUDA event timing, same C++ dispatch overhead.
+        """
+        harness = self._build_harness(problem_shape)
+        safe_name = f"baseline_{self.env.kernel_type}_{int(time.time())}"
+        ok, err, binary, _ = self.profiler.compile_kernel(
+            kernel_src=self.env.kernel_src_raw, harness_src=harness,
+            output_name=safe_name,
+        )
+        if not ok:
+            logger.warning("Baseline compilation failed: %s", err[:200])
+            return None
+        timing = self.profiler.benchmark_timing(binary)
+        if timing:
+            logger.info("Search baseline (with L2 cycling): %.3f us", timing)
+        return timing
 
     def _profile_candidate(
         self,
@@ -342,7 +385,16 @@ int main(int argc, char** argv) {{
         """Execute the full beam search. Returns the best KernelCandidate."""
         env           = self.env
         problem_shape = env.problem_shapes[0]
-        baseline_us   = env.baseline_us_reported
+
+        # Measure baseline with the SAME harness (L2 cycling, CUDA events) as candidates
+        # so the speedup comparison is symmetric.  Fall back to FlashInfer measurement.
+        search_baseline = self.measure_search_baseline(problem_shape)
+        baseline_us = search_baseline if search_baseline else env.baseline_us_reported
+        if search_baseline:
+            logger.info("Using search-harness baseline: %.3f us (FlashInfer was %.3f us)",
+                        baseline_us, env.baseline_us_reported)
+        else:
+            logger.info("Using FlashInfer baseline: %.3f us", baseline_us)
 
         logger.info("="*60)
         logger.info("Beam search: kernel=%s beam_width=%d rounds=%d",

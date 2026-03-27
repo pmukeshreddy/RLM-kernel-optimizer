@@ -64,11 +64,22 @@ You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
+- L2 cache: 126 MB — but benchmark uses L2 cache cycling (data is COLD every iteration)
 - 142 SMs, 228 KB shared memory per SM, 255 registers per thread
 - Warp size 32, max 2048 threads per SM
 - 128-bit load/store = uint4 = 8 bf16 values per transaction
 - Warp shuffle (__shfl_xor_sync): ~2 cycles vs shared mem reduction ~10+
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
+
+CRITICAL — These kernels are MEMORY-BOUND:
+- The benchmark forces L2 cache misses every iteration. Data comes from HBM, not L2.
+- The GPU is IDLE most of the time, waiting for HBM data to arrive.
+- Pure compute optimizations (faster math, ILP, register tiling) will NOT improve timing.
+- To get real speedup you MUST either reduce total memory traffic or overlap memory with compute:
+  * Software pipelining: load next tile via cp.async while computing on current tile
+  * Double buffering: use 2 shared memory buffers to overlap HBM loads with computation
+  * Fuse all operations into a single pass: load ONCE into registers, compute everything, store ONCE
+  * Vectorized 128-bit loads (uint4): maximize bytes per memory transaction
 
 Before EVERY submit_kernel call, you MUST first explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
@@ -240,12 +251,24 @@ class RLMEngine:
 You are a CUDA optimization expert. Analyze this kernel and propose exactly {num_strategies}
 DIVERSE optimization techniques that would give the biggest speedup.
 
+CRITICAL CONTEXT — This kernel is MEMORY-BOUND:
+- Benchmark uses L2 cache cycling — data is COLD every iteration, fetched from HBM (not L2).
+- The GPU is mostly IDLE, waiting for HBM data. Arithmetic is NOT the bottleneck.
+- Pure compute optimizations (faster math, ILP, register tiling) alone will NOT help.
+- To get real speedup, strategies MUST reduce total memory traffic or hide memory latency:
+  * Software pipelining / double buffering (cp.async + shared memory ping-pong)
+  * Fuse all passes into single-pass: load ONCE, compute everything in registers, store ONCE
+  * Vectorized 128-bit loads/stores (uint4) to maximize memory bus utilization
+  * Reduce total bytes: eliminate redundant loads/stores, compress intermediates
+  * Overlap: load next tile while computing on current tile
+
 You are NOT limited to any predefined list. Propose whatever CUDA optimizations
 you think are most impactful for THIS SPECIFIC kernel. Be specific and concrete.
 Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
+At least half your strategies MUST target memory access patterns, not compute.
 
 Kernel type: {env.kernel_type}
-Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 142 SMs)
+Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs)
 
 ```cuda
 {kernel_src}
@@ -315,6 +338,10 @@ Respond with ONLY the JSON array, nothing else."""
             prompt_parts = [
                 f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel from scratch.",
                 f"Direction: {strat_desc}",
+                "\nIMPORTANT: This kernel is MEMORY-BOUND. The benchmark uses L2 cache cycling "
+                "so data comes from HBM every time. The GPU is idle waiting for memory. "
+                "Compute-only optimizations won't help — you must reduce memory traffic or "
+                "overlap loads with compute (software pipelining, cp.async, double buffering).",
                 f"\n## Reference kernel (BASELINE — this is what you must beat):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
@@ -415,12 +442,18 @@ Apply this optimization to the kernel below:
 ## Optimization: {strat_name}
 {strat_desc}
 
-## B200 Hardware (use these numbers to guide your optimization):
+## B200 Hardware:
 - HBM3e: 8 TB/s bandwidth — use float4/uint4 (128-bit) loads to saturate it
+- L2 cache: 126 MB — but benchmark uses L2 cycling so data is COLD (from HBM)
 - 142 SMs, 228 KB shared memory per SM, 255 registers per thread
 - Warp shuffle (__shfl_xor_sync) costs ~2 cycles vs shared mem reduction ~10+ cycles
 - Fast math SFU: __expf ~4 cycles vs expf ~20 cycles; __frcp_rn for reciprocal
 - For bf16: load 8 values at once via reinterpret_cast<uint4*>, unpack to float for compute
+
+## MEMORY-BOUND WARNING:
+This kernel is memory-bound — the GPU is idle waiting for HBM data most of the time.
+Compute tricks alone won't help. You MUST reduce memory traffic or overlap loads with compute.
+Key techniques: software pipelining (cp.async + double buffer), single-pass fusion, vectorized loads.
 
 ## Full kernel source (headers expanded inline between === markers):
 ```cuda

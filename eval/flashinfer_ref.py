@@ -40,8 +40,18 @@ if _HAS_FLASHINFER:
 # Timing constants matching ThunderKittens 2.0 / WaferBench convention
 _WARMUP_ITERS = 500
 _BENCH_ITERS  = 100
-# L2 cache cycling — must match benchmark.py to keep baseline/candidate symmetric
-_L2_CYCLE_BUFS = 4
+
+
+def _compute_l2_cycle_bufs(input_bytes: int, max_groups: int = 256) -> int:
+    """Compute number of input groups to exceed 3x L2 cache (KernelArena methodology)."""
+    if not _HAS_FLASHINFER:
+        return 4
+    props = torch.cuda.get_device_properties(0)
+    l2_size = props.L2_cache_size  # bytes
+    if input_bytes >= l2_size * 3:
+        return 1
+    n = int(l2_size * 3 / input_bytes) + 1
+    return min(n, max_groups)
 
 
 def available() -> bool:
@@ -134,9 +144,10 @@ def generate_reference(kernel_type: str, shape: tuple, seed: int = 42) -> Option
 
 def _baseline_add_rmsnorm(shape: tuple) -> float:
     rows, hidden = shape
-    # L2 cycling: multiple input buffers, cycled per iteration
+    input_bytes = rows * hidden * 2 * 2 + hidden * 2  # (input+residual)*bf16 + weight
+    nbufs = _compute_l2_cycle_bufs(input_bytes)
     inps, ress = [], []
-    for i in range(_L2_CYCLE_BUFS):
+    for i in range(nbufs):
         torch.manual_seed(i)
         inps.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
         ress.append(torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda"))
@@ -145,7 +156,7 @@ def _baseline_add_rmsnorm(shape: tuple) -> float:
     def run(buf_idx):
         flashinfer.add_rmsnorm_fp4quant(inps[buf_idx], ress[buf_idx], w, eps=1e-6)
 
-    return _time_fn(run)
+    return _time_fn(run, nbufs=nbufs)
 
 
 def _reference_add_rmsnorm(shape: tuple, seed: int) -> dict:
@@ -175,10 +186,10 @@ def _baseline_silu_mul(shape: tuple) -> float:
 
     if _HAS_FUSED_SILU:
         # KernelArena reference: single fused kernel (3D expert-batched, swizzled)
-        # Input: (B, M, 2*K) bf16 — gate and up concatenated on last dim
-        # mask: (B,) int — per-expert token count (all M for uniform batches)
+        input_bytes = b * m * 2 * k * 2  # (B, M, 2*K) bf16
+        nbufs = _compute_l2_cycle_bufs(input_bytes)
         xs = []
-        for i in range(_L2_CYCLE_BUFS):
+        for i in range(nbufs):
             torch.manual_seed(i)
             xs.append(torch.randn(b, m, 2 * k, dtype=torch.bfloat16, device="cuda"))
         mask = torch.full((b,), m, dtype=torch.int64, device="cuda")
@@ -188,12 +199,14 @@ def _baseline_silu_mul(shape: tuple) -> float:
                 xs[buf_idx], mask, global_scale
             )
 
-        return _time_fn(run)
+        return _time_fn(run, nbufs=nbufs)
     else:
         # Fallback: two separate calls (NOT comparable to KernelArena)
         logger.warning("Using unfused silu_mul baseline — speedup NOT comparable to KernelArena")
+        input_bytes = b * m * k * 2 * 2  # gate + up bf16
+        nbufs = _compute_l2_cycle_bufs(input_bytes)
         combineds = []
-        for i in range(_L2_CYCLE_BUFS):
+        for i in range(nbufs):
             torch.manual_seed(i)
             gate = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
             up   = torch.randn(b * m, k, dtype=torch.bfloat16, device="cuda")
@@ -203,7 +216,7 @@ def _baseline_silu_mul(shape: tuple) -> float:
             out = flashinfer.silu_and_mul(combineds[buf_idx])
             flashinfer.fp4_quantize(out, global_scale=global_scale)
 
-        return _time_fn(run)
+        return _time_fn(run, nbufs=nbufs)
 
 
 def _reference_silu_mul(shape: tuple, seed: int) -> dict:
@@ -220,8 +233,10 @@ def _reference_silu_mul(shape: tuple, seed: int) -> dict:
 
 def _baseline_nvfp4_quantize(shape: tuple) -> float:
     m, k = shape
+    input_bytes = m * k * 2  # input bf16
+    nbufs = _compute_l2_cycle_bufs(input_bytes)
     inps = []
-    for i in range(_L2_CYCLE_BUFS):
+    for i in range(nbufs):
         torch.manual_seed(i)
         inps.append(torch.randn(m, k, dtype=torch.bfloat16, device="cuda"))
     global_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
@@ -229,7 +244,7 @@ def _baseline_nvfp4_quantize(shape: tuple) -> float:
     def run(buf_idx):
         flashinfer.fp4_quantize(inps[buf_idx], global_scale=global_scale)
 
-    return _time_fn(run)
+    return _time_fn(run, nbufs=nbufs)
 
 
 def _reference_nvfp4_quantize(shape: tuple, seed: int) -> dict:
@@ -243,21 +258,25 @@ def _reference_nvfp4_quantize(shape: tuple, seed: int) -> dict:
 
 # ── Timing utility ───────────────────────────────────────────────────────────
 
-def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> float:
+def _time_fn(fn, nbufs: int = 4, warmup: int = _WARMUP_ITERS,
+             iters: int = _BENCH_ITERS) -> float:
     """Time a function with L2 cache cycling. Returns microseconds per call.
 
-    fn(buf_idx) is called with a rotating buffer index to prevent L2 cache
-    hits from inflating performance — matching benchmark.py's candidate timing.
+    Captures a CUDA graph containing all iterations with L2-cycling buffer
+    rotation baked in.  Graph replay eliminates Python dispatch overhead
+    (~3-5µs/call) that would otherwise crush speedup ratios on micro-kernels.
+
+    Must stay symmetric with benchmark.py's _time_via_extension (also uses
+    CUDA graph + dynamic nbufs) so baseline/candidate comparison is fair.
+
+    fn(buf_idx) is called with a rotating buffer index to cycle L2.
     """
-    nbufs = _L2_CYCLE_BUFS
-    
-    # Pre-warmup
+    # Warmup with L2 cycling (Python loop — overhead doesn't matter here)
     for i in range(warmup):
         fn(i % nbufs)
     torch.cuda.synchronize()
 
-    # Capture CUDA Graph containing all iterations
-    # Stream-specific warmup for graph capture
+    # Capture CUDA graph with L2-cycling buffer sequence
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -270,11 +289,15 @@ def _time_fn(fn, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS) -> floa
         for i in range(iters):
             fn(i % nbufs)
 
-    # Timed graph replay
+    # Warm the graph replay
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Timed graph replay — zero Python overhead, L2 cycling preserved
     start = torch.cuda.Event(enable_timing=True)
     end   = torch.cuda.Event(enable_timing=True)
 
-    torch.cuda.synchronize()
     start.record()
     g.replay()
     end.record()

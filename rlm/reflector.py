@@ -151,6 +151,23 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
     lines.append(f"Speedup:                       {speedup:.3f}x")
     lines.append(f"SM occupancy:                  {occupancy:.1f}%")
 
+    # Memory throughput metrics (from NCU) — critical for memory-bound diagnosis
+    mem_tput = metrics.get("mem_throughput_pct", 0)
+    compute_tput = metrics.get("compute_throughput_pct", 0)
+    stall_mem = metrics.get("stall_memory", 0)
+    dram_bw = metrics.get("dram_read_bw_gbps", 0)
+    l2_hit = metrics.get("l2_hit_rate", 0)
+    if mem_tput > 0 or compute_tput > 0:
+        lines.append("")
+        lines.append(f"Memory throughput:             {mem_tput:.1f}% of peak")
+        lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
+        if stall_mem > 0:
+            lines.append(f"Warp stalls (memory):          {stall_mem:.1f}%")
+        if dram_bw > 0:
+            lines.append(f"DRAM read bandwidth:           {dram_bw:.0f} GB/s")
+        if l2_hit > 0:
+            lines.append(f"L2 hit rate:                   {l2_hit:.1f}%")
+
     # Compiler metrics (from nvcc -Xptxas -v)
     cm = metrics.get("_compiler", {})
     if cm:
@@ -318,6 +335,33 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
 
     ineffective = ineffective or set()
     suggestions = []
+
+    # Memory-bound diagnosis — check BEFORE compute suggestions
+    # When the kernel is memory-bound, compute optimizations won't help
+    mem_tput = metrics.get("mem_throughput_pct", 0)
+    compute_tput = metrics.get("compute_throughput_pct", 0)
+    stall_mem = metrics.get("stall_memory", 0)
+
+    is_memory_bound = (mem_tput > 60) or (stall_mem > 40 and compute_tput < 30)
+    if is_memory_bound and "memory_bound" not in ineffective:
+        suggestions.append(
+            f"MEMORY-BOUND KERNEL ({mem_tput:.0f}% mem throughput, "
+            f"{stall_mem:.0f}% memory stalls). "
+            "Compute optimizations (faster math, more ILP) will NOT help. "
+            "The GPU is waiting for data from HBM. You MUST reduce memory traffic:\n"
+            "  (a) Fuse operations to avoid writing intermediate results to HBM and re-reading them\n"
+            "  (b) Increase data reuse per element — load once into registers, do all computation, then store once\n"
+            "  (c) Use vectorized 128-bit loads/stores (uint4) to maximize bandwidth utilization\n"
+            "  (d) Use software pipelining: load next data block while computing on current block (cp.async / double buffering)\n"
+            "  (e) Reduce the total bytes touched — e.g. pack/compress intermediates"
+        )
+    elif mem_tput > 40 and compute_tput < 20:
+        suggestions.append(
+            f"Kernel is memory-limited ({mem_tput:.0f}% mem throughput vs "
+            f"{compute_tput:.0f}% compute). Focus on reducing HBM traffic and "
+            "overlapping memory access with computation rather than optimizing arithmetic."
+        )
+
     cm = metrics.get("_compiler", {})
 
     if cm:
@@ -674,7 +718,7 @@ def reflect(
     stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration, candidate=candidate)
     last_error_section = _format_last_error_section(candidate)
     history_section = _format_history_section(candidate)
-    suggestions_section = _format_suggestions_section(metrics)
+    suggestions_section = _format_suggestions_section(metrics, kernel_type=kernel_type)
 
     reward, reward_breakdown = compute_reward(
         candidate.compile_ok, candidate.correct, speedup

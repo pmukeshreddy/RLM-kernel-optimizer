@@ -31,8 +31,8 @@ import time
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 
-# Number of input buffer copies for L2 cache cycling
-_L2_CYCLE_BUFS = 4
+# Maximum input buffer copies for L2 cache cycling (KernelArena methodology)
+_MAX_L2_CYCLE_BUFS = 256
 
 # Timing constants matching ThunderKittens 2.0 / WaferBench convention
 _WARMUP_ITERS = 500
@@ -53,6 +53,30 @@ class Benchmarker:
         self.iters       = config["eval"]["benchmark_iters"]
         self.kernel_type = kernel_type
         self.include_dirs = [str(PROJECT_ROOT / 'kernels' / 'common')]
+
+    @staticmethod
+    def _compute_l2_cycle_bufs(input_bytes: int) -> int:
+        """Compute nbufs to exceed 3x L2 cache (KernelArena methodology)."""
+        import torch
+        props = torch.cuda.get_device_properties(0)
+        l2_size = props.L2_cache_size
+        if input_bytes >= l2_size * 3:
+            return 1
+        n = int(l2_size * 3 / input_bytes) + 1
+        return min(n, _MAX_L2_CYCLE_BUFS)
+
+    def _input_bytes(self, shape: tuple) -> int:
+        """Compute input bytes for L2 cycling calculation."""
+        if self.kernel_type == "add_rmsnorm":
+            rows, hidden = shape
+            return rows * hidden * 2 * 2 + hidden * 2
+        elif self.kernel_type == "silu_mul":
+            b, m, k = shape
+            return b * m * k * 2 * 2
+        elif self.kernel_type == "nvfp4_quantize":
+            m, k = shape
+            return m * k * 2
+        return 4096  # fallback
 
     # ── Primary: Python-dispatch timing (symmetric with FlashInfer baseline) ──
 
@@ -98,8 +122,9 @@ class Benchmarker:
             verbose=False,
         )
 
-        # Create L2-cycling input sets + shared outputs
-        nbufs = _L2_CYCLE_BUFS
+        # Dynamic L2 cache cycling (KernelArena methodology)
+        input_bytes = self._input_bytes(shape)
+        nbufs = self._compute_l2_cycle_bufs(input_bytes)
         input_sets = []
         for i in range(nbufs):
             torch.manual_seed(42 + i)
@@ -109,13 +134,15 @@ class Benchmarker:
         def run(buf_idx):
             module.run_kernel(*input_sets[buf_idx], *outputs)
 
-        # Warmup with L2 cycling
+        # Warmup with L2 cycling (Python loop — overhead doesn't matter here)
         for i in range(self.warmup):
             run(i % nbufs)
         torch.cuda.synchronize()
 
-        # Capture CUDA Graph containing all iterations
-        # Stream-specific warmup for graph capture
+        # Capture CUDA graph with L2-cycling buffer sequence.
+        # The graph bakes in the exact pointer sequence run(0),run(1),...,run(nbufs-1),...
+        # so L2 cycling is preserved. Graph replay has ZERO Python dispatch overhead,
+        # eliminating the ~3-5µs/call Pybind11 boundary crossing that crushes speedup ratios.
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -128,11 +155,15 @@ class Benchmarker:
             for i in range(self.iters):
                 run(i % nbufs)
 
-        # Timed graph replay
+        # Warm the graph replay (first replay may have overhead)
+        for _ in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+
+        # Timed graph replay — zero Python overhead, L2 cycling preserved
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
 
-        torch.cuda.synchronize()
         start.record()
         g.replay()
         end.record()
@@ -376,17 +407,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     def _timing_footer(self, launch_call_indexed: str, iters: int, warmup: int) -> str:
         return f"""
     // Warmup with L2 cycling
-    for(int i=0;i<{warmup};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
+    for(int i=0;i<{warmup};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
     cudaStreamSynchronize(s);
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
-    for(int i=0;i<{iters};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms_event=0; cudaEventElapsedTime(&ms_event,t0,t1);
     float us_event=ms_event*1000.f/{iters};
     cudaDeviceSynchronize();
     struct timespec ts0,ts1; clock_gettime(CLOCK_MONOTONIC,&ts0);
-    for(int i=0;i<{iters};++i) {{ int buf_idx = i % {_L2_CYCLE_BUFS}; {launch_call_indexed} }}
+    for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
     cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC,&ts1);
     double wall_ns=(ts1.tv_sec-ts0.tv_sec)*1e9+(ts1.tv_nsec-ts0.tv_nsec);
     float us_wall=(float)(wall_ns/1000.0/{iters});
@@ -394,13 +425,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     printf("timing_us: %.3f\\n",us_event);
     printf("timing_wall_us: %.3f\\n",us_wall);
     printf("timing_ratio: %.3f\\n",ratio);
+    printf("l2_cycle_bufs: %d\\n",nbufs);
     if(ratio>1.5f) printf("TIMING_ANOMALY: event=%.3fus wall=%.3fus ratio=%.2fx\\n",us_event,us_wall,ratio);
+"""
+
+    @staticmethod
+    def _l2_cycling_preamble(input_bytes: int) -> str:
+        """Generate C code for runtime L2 cache size query and nbufs calculation."""
+        return f"""
+    // Dynamic L2 cache cycling (KernelArena methodology)
+    int l2_bytes=0;
+    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
+    int nbufs = 1;
+    if ({input_bytes} > 0 && l2_bytes > 0 && {input_bytes} < l2_bytes * 3)
+        nbufs = l2_bytes * 3 / {input_bytes} + 1;
+    if (nbufs > 256) nbufs = 256;
+    if (nbufs < 1) nbufs = 1;
 """
 
     def _harness_add_rmsnorm(self, shape: tuple) -> str:
         rows, hidden = shape
         n, nb = rows * hidden, rows * hidden // 16
-        nbufs = _L2_CYCLE_BUFS
+        input_bytes = n * 2 * 2 + hidden * 2
         launch = (f"launch_fused_add_rmsnorm_nvfp4("
                   f"di[buf_idx],dr[buf_idx],dw,dro,dq,ds,rows,hidden,s);")
         return f"""
@@ -408,21 +454,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
 int main() {{
     const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
-    __nv_bfloat16 *di[{nbufs}], *dr[{nbufs}], *dw, *dro;
+    {self._l2_cycling_preamble(input_bytes)}
+    __nv_bfloat16 **di = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **dr = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 *dw, *dro;
     unsigned char *dq; __nv_fp8_storage_t *ds;
-    for (int b=0; b<{nbufs}; ++b) {{
+    for (int b=0; b<nbufs; ++b) {{
         cudaMalloc(&di[b],N*2); cudaMalloc(&dr[b],N*2);
     }}
     cudaMalloc(&dw,hidden*2);
     cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
+    for(int b=0;b<nbufs;++b) {{ cudaFree(di[b]); cudaFree(dr[b]); }}
+    free(di); free(dr);
     return 0;
 }}
 """
@@ -431,7 +483,7 @@ int main() {{
         b, m, k = shape
         n = b * m * k
         nb = n // 16
-        nbufs = _L2_CYCLE_BUFS
+        input_bytes = n * 2 * 2
         launch = (f"launch_silu_mul_fp4quant("
                   f"dg[buf_idx],du[buf_idx],dq,ds,N,s);")
         return f"""
@@ -440,20 +492,25 @@ int main() {{
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 void launch_silu_mul_fp4quant(
     const __nv_bfloat16*, const __nv_bfloat16*,
     uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main() {{
     const int N={n}, nb={nb};
-    __nv_bfloat16 *dg[{nbufs}], *du[{nbufs}];
+    {self._l2_cycling_preamble(input_bytes)}
+    __nv_bfloat16 **dg = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    __nv_bfloat16 **du = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
     uint8_t *dq; __nv_fp8_storage_t *ds;
-    for (int b=0; b<{nbufs}; ++b) {{
+    for (int b=0; b<nbufs; ++b) {{
         cudaMalloc(&dg[b],N*2); cudaMalloc(&du[b],N*2);
     }}
     cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
+    for(int b=0;b<nbufs;++b) {{ cudaFree(dg[b]); cudaFree(du[b]); }}
+    free(dg); free(du);
     return 0;
 }}
 """
@@ -462,7 +519,7 @@ int main() {{
         m, k = shape
         n = m * k
         nb = n // 16
-        nbufs = _L2_CYCLE_BUFS
+        input_bytes = n * 2
         launch = f"launch_nvfp4_quantize_bf16(din[buf_idx],dpk,dsc,N,s);"
         return f"""
 #include <cuda_runtime.h>
@@ -470,18 +527,23 @@ int main() {{
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 void launch_nvfp4_quantize_bf16(
     const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main() {{
     const int N={n}, nb={nb};
-    __nv_bfloat16 *din[{nbufs}]; uint8_t *dpk; __nv_fp8_storage_t *dsc;
-    for (int b=0; b<{nbufs}; ++b) {{
+    {self._l2_cycling_preamble(input_bytes)}
+    __nv_bfloat16 **din = (__nv_bfloat16**)malloc(nbufs*sizeof(void*));
+    uint8_t *dpk; __nv_fp8_storage_t *dsc;
+    for (int b=0; b<nbufs; ++b) {{
         cudaMalloc(&din[b],N*2);
     }}
     cudaMalloc(&dpk,N/2); cudaMalloc(&dsc,nb);
     cudaStream_t s; cudaStreamCreate(&s);
     {self._timing_footer(launch, self.iters, self.warmup)}
+    for(int b=0;b<nbufs;++b) {{ cudaFree(din[b]); }}
+    free(din);
     return 0;
 }}
 """
