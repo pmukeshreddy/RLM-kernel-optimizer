@@ -75,14 +75,46 @@ Before EVERY submit_kernel call, you MUST first explain in 2-3 sentences:
 2. What specific code change you will make and why you expect it to help
 
 Rules:
-- Surgical changes only (5-15 lines). Do not rewrite from scratch.
+{{constraint}}
 - Keep all existing optimizations — do not regress.
 - NEVER put __syncthreads() inside if/else branches (deadlock).
 - The launch_* function signature must match exactly.
 - Output must match reference within atol=1e-2.
 - Keep original #include directives, not expanded headers.
 - Do not use torch headers (torch/extension.h, ATen, c10).
-""".replace("{{turns}}", str(MAX_INNER_TURNS))
+"""
+
+
+def _constraint_for_speedup(speedup: float) -> str:
+    """Dynamic constraint scaling — more freedom when far from target.
+
+    < 1.0x  → full rewrite allowed (current code is SLOWER than baseline)
+    < 1.3x  → moderate changes (up to 40 lines, algorithmic changes OK)
+    >= 1.3x → surgical only (5-15 lines, preserve what's working)
+    """
+    if speedup < 1.0:
+        return (
+            "- The kernel is SLOWER than baseline — aggressive rewrite is allowed. "
+            "You may restructure the entire kernel, change the algorithm, "
+            "add shared memory, change thread mapping, etc."
+        )
+    elif speedup < 1.3:
+        return (
+            "- Moderate changes allowed (up to ~40 lines). Algorithmic changes "
+            "(adding warp shuffles, shared memory, changing reduction pattern) "
+            "are encouraged. Don't just tweak — make structural improvements."
+        )
+    else:
+        return (
+            "- Surgical changes only (5-15 lines). The kernel is performing well — "
+            "make targeted micro-optimizations, do not rewrite from scratch."
+        )
+
+
+def _build_refine_system_prompt(speedup: float) -> str:
+    """Build REFINE_SYSTEM_PROMPT with dynamic constraint for current speedup."""
+    constraint = _constraint_for_speedup(speedup)
+    return REFINE_SYSTEM_PROMPT.replace("{{turns}}", str(MAX_INNER_TURNS)).replace("{{constraint}}", constraint)
 
 
 class RLMEngine:
@@ -279,6 +311,7 @@ Respond with ONLY the JSON array, nothing else."""
         kernel_slice: str,
         current_metrics: dict = None,
         round_num: int = 0,
+        profile_fn=None,
     ) -> KernelCandidate:
         # Support both freeform dicts {name, what} and plain strategy name strings
         if isinstance(strategy, dict):
@@ -288,9 +321,108 @@ Respond with ONLY the JSON array, nothing else."""
             strat_name = strategy
             strat_desc = ""
 
+        launch_sig = _get_launch_signature(self.env.kernel_type)
+
+        # ── Tool-use path: compile/test/iterate like refinement ──────────
+        if profile_fn and strat_desc:
+            constraint = _constraint_for_speedup(0.0)  # round 0 = aggressive
+            system_prompt = _build_refine_system_prompt(0.0)
+
+            prompt_parts = [
+                f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel from scratch.",
+                f"Direction: {strat_desc}",
+                f"\n## Reference kernel (BASELINE — this is what you must beat):\n"
+                f"```cuda\n{kernel_slice}\n```",
+                f"\n{launch_sig}",
+                "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
+                "1. What optimization you're applying and why it should help\n"
+                "2. What specific code changes you're making\n\n"
+                "Then call submit_kernel with your complete .cu file.",
+            ]
+            initial_prompt = "\n\n".join(prompt_parts)
+
+            messages = [{"role": "user", "content": initial_prompt}]
+            best = None
+            prev_inner_metrics = None
+
+            for turn in range(MAX_INNER_TURNS):
+                try:
+                    response = await self._call_llm_with_tools_async(
+                        messages=messages,
+                        tools=[SUBMIT_KERNEL_TOOL],
+                        model=self.sub_model,
+                        system=system_prompt,
+                        temperature=0.5,
+                    )
+                except RuntimeError as e:
+                    logger.error("Budget exceeded gen %s turn %d: %s",
+                                 strat_name, turn, e)
+                    break
+
+                messages.append({"role": "assistant", "content": response.content})
+
+                tool_block = next(
+                    (b for b in response.content
+                     if b.type == "tool_use" and b.name == "submit_kernel"),
+                    None,
+                )
+                if not tool_block:
+                    logger.info("GEN [%s] turn %d: no tool call", strat_name, turn)
+                    break
+
+                code = tool_block.input.get("cuda_code", "")
+                if not code:
+                    messages.append({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": tool_block.id,
+                         "content": "Error: empty cuda_code. Submit the complete .cu file.",
+                         "is_error": True}
+                    ]})
+                    continue
+
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, profile_fn, code, strat_name, round_num)
+
+                tool_result_text = self._format_tool_result(
+                    result, 1.0, prev_inner_metrics)
+                if result["compile_ok"] and result["correct"] and result.get("metrics"):
+                    prev_inner_metrics = result["metrics"]
+                messages.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tool_block.id,
+                     "content": tool_result_text}
+                ]})
+
+                logger.info("GEN [%s] turn %d: compile=%s correct=%s speedup=%.3fx",
+                            strat_name, turn,
+                            result["compile_ok"], result["correct"],
+                            result.get("speedup", 0))
+
+                if result["compile_ok"] and result["correct"]:
+                    if best is None or result["speedup"] > best.speedup:
+                        best = KernelCandidate(
+                            code=code,
+                            strategy=strat_name,
+                            round_num=round_num,
+                            compile_ok=True,
+                            correct=True,
+                            speedup=result["speedup"],
+                            metrics=result.get("metrics", {}),
+                            bottleneck=result.get("bottleneck", "unknown"),
+                        )
+                        best.strategy_context = strat_desc
+
+            if best:
+                return best
+
+            # All turns failed — return failure
+            failed = KernelCandidate(
+                code="", strategy=strat_name, round_num=round_num,
+                compile_ok=False,
+            )
+            failed.strategy_context = strat_desc
+            return failed
+
+        # ── One-shot fallback (no profile_fn or no description) ──────────
         if strat_desc:
-            # Freeform mode: use the LLM's own description as the instruction
-            launch_sig = _get_launch_signature(self.env.kernel_type)
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -362,9 +494,11 @@ CRITICAL RULES:
         kernel_slice: str,
         current_metrics: dict = None,
         round_num: int = 0,
+        profile_fn=None,
     ) -> list:
         tasks = [
-            self._generate_single_beam(s, kernel_slice, current_metrics, round_num)
+            self._generate_single_beam(
+                s, kernel_slice, current_metrics, round_num, profile_fn)
             for s in strategies
         ]
         return list(await asyncio.gather(*tasks))
@@ -485,11 +619,12 @@ CRITICAL RULES:
 
         for turn in range(MAX_INNER_TURNS):
             try:
+                system_prompt = _build_refine_system_prompt(parent.speedup)
                 response = await self._call_llm_with_tools_async(
                     messages=messages,
                     tools=[SUBMIT_KERNEL_TOOL],
                     model=self.sub_model,
-                    system=REFINE_SYSTEM_PROMPT,
+                    system=system_prompt,
                     temperature=0.4,
                 )
             except RuntimeError as e:
@@ -635,7 +770,8 @@ CRITICAL RULES:
             parts.append(_format_profile_section(metrics, 0))
 
         # Data-driven suggestions for remaining bottlenecks
-        suggestions = _format_suggestions_section(metrics)
+        suggestions = _format_suggestions_section(
+            metrics, kernel_type=self.env.kernel_type)
         if suggestions:
             parts.append(suggestions)
 
@@ -731,10 +867,12 @@ CRITICAL RULES:
     def run_generate_beams(
         self, strategies: list, kernel_slice: str,
         current_metrics: dict = None, round_num: int = 0,
+        profile_fn=None,
     ) -> list:
         loop = self._get_or_create_loop()
         return loop.run_until_complete(
-            self.generate_beams(strategies, kernel_slice, current_metrics, round_num)
+            self.generate_beams(strategies, kernel_slice, current_metrics,
+                                round_num, profile_fn)
         )
 
     def run_refine_beams(self, survivors: list, round_num: int,

@@ -298,12 +298,20 @@ def _compute_proven_ineffective(latest: dict, best: dict) -> tuple:
 
 # ── Data-driven optimization suggestions ─────────────────────────────────────
 
-def _format_suggestions_section(metrics: dict, ineffective: set = None) -> str:
+_REDUCTION_KERNEL_TYPES = frozenset({
+    "add_rmsnorm", "rmsnorm", "layernorm", "softmax", "logsoftmax",
+    "cross_entropy", "rms_norm", "layer_norm",
+})
+
+
+def _format_suggestions_section(metrics: dict, ineffective: set = None,
+                                 kernel_type: str = "") -> str:
     """Generate concrete actionable suggestions from profiler data.
 
     ineffective: set of optimization categories proven not to help timing
     (computed by _compute_proven_ineffective from actual profiler deltas).
     Suggestions targeting these categories are suppressed.
+    kernel_type: kernel type string — enables reduction pattern detection.
     """
     if not metrics:
         return ""
@@ -352,6 +360,26 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None) -> str:
         if stg_32 > 0 and stg_128 == 0 and "vectorize_stores" not in ineffective:
             suggestions.append(
                 f"All {stg_32} stores are 32-bit — vectorize stores with uint4"
+            )
+
+    # Reduction pattern detection: kernel has a row reduction but SASS shows
+    # no warp shuffles and no shared memory → reduction is serialized
+    if kernel_type in _REDUCTION_KERNEL_TYPES and cm and "reduction" not in ineffective:
+        shfls = cm.get("sass_shfl", 0)
+        lds = cm.get("sass_lds", 0)
+        sts = cm.get("sass_sts", 0)
+        smem = cm.get("static_smem_bytes", 0)
+        if shfls == 0 and lds == 0 and sts == 0 and smem == 0:
+            suggestions.append(
+                "Row reduction is SERIALIZED — 0 warp shuffles, 0 shared memory. "
+                "Use __shfl_down_sync for warp-level reduction (2 cycles/op) or "
+                "shared memory reduction for cross-warp accumulation"
+            )
+        elif shfls == 0 and (lds > 0 or sts > 0):
+            suggestions.append(
+                f"Reduction uses shared memory ({lds} LDS + {sts} STS) but 0 warp "
+                f"shuffles — replace intra-warp shared mem reduction with "
+                f"__shfl_down_sync (~2 cycles vs ~10+ for shared mem)"
             )
 
     occ = metrics.get("sm_occupancy", 0)

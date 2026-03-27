@@ -333,12 +333,28 @@ int main(int argc, char** argv) {{
         env.current_round = 0
 
         kernel_slice = env.kernel_src
+        profile_fn = self._make_inner_profile_fn(problem_shape, baseline_us)
         candidates = self.engine.run_generate_beams(
-            strategies=strategies, kernel_slice=kernel_slice, round_num=0
+            strategies=strategies, kernel_slice=kernel_slice, round_num=0,
+            profile_fn=profile_fn,
         )
 
-        logger.info("Profiling %d initial beams in parallel...", len(candidates))
-        metrics_list = self._profile_candidates_parallel(candidates, problem_shape, baseline_us)
+        # Separate pre-profiled (from tool loop) vs unprofiled (from one-shot fallback)
+        pre_profiled = [c for c in candidates if c.metrics]
+        need_profiling = [c for c in candidates if not c.metrics]
+
+        if need_profiling:
+            logger.info("Profiling %d one-shot beams in parallel...", len(need_profiling))
+            fresh_metrics = self._profile_candidates_parallel(
+                need_profiling, problem_shape, baseline_us)
+        else:
+            fresh_metrics = []
+
+        metrics_list = [
+            (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
+            for c in pre_profiled
+        ] + fresh_metrics
+
         for c, _ in metrics_list:
             env.optimization_history.record(c)
             logger.info("  %s", c.summary())
@@ -420,7 +436,8 @@ int main(int argc, char** argv) {{
                 logger.info("  Retrying %d failed strategies: %s",
                             n_retry, [s["name"] for s in retry_strats])
                 fresh = self.engine.run_generate_beams(
-                    strategies=retry_strats, kernel_slice=best_code, round_num=round_num
+                    strategies=retry_strats, kernel_slice=best_code,
+                    round_num=round_num, profile_fn=profile_fn,
                 )
                 slots_available -= n_retry
 
@@ -432,21 +449,27 @@ int main(int argc, char** argv) {{
                 logger.info("  Replacing %d stagnant beams with fresh strategies: %s",
                             n_fresh, [s.get("name", s) if isinstance(s, dict) else s for s in fresh_strats])
                 fresh += self.engine.run_generate_beams(
-                    strategies=fresh_strats, kernel_slice=best_code, round_num=round_num
+                    strategies=fresh_strats, kernel_slice=best_code,
+                    round_num=round_num, profile_fn=profile_fn,
                 )
 
             # Refined candidates are already profiled by the inner loop.
-            # Only fresh beams need profiling.
-            if fresh:
+            # Fresh beams may be pre-profiled (tool loop) or need profiling (one-shot).
+            fresh_pre_profiled = [c for c in fresh if c.metrics]
+            fresh_need_profiling = [c for c in fresh if not c.metrics]
+            if fresh_need_profiling:
                 fresh_metrics = self._profile_candidates_parallel(
-                    fresh, problem_shape, baseline_us)
+                    fresh_need_profiling, problem_shape, baseline_us)
             else:
                 fresh_metrics = []
 
-            # Combine: refined (already profiled) + fresh (just profiled)
+            # Combine: refined (already profiled) + fresh pre-profiled + fresh just-profiled
             new_metrics = [
                 (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
                 for c in refined
+            ] + [
+                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
+                for c in fresh_pre_profiled
             ] + fresh_metrics
 
             for c, _ in new_metrics:
