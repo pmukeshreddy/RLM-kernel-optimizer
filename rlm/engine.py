@@ -76,7 +76,6 @@ Before EVERY submit_kernel call, you MUST first explain in 2-3 sentences:
 
 Rules:
 {{constraint}}
-- Keep all existing optimizations — do not regress.
 - NEVER put __syncthreads() inside if/else branches (deadlock).
 - The launch_* function signature must match exactly.
 - Output must match reference within atol=1e-2.
@@ -94,20 +93,26 @@ def _constraint_for_speedup(speedup: float) -> str:
     """
     if speedup < 1.0:
         return (
-            "- The kernel is SLOWER than baseline — aggressive rewrite is allowed. "
-            "You may restructure the entire kernel, change the algorithm, "
-            "add shared memory, change thread mapping, etc."
+            "- The kernel is SLOWER than baseline — aggressive rewrite is allowed.\n"
+            "- You may restructure the entire kernel, change the algorithm, "
+            "replace the reduction pattern, add shared memory, change thread mapping.\n"
+            "- You are NOT required to keep existing code patterns — replace them "
+            "with better ones."
         )
     elif speedup < 1.3:
         return (
             "- Moderate changes allowed (up to ~40 lines). Algorithmic changes "
             "(adding warp shuffles, shared memory, changing reduction pattern) "
-            "are encouraged. Don't just tweak — make structural improvements."
+            "are encouraged.\n"
+            "- You MAY replace existing optimization patterns with better ones "
+            "(e.g., replace shared memory reduction with warp shuffles).\n"
+            "- Don't just tweak — make structural improvements."
         )
     else:
         return (
-            "- Surgical changes only (5-15 lines). The kernel is performing well — "
-            "make targeted micro-optimizations, do not rewrite from scratch."
+            "- Surgical changes only (5-15 lines). The kernel is performing well.\n"
+            "- Keep all existing optimizations — do not regress.\n"
+            "- Make targeted micro-optimizations, do not rewrite from scratch."
         )
 
 

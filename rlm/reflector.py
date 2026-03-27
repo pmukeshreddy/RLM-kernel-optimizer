@@ -371,9 +371,12 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
         smem = cm.get("static_smem_bytes", 0)
         if shfls == 0 and lds == 0 and sts == 0 and smem == 0:
             suggestions.append(
-                "Row reduction is SERIALIZED — 0 warp shuffles, 0 shared memory. "
-                "Use __shfl_down_sync for warp-level reduction (2 cycles/op) or "
-                "shared memory reduction for cross-warp accumulation"
+                "CRITICAL: Row reduction is COMPLETELY SERIALIZED — 0 warp shuffles, "
+                "0 shared memory, 0 LDS/STS. Each thread is computing its own sum "
+                "without any cross-thread communication. You MUST add either:\n"
+                "  (a) __shfl_down_sync for warp-level reduction (2 cycles/op), or\n"
+                "  (b) shared memory + __syncthreads() for block-level reduction.\n"
+                "  Without this, the reduction loop runs sequentially per-thread."
             )
         elif shfls == 0 and (lds > 0 or sts > 0):
             suggestions.append(
