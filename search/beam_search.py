@@ -317,6 +317,18 @@ int main(int argc, char** argv) {{
             env.optimization_history.record(c)
             logger.info("  %s", c.summary())
 
+        # Collect failed round-0 strategies for retry — these were the LLM's
+        # top picks but failed due to implementation bugs (not bad ideas)
+        self._failed_strategies = []
+        for (c, _), strat in zip(metrics_list, strategies):
+            if not c.is_viable():
+                error = c.compile_error or "Unknown failure"
+                self._failed_strategies.append((strat, error))
+        if self._failed_strategies:
+            names = [s.get("name", s) if isinstance(s, dict) else s
+                     for s, _ in self._failed_strategies]
+            logger.info("Failed strategies saved for retry: %s", names)
+
         survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
         for s in survivors:
             if s.prev_metrics is None:
@@ -355,17 +367,43 @@ int main(int argc, char** argv) {{
             if to_refine:
                 refined = self.engine.run_refine_beams(to_refine, round_num)
 
-            # Generate fresh beams for stagnant slots using reserve strategies
+            # Fill stagnant slots: first retry failed strategies, then use reserves
             fresh = []
-            if stagnant and self._reserve_strategies:
-                n_fresh = min(len(stagnant), len(self._reserve_strategies))
+            slots_available = len(stagnant)
+            best_code = max(survivors, key=lambda c: c.speedup).code if survivors else kernel_slice
+
+            # Priority 1: retry failed strategies with error context
+            if slots_available > 0 and self._failed_strategies:
+                n_retry = min(slots_available, len(self._failed_strategies))
+                to_retry = self._failed_strategies[:n_retry]
+                self._failed_strategies = self._failed_strategies[n_retry:]
+
+                retry_strats = []
+                for strat, error in to_retry:
+                    name = strat.get("name", strat) if isinstance(strat, dict) else strat
+                    what = strat.get("what", "") if isinstance(strat, dict) else ""
+                    retry_strats.append({
+                        "name": name,
+                        "what": (what + f"\n\nWARNING — Previous attempt FAILED:\n{error[:400]}\n"
+                                 "Fix the bug. Common cause: __syncthreads() inside if/else "
+                                 "causes deadlock — all threads in a block MUST hit every barrier."),
+                    })
+
+                logger.info("  Retrying %d failed strategies: %s",
+                            n_retry, [s["name"] for s in retry_strats])
+                fresh = self.engine.run_generate_beams(
+                    strategies=retry_strats, kernel_slice=best_code, round_num=round_num
+                )
+                slots_available -= n_retry
+
+            # Priority 2: fresh reserve strategies for remaining slots
+            if slots_available > 0 and self._reserve_strategies:
+                n_fresh = min(slots_available, len(self._reserve_strategies))
                 fresh_strats = self._reserve_strategies[:n_fresh]
                 self._reserve_strategies = self._reserve_strategies[n_fresh:]
-                # Build on the best code so far, not the 1.0x baseline
-                best_code = max(survivors, key=lambda c: c.speedup).code if survivors else kernel_slice
                 logger.info("  Replacing %d stagnant beams with fresh strategies: %s",
                             n_fresh, [s.get("name", s) if isinstance(s, dict) else s for s in fresh_strats])
-                fresh = self.engine.run_generate_beams(
+                fresh += self.engine.run_generate_beams(
                     strategies=fresh_strats, kernel_slice=best_code, round_num=round_num
                 )
 
