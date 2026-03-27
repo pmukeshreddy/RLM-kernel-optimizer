@@ -17,8 +17,9 @@ from .root_prompts import SYSTEM_PROMPT, decompose_prompt, combine_prompt
 from .sub_prompts import get_prompt_for_strategy
 from .reflector import (
     _get_launch_signature, _format_profile_section,
-    _format_react_trace, _format_last_error_section,
-    _format_delta_section, _compute_proven_ineffective,
+    _format_suggestions_section, _format_react_trace,
+    _format_last_error_section, _format_delta_section,
+    _compute_proven_ineffective,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,12 +27,22 @@ logger = logging.getLogger(__name__)
 
 # ── Refinement: tool-use agent loop ────────────────────────────────────────
 
+MAX_INNER_TURNS = 3
+
 SUBMIT_KERNEL_TOOL = {
     "name": "submit_kernel",
     "description": (
         "Submit optimized CUDA kernel for compilation, correctness checking, "
-        "and profiling. Returns compile status, correctness, timing, and "
-        "detailed profiler metrics including SASS instruction breakdown."
+        "and profiling.\n\n"
+        "Returns one of:\n"
+        "- COMPILE ERROR: first error with file:line plus surrounding context\n"
+        "- CORRECTNESS FAILURE: max error magnitude and which check failed\n"
+        "- Result verdict (IMPROVED / REGRESSION / NO CHANGE) with:\n"
+        "  timing_us, speedup vs baseline, SM occupancy,\n"
+        "  SASS breakdown (load vectorization %, loads by width, "
+        "stores, barriers, shuffles, register spills),\n"
+        "  delta from your previous submission,\n"
+        "  remaining optimization suggestions from profiler data"
     ),
     "input_schema": {
         "type": "object",
@@ -48,27 +59,30 @@ SUBMIT_KERNEL_TOOL = {
     },
 }
 
-REFINE_SYSTEM_PROMPT = """\
-You are a CUDA kernel optimization agent targeting NVIDIA B200 (sm_100a, Blackwell).
-You have a submit_kernel tool to compile, check correctness, and profile your code.
+REFINE_SYSTEM_PROMPT = f"""\
+You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
 
-Workflow:
-1. Read the profiler observation and current kernel code.
-2. Reason about what the profiler data tells you about the bottleneck.
-3. Make a targeted code change (5-15 lines, not a rewrite).
-4. Call submit_kernel with the COMPLETE .cu file.
-5. If it fails or regresses, read the error/profiler result and fix.
+Target hardware — NVIDIA B200 (sm_100a, Blackwell):
+- HBM3e: 8 TB/s bandwidth, 192 GB
+- 142 SMs, 228 KB shared memory per SM, 255 registers per thread
+- Warp size 32, max 2048 threads per SM
+- 128-bit load/store = uint4 = 8 bf16 values per transaction
+- Warp shuffle (__shfl_xor_sync): ~2 cycles vs shared mem reduction ~10+
+- Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
+
+Before EVERY submit_kernel call, you MUST first explain in 2-3 sentences:
+1. What the profiler data tells you is the current bottleneck
+2. What specific code change you will make and why you expect it to help
 
 Rules:
-- Keep all existing optimizations intact — do not regress.
+- Surgical changes only (5-15 lines). Do not rewrite from scratch.
+- Keep all existing optimizations — do not regress.
 - NEVER put __syncthreads() inside if/else branches (deadlock).
-- The launch_* function signature must match exactly (see prompt).
+- The launch_* function signature must match exactly.
 - Output must match reference within atol=1e-2.
-- Keep original #include directives, not expanded content.
+- Keep original #include directives, not expanded headers.
 - Do not use torch headers (torch/extension.h, ATen, c10).
-"""
-
-MAX_INNER_TURNS = 3
+""".replace("{{turns}}", str(MAX_INNER_TURNS))
 
 
 class RLMEngine:
@@ -451,15 +465,23 @@ CRITICAL RULES:
             f"\n\n{launch_sig}")
 
         prompt_parts.append(
-            "Analyze the profiler data, then call submit_kernel with your optimized code.")
+            "Before calling submit_kernel, explain what the profiler shows is the "
+            "bottleneck and what code change you'll make. Example:\n\n"
+            "\"SASS shows 18 scalar LDG.32 loads (0% vectorized) but occupancy "
+            "is 96%, so the bottleneck is memory transaction efficiency not "
+            "parallelism. I'll pack the scalar bf16 loads in the hot loop into "
+            "uint4 loads via reinterpret_cast<uint4*>, cutting 18 loads to 3 "
+            "and using the full 128-bit bus width.\"\n\n"
+            "Then call submit_kernel with your complete .cu file.")
 
         initial_prompt = "\n\n".join(prompt_parts)
         logger.info("REFINE PROMPT [%s]: %d chars", parent.strategy, len(initial_prompt))
 
         # ── Multi-turn tool-use conversation ──────────────────────────────
         messages = [{"role": "user", "content": initial_prompt}]
-        best = None       # best KernelCandidate from inner loop
+        best = None              # best KernelCandidate from inner loop
         last_error = ""
+        prev_inner_metrics = None  # for SASS deltas between submissions
 
         for turn in range(MAX_INNER_TURNS):
             try:
@@ -511,8 +533,11 @@ CRITICAL RULES:
                           "metrics": {}, "error": "No profiler available",
                           "bottleneck": "unknown"}
 
-            # Feed result back as tool_result
-            tool_result_text = self._format_tool_result(result, parent.speedup)
+            # Feed result back as tool_result (with delta from prev submission)
+            tool_result_text = self._format_tool_result(
+                result, parent.speedup, prev_inner_metrics)
+            if result["compile_ok"] and result["correct"] and result.get("metrics"):
+                prev_inner_metrics = result["metrics"]
             messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": tool_block.id,
                  "content": tool_result_text}
@@ -561,31 +586,60 @@ CRITICAL RULES:
         failed.strategy_desc = ""
         return failed
 
-    def _format_tool_result(self, result: dict, parent_speedup: float) -> str:
-        """Format profiling result as tool_result content for the model."""
+    def _format_tool_result(self, result: dict, parent_speedup: float,
+                            prev_inner_metrics: dict = None) -> str:
+        """Format profiling result as tool_result content for the model.
+
+        Follows Anthropic guidance: error responses must communicate specific
+        and actionable improvements, success responses include delta + suggestions.
+        """
         if not result["compile_ok"]:
             error = result.get("error", "Unknown compilation error")
-            return f"COMPILE ERROR:\n{error[:800]}\nFix the error and resubmit."
+            # Extract first actionable error line from nvcc output
+            lines = error.split('\n')
+            error_lines = [l for l in lines if 'error' in l.lower()
+                           and ('(' in l or ':' in l)]
+            if error_lines:
+                first = error_lines[0].strip()
+                return (f"COMPILE ERROR: {first}\n\n"
+                        f"Full output ({len(error_lines)} error(s)):\n"
+                        f"{error[:500]}")
+            return f"COMPILE ERROR:\n{error[:600]}"
 
         if not result["correct"]:
             error = result.get("error", "Output mismatch (atol=1e-2)")
-            return (f"CORRECTNESS FAILURE:\n{error[:600]}\n"
-                    f"Fix the computation and resubmit.")
+            return f"CORRECTNESS FAILURE: {error[:400]}"
 
-        # Viable — show verdict + profiler data
+        # Viable — verdict + delta + suggestions (no code echo)
         metrics = result.get("metrics", {})
         speedup = result.get("speedup", 0)
-        profile = _format_profile_section(metrics, 0)
 
         if speedup > parent_speedup + 0.02:
             verdict = f"IMPROVED: {speedup:.3f}x (was {parent_speedup:.3f}x)"
         elif speedup < parent_speedup - 0.01:
-            verdict = (f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x) "
-                       f"— your change made it slower")
+            verdict = f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x)"
         else:
             verdict = f"NO CHANGE: {speedup:.3f}x (was {parent_speedup:.3f}x)"
 
-        return f"{verdict}\n{profile}"
+        parts = [verdict]
+
+        # SASS delta from previous submission — model sees what its change did
+        if prev_inner_metrics:
+            delta = _format_delta_section(
+                metrics, prev_inner_metrics,
+                title="Changes from Previous Submission")
+            if delta:
+                parts.append(delta)
+        else:
+            # First submission — show full profiler snapshot
+            parts.append(_format_profile_section(metrics, 0))
+
+        # Data-driven suggestions for remaining bottlenecks
+        suggestions = _format_suggestions_section(metrics)
+        if suggestions:
+            parts.append(suggestions)
+
+        return "\n".join(parts)
 
     # ── Combination step ──────────────────────────────────────────────────────
 
