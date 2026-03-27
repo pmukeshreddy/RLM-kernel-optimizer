@@ -238,6 +238,21 @@ def main():
     # Lock GPU clocks to max to prevent thermal throttling variance
     _lock_gpu_clocks()
 
+    # --- AGGRESSIVE WARMUP HACK ---
+    # Since we likely cannot lock clocks (no root), we force the GPU into
+    # Max P-State by hammering it with a massive matmul loop for ~1 second
+    # before evaluating any baselines or kernels.
+    import torch
+    logger.info("Forcing GPU into max P-state boost clocks with dummy workload...")
+    dummy_a = torch.randn(8192, 8192, device='cuda', dtype=torch.float16)
+    dummy_b = torch.randn(8192, 8192, device='cuda', dtype=torch.float16)
+    for _ in range(100):
+        _ = torch.matmul(dummy_a, dummy_b)
+    torch.cuda.synchronize()
+    del dummy_a, dummy_b
+    logger.info("GPU is now fully awake. Starting benchmarks...")
+    # ------------------------------
+
     config_path = args.config or PROJECT_ROOT / "config" / "search_config.yaml"
     with open(config_path) as f:
         config = yaml.safe_load(f)
