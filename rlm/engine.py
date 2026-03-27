@@ -477,6 +477,8 @@ CRITICAL RULES:
 
     async def _refine_single_beam(self, prompt: str, parent: 'KernelCandidate', round_num: int) -> 'KernelCandidate':
         """Run a reflection-based refinement for a single candidate."""
+        logger.info("\n========== FEEDBACK PROMPT FOR [%s_r%d] ==========\n%s\n==========================================================", 
+                    parent.strategy, round_num, prompt)
         try:
             response, _, _ = await self._call_llm_async(
                 prompt, model=self.sub_model, temperature=0.4
