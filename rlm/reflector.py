@@ -215,13 +215,100 @@ def _format_last_error_section(candidate) -> str:
     """)
 
 
+# ── Proven-ineffective detection ──────────────────────────────────────────────
+
+def _compute_proven_ineffective(latest: dict, best: dict) -> tuple:
+    """Compare last attempt vs best: find metrics that changed substantially
+    but didn't improve timing. Returns (ineffective_set, description_lines).
+
+    Generalizes across kernels — purely data-driven, no kernel-specific rules.
+    """
+    if not latest or not best:
+        return set(), []
+
+    # Timing must NOT have improved for changes to be "ineffective"
+    best_us = best.get("duration_us", 0)
+    latest_us = latest.get("duration_us", 0)
+    if best_us <= 0 or latest_us <= 0:
+        return set(), []
+    # If timing actually improved, nothing is proven ineffective
+    if latest_us < best_us * 0.98:
+        return set(), []
+
+    ineffective = set()
+    lines = []
+
+    best_cm = best.get("_compiler", {})
+    latest_cm = latest.get("_compiler", {})
+    if not best_cm or not latest_cm:
+        return set(), []
+
+    # Vectorization
+    def _vec_pct(cm):
+        total = cm.get("sass_ldg_32", 0) + cm.get("sass_ldg_64", 0) + cm.get("sass_ldg_128", 0)
+        return (cm.get("sass_ldg_128", 0) / total * 100) if total > 0 else 0
+
+    best_vec, latest_vec = _vec_pct(best_cm), _vec_pct(latest_cm)
+    if abs(latest_vec - best_vec) > 20:
+        ineffective.add("vectorize_loads")
+        lines.append(f"Load vectorization {best_vec:.0f}%→{latest_vec:.0f}%: no timing improvement")
+
+    # Registers
+    best_regs = best_cm.get("registers_per_thread", 0)
+    latest_regs = latest_cm.get("registers_per_thread", 0)
+    if best_regs > 0 and latest_regs > 0 and abs(latest_regs - best_regs) >= 4:
+        ineffective.add("reduce_registers")
+        lines.append(f"Registers {best_regs}→{latest_regs}: no timing improvement")
+
+    # Barriers → shuffles
+    best_bars = best_cm.get("sass_bar", 0)
+    latest_bars = latest_cm.get("sass_bar", 0)
+    best_shfl = best_cm.get("sass_shfl", 0)
+    latest_shfl = latest_cm.get("sass_shfl", 0)
+    if (latest_shfl > best_shfl + 2) or (latest_bars < best_bars - 1):
+        ineffective.add("warp_shuffle")
+        lines.append(f"Barriers {best_bars}→{latest_bars}, shuffles {best_shfl}→{latest_shfl}: no timing improvement")
+
+    # Store vectorization
+    def _store_vec(cm):
+        total = cm.get("sass_stg_32", 0) + cm.get("sass_stg_128", 0)
+        return (cm.get("sass_stg_128", 0) / total * 100) if total > 0 else 0
+
+    best_svec, latest_svec = _store_vec(best_cm), _store_vec(latest_cm)
+    if abs(latest_svec - best_svec) > 20:
+        ineffective.add("vectorize_stores")
+        lines.append(f"Store vectorization {best_svec:.0f}%→{latest_svec:.0f}%: no timing improvement")
+
+    # SASS instruction count
+    best_sass = best_cm.get("sass_total_instructions", 0)
+    latest_sass = latest_cm.get("sass_total_instructions", 0)
+    if best_sass > 0 and latest_sass > 0 and abs(latest_sass - best_sass) > best_sass * 0.15:
+        ineffective.add("reduce_instructions")
+        lines.append(f"SASS instructions {best_sass}→{latest_sass}: no timing improvement")
+
+    # Occupancy
+    best_occ = best.get("sm_occupancy", 0)
+    latest_occ = latest.get("sm_occupancy", 0)
+    if abs(latest_occ - best_occ) > 10:
+        ineffective.add("occupancy")
+        lines.append(f"Occupancy {best_occ:.0f}%→{latest_occ:.0f}%: no timing improvement")
+
+    return ineffective, lines
+
+
 # ── Data-driven optimization suggestions ─────────────────────────────────────
 
-def _format_suggestions_section(metrics: dict) -> str:
-    """Generate concrete actionable suggestions from profiler data."""
+def _format_suggestions_section(metrics: dict, ineffective: set = None) -> str:
+    """Generate concrete actionable suggestions from profiler data.
+
+    ineffective: set of optimization categories proven not to help timing
+    (computed by _compute_proven_ineffective from actual profiler deltas).
+    Suggestions targeting these categories are suppressed.
+    """
     if not metrics:
         return ""
 
+    ineffective = ineffective or set()
     suggestions = []
     cm = metrics.get("_compiler", {})
 
@@ -230,7 +317,7 @@ def _format_suggestions_section(metrics: dict) -> str:
         ldg_64 = cm.get("sass_ldg_64", 0)
         ldg_32 = cm.get("sass_ldg_32", 0)
         total_ldg = ldg_32 + ldg_64 + ldg_128
-        if total_ldg > 0:
+        if total_ldg > 0 and "vectorize_loads" not in ineffective:
             vec_pct = ldg_128 / total_ldg * 100
             if vec_pct < 80:
                 suggestions.append(
@@ -241,14 +328,14 @@ def _format_suggestions_section(metrics: dict) -> str:
 
         bars = cm.get("sass_bar", 0)
         shfls = cm.get("sass_shfl", 0)
-        if bars > 0 and shfls == 0:
+        if bars > 0 and shfls == 0 and "warp_shuffle" not in ineffective:
             suggestions.append(
                 f"{bars} barrier instructions but 0 warp shuffles — "
                 f"replace shared memory reductions with __shfl_down_sync"
             )
 
         spills = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
-        if spills > 0:
+        if spills > 0 and "reduce_registers" not in ineffective:
             suggestions.append(
                 f"{spills} bytes of register spills — reduce register pressure"
             )
@@ -262,22 +349,23 @@ def _format_suggestions_section(metrics: dict) -> str:
 
         stg_128 = cm.get("sass_stg_128", 0)
         stg_32 = cm.get("sass_stg_32", 0)
-        if stg_32 > 0 and stg_128 == 0:
+        if stg_32 > 0 and stg_128 == 0 and "vectorize_stores" not in ineffective:
             suggestions.append(
                 f"All {stg_32} stores are 32-bit — vectorize stores with uint4"
             )
 
     occ = metrics.get("sm_occupancy", 0)
-    if occ >= 95:
-        suggestions.append(
-            "Occupancy is maxed — focus on instruction-level parallelism "
-            "or memory access patterns, not thread count"
-        )
-    elif 0 < occ < 50:
-        suggestions.append(
-            f"SM occupancy is only {occ:.0f}% — reduce registers or "
-            f"shared memory to increase occupancy"
-        )
+    if "occupancy" not in ineffective:
+        if occ >= 95:
+            suggestions.append(
+                "Occupancy is maxed — focus on instruction-level parallelism "
+                "or memory access patterns, not thread count"
+            )
+        elif 0 < occ < 50:
+            suggestions.append(
+                f"SM occupancy is only {occ:.0f}% — reduce registers or "
+                f"shared memory to increase occupancy"
+            )
 
     if not suggestions:
         return ""

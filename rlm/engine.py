@@ -19,7 +19,7 @@ from .reflector import (
     _get_launch_signature, _format_profile_section,
     _format_suggestions_section, _format_history_section,
     _format_stagnation_section, _format_last_error_section,
-    _format_delta_section,
+    _format_delta_section, _compute_proven_ineffective,
 )
 
 logger = logging.getLogger(__name__)
@@ -308,16 +308,25 @@ CRITICAL RULES:
         if has_fresh_data:
             # Show the LAST ATTEMPT's profile — LLM sees what its changes produced
             profile_section = _format_profile_section(prev_metrics, round_num)
-            suggestions_section = _format_suggestions_section(prev_metrics)
+            # Detect optimizations that changed metrics but didn't help timing
+            ineffective, ineff_lines = _compute_proven_ineffective(prev_metrics, metrics)
+            suggestions_section = _format_suggestions_section(prev_metrics, ineffective=ineffective)
             # Delta: how last attempt differs from the current best code
             delta_section = _format_delta_section(prev_metrics, metrics,
                                                   title="Last Attempt vs Current Best")
+            # Show proven dead-ends so model stops repeating them
+            if ineff_lines:
+                dead_ends = "\n### Proven Non-Bottlenecks (do NOT optimize these)\n"
+                dead_ends += "\n".join(f"- {l}" for l in ineff_lines)
+            else:
+                dead_ends = ""
         else:
             # No viable refinement yet — show the current best's profile
             profile_section = _format_profile_section(metrics, round_num)
             suggestions_section = _format_suggestions_section(metrics)
             # Don't show a misleading "= 0.000" delta
             delta_section = ""
+            dead_ends = ""
 
         stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num, candidate=parent)
         last_error_section = _format_last_error_section(parent)
@@ -327,9 +336,9 @@ CRITICAL RULES:
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
 
         # Debug: what data sections are populated?
-        logger.info("STRATEGY DATA [%s]: fresh=%s profile=%d suggestions=%d delta=%d stagnation=%d history=%d last_err=%d chars",
+        logger.info("STRATEGY DATA [%s]: fresh=%s profile=%d suggestions=%d dead_ends=%d delta=%d stagnation=%d history=%d last_err=%d chars",
             parent.strategy, has_fresh_data, len(profile_section), len(suggestions_section),
-            len(delta_section), len(stagnation_section), len(history_section),
+            len(dead_ends), len(delta_section), len(stagnation_section), len(history_section),
             len(last_error_section))
 
         # ── Turn 1: Strategy — DATA ONLY, no code ─────────────────────────
@@ -346,6 +355,7 @@ CRITICAL RULES:
 {header}
 {profile_section}
 {suggestions_section}
+{dead_ends}
 {delta_section}
 {stagnation_section}
 {last_error_section}
