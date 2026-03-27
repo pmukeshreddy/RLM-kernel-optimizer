@@ -164,6 +164,16 @@ def parse_ncu_csv_line(metric_id: str, value_str: str) -> float:
 def metrics_from_dict(d: dict) -> KernelMetrics:
     m = KernelMetrics()
     for field_name, value in d.items():
+        if field_name == '_compiler':
+            continue  # handled below
         if hasattr(m, field_name):
             setattr(m, field_name, float(value))
+    # Reconstruct compiler metrics so to_dict() preserves _compiler
+    compiler_data = d.get('_compiler')
+    if compiler_data:
+        cm = CompilerMetrics()
+        for k, v in compiler_data.items():
+            if hasattr(cm, k):
+                setattr(cm, k, int(v) if isinstance(v, (int, float)) else v)
+        m._compiler_metrics = cm
     return m

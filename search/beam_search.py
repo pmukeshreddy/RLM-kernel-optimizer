@@ -196,14 +196,17 @@ int main(int argc, char** argv) {{
             kernel_src=candidate.code, harness_src=harness, output_name=name,
         )
         if not compile_ok:
+            candidate.compile_ok = False
             candidate.compile_error = err_msg[:800]
             logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
         if compile_ok:
+            candidate.compile_ok = True  # nvcc succeeded
             with self._env_lock:
                 self.env.compile_passes += 1
             passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
                                                           kernel_type=self.env.kernel_type)
             if not passed:
+                candidate.compile_error = f"Correctness: {msg[:600]}"
                 logger.warning("  Correctness FAIL [%s] (err=%.4f): %s",
                                candidate.strategy, max_err, msg[:200])
             else:
@@ -230,7 +233,6 @@ int main(int argc, char** argv) {{
                     else:
                         logger.warning("  Profiler returned no metrics for [%s]", candidate.strategy)
                 ok = True
-        candidate.compile_ok = ok
 
         # Runtime hack checks — run after compile confirms the kernel is valid CUDA
         if ok:
@@ -382,7 +384,7 @@ int main(int argc, char** argv) {{
                         parent.last_refine_error = refined_c.compile_error or "Compile failure"
                     elif not refined_c.correct:
                         entry["outcome"] = "correctness_fail"
-                        parent.last_refine_error = "Correctness failure (output mismatch or kernel hung)"
+                        parent.last_refine_error = refined_c.compile_error or "Correctness failure (output mismatch or kernel hung)"
                     elif refined_c.speedup < parent.speedup - 0.001:
                         entry["outcome"] = "regression"
                         msg = f"Your refinement was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."

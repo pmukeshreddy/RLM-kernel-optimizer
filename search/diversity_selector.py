@@ -36,8 +36,7 @@ class DiversitySelector:
     def _cluster_select(self, candidates_with_metrics: list, max_survivors: int) -> list:
         clusters = {}
         for candidate, metrics in candidates_with_metrics:
-            # Only filter on compile_ok — correctness check runs later in run.py
-            if not candidate.compile_ok:
+            if not candidate.is_viable():
                 continue
             bottleneck = self.classifier.classify(metrics)
             clusters.setdefault(bottleneck, []).append((candidate, metrics))
@@ -69,7 +68,7 @@ class DiversitySelector:
         return survivors[:max_survivors]
 
     def _top_k_select(self, candidates_with_metrics: list, max_survivors: int) -> list:
-        viable = [(c, m) for c, m in candidates_with_metrics if c.compile_ok]
+        viable = [(c, m) for c, m in candidates_with_metrics if c.is_viable()]
         # Rank by candidate.speedup (from timing), not metrics.speedup
         viable.sort(key=lambda x: -x[0].speedup)
         survivors = []

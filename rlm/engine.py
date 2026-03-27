@@ -326,9 +326,13 @@ Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).
 {last_error_section}
 {history_section}
 
-Based on the profiler data above, what ONE specific optimization should be applied next?
-Be concrete: name the exact code transformation (e.g., "replace the 18 scalar LDG.32 loads
-with 3 uint4 128-bit loads using reinterpret_cast<uint4*>").
+Based on the profiler data above, what ONE small, incremental optimization should be applied next?
+RULES:
+- Do NOT propose rewriting the algorithm or changing the parallelization strategy.
+- Do NOT propose "switching to" a different approach. The current code works; improve it.
+- Propose a SURGICAL change: ~5-15 lines modified, not a rewrite.
+- Be concrete: name the exact code transformation (e.g., "replace the 18 scalar LDG.32 loads
+  with 3 uint4 128-bit loads using reinterpret_cast<uint4*>").
 Respond in 2-3 sentences. No code."""
 
         logger.info("STRATEGY PROMPT [%s]: %d chars", parent.strategy, len(strategy_prompt))
