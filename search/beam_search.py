@@ -423,6 +423,11 @@ int main(int argc, char** argv) {{
                             f"{parent.speedup:.3f}x). Try a fundamentally different approach."
                         )
 
+                    # Update prev_metrics so the delta section shows what the
+                    # failed refinement changed — closes the feedback loop
+                    if refined_c.metrics:
+                        parent.prev_metrics = refined_c.metrics
+
                     parent.refinement_history.append(entry)
                     refined_c.refinement_history = list(parent.refinement_history)
 
