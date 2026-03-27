@@ -336,6 +336,18 @@ int main(int argc, char** argv) {{
                 env.optimization_history.record(c)
                 logger.info("  Refined: %s", c.summary())
 
+            # Track failed refinement errors on parent survivors so next
+            # round's reflection can warn the model about its mistakes
+            for i, (refined_c, _) in enumerate(new_metrics):
+                if i < len(survivors):
+                    parent = survivors[i]
+                    if not refined_c.compile_ok:
+                        parent.last_refine_error = refined_c.compile_error or "Compile failure"
+                    elif not refined_c.correct:
+                        parent.last_refine_error = "Correctness failure (output mismatch or kernel hung)"
+                    else:
+                        parent.last_refine_error = ""  # clear on success
+
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
                 for s in survivors

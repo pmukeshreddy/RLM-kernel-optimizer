@@ -28,6 +28,7 @@ class KernelCandidate:
     ncu_report_path: Optional[str] = None
     prev_metrics: Optional[dict] = None  # parent's metrics for delta comparison
     compile_error: str = ""  # compiler error message for reflection
+    last_refine_error: str = ""  # error from last failed refinement attempt
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

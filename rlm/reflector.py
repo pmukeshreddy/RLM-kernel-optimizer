@@ -94,6 +94,7 @@ PERFORMANCE_REFLECTION = dedent("""\
     {profile_section}
     {delta_section}
     {stagnation_section}
+    {last_error_section}
 
     ### Your previous solution
     ```cuda
@@ -187,6 +188,27 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 
     lines.append("```")
     return "\n".join(lines)
+
+
+# ── Last failed refinement error ──────────────────────────────────────────────
+
+def _format_last_error_section(candidate) -> str:
+    """If the model's last refinement attempt failed, show the error so it
+    doesn't repeat the same mistake."""
+    error = getattr(candidate, 'last_refine_error', '')
+    if not error:
+        return ""
+    # Truncate long errors to keep the prompt focused
+    if len(error) > 600:
+        error = error[:600] + "\n... (truncated)"
+    return dedent(f"""\
+
+        ### Your Last Refinement Attempt FAILED
+        ```
+        {error}
+        ```
+        Do NOT repeat this mistake. Fix the error while improving performance.
+    """)
 
 
 # ── Stagnation detection ─────────────────────────────────────────────────────
@@ -388,6 +410,7 @@ def reflect(
     profile_section = _format_profile_section(metrics, iteration)
     delta_section = _format_delta_section(metrics, prev_metrics)
     stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration)
+    last_error_section = _format_last_error_section(candidate)
 
     reward, reward_breakdown = compute_reward(
         candidate.compile_ok, candidate.correct, speedup
@@ -422,4 +445,5 @@ def reflect(
         profile_section=profile_section,
         delta_section=delta_section,
         stagnation_section=stagnation_section,
+        last_error_section=last_error_section,
     ) + footer
