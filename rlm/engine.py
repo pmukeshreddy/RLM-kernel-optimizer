@@ -239,7 +239,7 @@ CRITICAL RULES:
 
         try:
             response, _, _ = await self._call_llm_async(
-                prompt, model=self.sub_model, temperature=0.4
+                prompt, model=self.sub_model, temperature=0.6
             )
         except RuntimeError as e:
             logger.error("Budget exceeded during beam %s: %s", strat_name, e)
@@ -298,15 +298,52 @@ CRITICAL RULES:
         return list(await asyncio.gather(*tasks))
 
     async def _refine_single_beam(self, prompt: str, parent: 'KernelCandidate', round_num: int) -> 'KernelCandidate':
-        """Run a reflection-based refinement for a single candidate."""
+        """2-turn refinement: strategy exploration → precise implementation."""
         logger.info("Reflecting [%s_r%d]: compile=%s correct=%s speedup=%.3fx",
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
+
+        # Turn 1: Strategy — what ONE optimization to apply (cheap, exploratory)
+        strategy_prompt = (
+            f"{prompt}\n\n"
+            "FIRST: Before writing code, describe in 2-3 sentences the ONE specific "
+            "optimization you will apply and WHY it will help based on the profiler data. "
+            "Do NOT write code yet — just the strategy."
+        )
         try:
-            response, _, _ = await self._call_llm_async(
-                prompt, model=self.sub_model, temperature=0.4
+            strat_response, _, _ = await self._call_llm_async(
+                strategy_prompt, model=self.sub_model, temperature=0.6
             )
         except RuntimeError as e:
-            logger.error("Budget exceeded during refine %s: %s", parent.strategy, e)
+            logger.error("Budget exceeded during strategy %s: %s", parent.strategy, e)
+            return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
+
+        logger.debug("Strategy for [%s]: %s", parent.strategy, strat_response[:200])
+
+        # Turn 2: Implementation — apply the decided strategy precisely
+        launch_sig = _get_launch_signature(self.env.kernel_type)
+        impl_prompt = f"""\
+Apply this exact optimization to the kernel below:
+
+## Strategy decided:
+{strat_response}
+
+## Current kernel ({parent.speedup:.3f}x):
+```cuda
+{parent.code}
+```
+
+{launch_sig}
+
+CRITICAL: Do NOT rewrite from scratch. Make the MINIMUM change needed for the strategy above.
+Keep all existing optimizations intact.
+Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
+"""
+        try:
+            response, _, _ = await self._call_llm_async(
+                impl_prompt, model=self.sub_model, temperature=0.3
+            )
+        except RuntimeError as e:
+            logger.error("Budget exceeded during implement %s: %s", parent.strategy, e)
             return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
 
         code = self._extract_cuda_code(response)

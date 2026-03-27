@@ -356,10 +356,12 @@ int main(int argc, char** argv) {{
                 n_fresh = min(len(stagnant), len(self._reserve_strategies))
                 fresh_strats = self._reserve_strategies[:n_fresh]
                 self._reserve_strategies = self._reserve_strategies[n_fresh:]
+                # Build on the best code so far, not the 1.0x baseline
+                best_code = max(survivors, key=lambda c: c.speedup).code if survivors else kernel_slice
                 logger.info("  Replacing %d stagnant beams with fresh strategies: %s",
                             n_fresh, [s.get("name", s) if isinstance(s, dict) else s for s in fresh_strats])
                 fresh = self.engine.run_generate_beams(
-                    strategies=fresh_strats, kernel_slice=kernel_slice, round_num=round_num
+                    strategies=fresh_strats, kernel_slice=best_code, round_num=round_num
                 )
 
             all_new = refined + fresh
@@ -426,10 +428,11 @@ int main(int argc, char** argv) {{
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
                 for s in survivors
             ] + improved_new
+            prev_survivor_ids = {id(s) for s in survivors}
             survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
-            # Bug 1 fix: only set prev_metrics on newly promoted candidates
+            # Only set prev_metrics on NEW entrants; carried-over survivors keep theirs
             for s in survivors:
-                if s.prev_metrics is None:
+                if id(s) not in prev_survivor_ids:
                     s.prev_metrics = s.metrics
 
         # ── Final: Combine top-2 ───────────────────────────────────────────
