@@ -348,6 +348,9 @@ Respond in 2-3 sentences. No code."""
         logger.info("STRATEGY RESPONSE [%s]: %s", parent.strategy, strat_response[:300])
 
         # ── Turn 2: Implementation — CODE ONLY, no profiler data ──────────
+        # Always refine from the best-known code, not a degraded version
+        base_code = parent.best_code or parent.code
+        base_speedup = parent.best_speedup or parent.speedup
         launch_sig = _get_launch_signature(self.env.kernel_type)
         impl_prompt = f"""\
 Apply this exact optimization to the kernel below:
@@ -355,9 +358,9 @@ Apply this exact optimization to the kernel below:
 ## Strategy decided:
 {strat_response}
 
-## Current kernel ({parent.speedup:.3f}x):
+## Current kernel ({base_speedup:.3f}x):
 ```cuda
-{parent.code}
+{base_code}
 ```
 
 {launch_sig}
@@ -391,13 +394,16 @@ RULES:
 
         if not code:
             logger.warning("No CUDA code extracted for refinement of %s", parent.strategy)
-        return KernelCandidate(
+        refined = KernelCandidate(
             code=code,
             strategy=f"{parent.strategy}_r{round_num}",
             round_num=round_num,
             compile_ok=bool(code),
             prev_metrics=parent.metrics,
         )
+        # Carry forward the strategy description so history can show what was tried
+        refined.strategy_desc = strat_response[:300]
+        return refined
 
     # ── Combination step ──────────────────────────────────────────────────────
 

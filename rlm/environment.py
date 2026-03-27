@@ -31,6 +31,8 @@ class KernelCandidate:
     last_refine_error: str = ""  # error from last failed refinement attempt
     refinement_history: list = field(default_factory=list)  # [{round, strategy, outcome, speedup}]
     refine_attempts: int = 0  # times this candidate was refined without improvement
+    best_code: str = ""       # code that achieved best_speedup (for refinement base)
+    best_speedup: float = 0.0 # best speedup seen for this beam lineage
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

@@ -301,7 +301,11 @@ def _format_history_section(candidate) -> str:
         speedup = entry.get("speedup", 0)
         strategy = entry.get("strategy", "?")
         rnd = entry.get("round", "?")
+        desc = entry.get("strategy_desc", "")
         lines.append(f"- Round {rnd}: {strategy} → {outcome} ({speedup:.3f}x)")
+        # Show what was tried for failed attempts so the LLM avoids repeating them
+        if desc and outcome in ("regression", "stagnant", "compile_fail", "correctness_fail"):
+            lines.append(f"  Attempted: {desc[:200]}")
     return "\n".join(lines)
 
 

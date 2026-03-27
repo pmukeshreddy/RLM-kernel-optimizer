@@ -321,6 +321,9 @@ int main(int argc, char** argv) {{
         for s in survivors:
             if s.prev_metrics is None:
                 s.prev_metrics = s.metrics
+            # Initialize best-code tracking for refinement
+            s.best_code = s.code
+            s.best_speedup = s.speedup
 
         # ── Rounds 1-N: Refine ─────────────────────────────────────────────
         for round_num in range(1, self.rounds + 1):
@@ -335,17 +338,17 @@ int main(int argc, char** argv) {{
 
             logger.info("--- Round %d ---", round_num)
 
-            # Problem 1: split survivors into refineable vs stagnant
+            # Split survivors into refineable vs stagnant
             to_refine = []
             stagnant = []
             for s in survivors:
-                if s.refine_attempts >= 2:
+                if s.refine_attempts >= 3:
                     stagnant.append(s)
                     logger.info("  Retiring stagnant [%s] after %d failed refine attempts",
                                 s.strategy, s.refine_attempts)
                 else:
                     to_refine.append(s)
-                    s.refine_attempts += 1
+                    # Don't increment here — increment based on outcome below
 
             # Refine non-stagnant survivors
             refined = []
@@ -377,16 +380,20 @@ int main(int argc, char** argv) {{
                 if i < len(to_refine):
                     parent = to_refine[i]
                     entry = {"round": round_num, "strategy": refined_c.strategy,
-                             "speedup": refined_c.speedup}
+                             "speedup": refined_c.speedup,
+                             "strategy_desc": getattr(refined_c, 'strategy_desc', '')}
 
                     if not refined_c.compile_ok:
                         entry["outcome"] = "compile_fail"
                         parent.last_refine_error = refined_c.compile_error or "Compile failure"
+                        parent.refine_attempts += 1
                     elif not refined_c.correct:
                         entry["outcome"] = "correctness_fail"
                         parent.last_refine_error = refined_c.compile_error or "Correctness failure (output mismatch or kernel hung)"
+                        parent.refine_attempts += 1
                     elif refined_c.speedup < parent.speedup - 0.001:
                         entry["outcome"] = "regression"
+                        parent.refine_attempts += 1
                         msg = f"Your refinement was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
                         rm = refined_c.metrics or {}
                         rc = rm.get("_compiler", {})
@@ -404,8 +411,13 @@ int main(int argc, char** argv) {{
                         entry["outcome"] = "improved"
                         parent.last_refine_error = ""
                         parent.refine_attempts = 0  # reset on real improvement
+                        # Update best-known code for this beam lineage
+                        if refined_c.speedup > (parent.best_speedup or 0):
+                            refined_c.best_code = refined_c.code
+                            refined_c.best_speedup = refined_c.speedup
                     else:
                         entry["outcome"] = "stagnant"
+                        parent.refine_attempts += 1
                         parent.last_refine_error = (
                             f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
                             f"{parent.speedup:.3f}x). Try a fundamentally different approach."
