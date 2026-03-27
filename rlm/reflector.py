@@ -311,11 +311,20 @@ def _format_history_section(candidate) -> str:
 
 # ── Stagnation detection ─────────────────────────────────────────────────────
 
-def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int) -> str:
+def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int,
+                               candidate=None) -> str:
     """Detect reward stagnation and tell the model to change approach.
-    Triggers from round 1 onward with flat speedup."""
+    Only triggers after at least one refinement attempt has been made,
+    to avoid falsely firing on carried-over survivors whose metrics==prev_metrics."""
     if not metrics or not prev_metrics or iteration < 1:
         return ""
+
+    # Don't trigger stagnation if this beam hasn't been refined yet —
+    # metrics and prev_metrics are identical for fresh survivors
+    if candidate is not None:
+        has_history = getattr(candidate, 'refinement_history', [])
+        if not has_history:
+            return ""
 
     cur_speedup = metrics.get("speedup", 1.0)
     prev_speedup = prev_metrics.get("speedup", 1.0)
@@ -326,8 +335,8 @@ def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int
 
             ### Stagnation Detected
             Speedup has NOT improved: {prev_speedup:.3f}x -> {cur_speedup:.3f}x
-            Your previous optimization approach is not working.
-            Do NOT make small tweaks to the same approach — try a completely different optimization technique.
+            Your previous refinement attempts are not working.
+            Try a different optimization technique than what's listed in the Refinement History.
         """)
     return ""
 
@@ -509,7 +518,7 @@ def reflect(
     launch_sig = _get_launch_signature(kernel_type)
     profile_section = _format_profile_section(metrics, iteration)
     delta_section = _format_delta_section(metrics, prev_metrics)
-    stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration)
+    stagnation_section = _format_stagnation_section(metrics, prev_metrics, iteration, candidate=candidate)
     last_error_section = _format_last_error_section(candidate)
     history_section = _format_history_section(candidate)
     suggestions_section = _format_suggestions_section(metrics)

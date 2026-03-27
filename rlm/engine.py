@@ -302,7 +302,7 @@ CRITICAL RULES:
         profile_section = _format_profile_section(metrics, round_num)
         suggestions_section = _format_suggestions_section(metrics)
         delta_section = _format_delta_section(metrics, prev_metrics)
-        stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num)
+        stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num, candidate=parent)
         last_error_section = _format_last_error_section(parent)
         history_section = _format_history_section(parent)
 
