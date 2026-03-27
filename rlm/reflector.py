@@ -472,8 +472,9 @@ CRITICAL_RULES = dedent("""\
     5. The launch_* function signature MUST match the "Required Launch Function" section EXACTLY.
        If you change it, the code will fail with "undefined reference" linker errors.
     6. Output must match reference within atol=1e-2.
-    7. No explanations -- just the code block.
-    8. Only call functions defined in the included headers. Do NOT invent helper functions.
+    7. NEVER put __syncthreads() inside an if/else branch -- all threads in a block MUST hit the same barrier or the kernel will deadlock.
+    8. No explanations -- just the code block.
+    9. Only call functions defined in the included headers. Do NOT invent helper functions.
 """)
 
 

@@ -15,7 +15,12 @@ from anthropic import AsyncAnthropic
 from .environment import RLMEnvironment, KernelCandidate
 from .root_prompts import SYSTEM_PROMPT, decompose_prompt, combine_prompt
 from .sub_prompts import get_prompt_for_strategy
-from .reflector import reflect, _get_launch_signature
+from .reflector import (
+    _get_launch_signature, _format_profile_section,
+    _format_suggestions_section, _format_history_section,
+    _format_stagnation_section, _format_last_error_section,
+    _format_delta_section,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,8 +229,9 @@ CRITICAL RULES:
 5. The launch_* function signature MUST match the "Required Launch Function" section EXACTLY.
    If you change it, you will get "undefined reference" linker errors.
 6. Output must match reference within atol=1e-2
-7. No explanations — just the code block
-8. You may call any function defined in the expanded headers above. Do NOT invent
+7. NEVER put __syncthreads() inside an if/else branch — all threads in a block MUST hit the same barrier or the kernel will deadlock.
+8. No explanations — just the code block
+9. You may call any function defined in the expanded headers above. Do NOT invent
    helper functions that aren't defined in the headers.
 """
         else:
@@ -275,55 +281,58 @@ CRITICAL RULES:
         return self.env.search_config.get("target", {}).get("min_speedup", 1.5)
 
     async def refine_beams(self, survivors: list, round_num: int) -> list:
-        cfg = self.env.search_config
-        target_speedup = self._get_target_speedup()
-        atol = cfg.get("eval", {}).get("correctness_atol", 1e-2)
-        baseline_us = self.env.baseline_us_reported or 12.4
-
-        tasks = []
-        for candidate in survivors:
-            prompt = reflect(
-                candidate=candidate,
-                iteration=round_num,
-                hw_spec=self.env.hw_spec,
-                kernel_type=self.env.kernel_type,
-                target_speedup=target_speedup,
-                min_speedup=1.05,
-                baseline_us=baseline_us,
-                prev_metrics=candidate.prev_metrics,
-                atol=atol,
-                original_kernel_src=self.env.kernel_src,
-            )
-            tasks.append(self._refine_single_beam(prompt, candidate, round_num))
+        tasks = [
+            self._refine_single_beam(candidate, round_num)
+            for candidate in survivors
+        ]
         return list(await asyncio.gather(*tasks))
 
-    async def _refine_single_beam(self, prompt: str, parent: 'KernelCandidate', round_num: int) -> 'KernelCandidate':
-        """2-turn refinement: strategy exploration → precise implementation."""
+    async def _refine_single_beam(self, parent: 'KernelCandidate', round_num: int) -> 'KernelCandidate':
+        """2-turn refinement: data-only strategy → code-only implementation.
+
+        Turn 1 (strategy): sees ONLY profiler numbers, suggestions, history.
+                           No kernel source. Forces reasoning from data.
+        Turn 2 (implement): sees ONLY the chosen strategy + parent code.
+                           No profiler data. Forces minimal targeted edit.
+        """
+        metrics = parent.metrics or {}
+        prev_metrics = parent.prev_metrics
+
+        # Build data-only sections for strategy call
+        profile_section = _format_profile_section(metrics, round_num)
+        suggestions_section = _format_suggestions_section(metrics)
+        delta_section = _format_delta_section(metrics, prev_metrics)
+        stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num)
+        last_error_section = _format_last_error_section(parent)
+        history_section = _format_history_section(parent)
+
         logger.info("Reflecting [%s_r%d]: compile=%s correct=%s speedup=%.3fx",
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
 
-        # Debug 1: What prompt sections are populated?
-        logger.info("PROMPT SECTIONS [%s]: targets=%s history=%s stagnation=%s delta=%s last_err=%s",
-            parent.strategy,
-            "### Optimization Targets" in prompt,
-            "### Refinement History" in prompt,
-            "### Stagnation Detected" in prompt,
-            "### Changes vs Previous" in prompt,
-            "### Your Last Refinement" in prompt)
+        # Debug: what data sections are populated?
+        logger.info("STRATEGY DATA [%s]: profile=%d suggestions=%d delta=%d stagnation=%d history=%d last_err=%d chars",
+            parent.strategy, len(profile_section), len(suggestions_section),
+            len(delta_section), len(stagnation_section), len(history_section),
+            len(last_error_section))
 
-        # Debug 2: Prompt length + suggestions content
-        logger.info("PROMPT LENGTH [%s]: %d chars", parent.strategy, len(prompt))
-        targets_match = re.search(r'(### Optimization Targets.*?)###', prompt, re.DOTALL)
-        if targets_match:
-            logger.info("SUGGESTIONS [%s]: %s", parent.strategy, targets_match.group(1).strip()[:500])
+        # ── Turn 1: Strategy — DATA ONLY, no code ─────────────────────────
+        strategy_prompt = f"""\
+You are optimizing a CUDA kernel currently at {parent.speedup:.3f}x speedup.
+Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).
+{profile_section}
+{suggestions_section}
+{delta_section}
+{stagnation_section}
+{last_error_section}
+{history_section}
 
-        # Turn 1: Strategy — what ONE optimization to apply (cheap, exploratory)
-        strategy_prompt = (
-            f"{prompt}\n\n"
-            "FIRST: Before writing code, describe in 2-3 sentences the ONE specific "
-            "optimization you will apply and WHY it will help based on the profiler data. "
-            "Do NOT write code yet — just the strategy."
-        )
+Based on the profiler data above, what ONE specific optimization should be applied next?
+Be concrete: name the exact code transformation (e.g., "replace the 18 scalar LDG.32 loads
+with 3 uint4 128-bit loads using reinterpret_cast<uint4*>").
+Respond in 2-3 sentences. No code."""
+
+        logger.info("STRATEGY PROMPT [%s]: %d chars", parent.strategy, len(strategy_prompt))
+
         try:
             strat_response, _, _ = await self._call_llm_async(
                 strategy_prompt, model=self.sub_model, temperature=0.6
@@ -334,7 +343,7 @@ CRITICAL RULES:
 
         logger.info("STRATEGY RESPONSE [%s]: %s", parent.strategy, strat_response[:300])
 
-        # Turn 2: Implementation — apply the decided strategy precisely
+        # ── Turn 2: Implementation — CODE ONLY, no profiler data ──────────
         launch_sig = _get_launch_signature(self.env.kernel_type)
         impl_prompt = f"""\
 Apply this exact optimization to the kernel below:
@@ -349,10 +358,12 @@ Apply this exact optimization to the kernel below:
 
 {launch_sig}
 
-CRITICAL: Do NOT rewrite from scratch. Make the MINIMUM change needed for the strategy above.
-Keep all existing optimizations intact.
-Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
-"""
+RULES:
+1. Do NOT rewrite from scratch. Make the MINIMUM change needed for the strategy above.
+2. Keep all existing optimizations intact.
+3. NEVER put __syncthreads() inside an if/else branch — all threads in a block MUST hit the same barrier.
+4. Return the COMPLETE .cu file in a single ```cuda code block. No explanations."""
+
         try:
             response, _, _ = await self._call_llm_async(
                 impl_prompt, model=self.sub_model, temperature=0.3
@@ -361,12 +372,11 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             logger.error("Budget exceeded during implement %s: %s", parent.strategy, e)
             return KernelCandidate(code="", strategy=parent.strategy, round_num=round_num)
 
-        # Debug 3: Raw LLM response start
-        logger.info("LLM RESPONSE START [%s]: %s", parent.strategy, response[:300])
+        logger.info("LLM RESPONSE START [%s]: %s", parent.strategy, response[:200])
 
         code = self._extract_cuda_code(response)
 
-        # Debug 4: Code diff
+        # Debug: code diff
         if code and parent.code:
             parent_lines = set(parent.code.strip().splitlines())
             new_lines = set(code.strip().splitlines())
