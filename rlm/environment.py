@@ -27,6 +27,7 @@ class KernelCandidate:
     correct: bool = False
     ncu_report_path: Optional[str] = None
     prev_metrics: Optional[dict] = None  # parent's metrics for delta comparison
+    compile_error: str = ""  # compiler error message for reflection
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

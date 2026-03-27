@@ -196,6 +196,7 @@ int main(int argc, char** argv) {{
             kernel_src=candidate.code, harness_src=harness, output_name=name,
         )
         if not compile_ok:
+            candidate.compile_error = err_msg[:800]
             logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
         if compile_ok:
             with self._env_lock:

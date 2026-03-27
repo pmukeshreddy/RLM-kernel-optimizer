@@ -80,8 +80,12 @@ class NCURunner:
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
-            logger.warning("Compilation failed:\n%s", result.stderr[:400])
-            return False, result.stderr, binary_file, None
+            # Filter ptxas info lines so actual errors are visible in logs
+            error_lines = [l for l in result.stderr.splitlines()
+                           if not l.strip().startswith("ptxas info")]
+            error_msg = "\n".join(error_lines).strip() or result.stderr.strip()
+            logger.warning("Compilation failed:\n%s", error_msg[:800])
+            return False, error_msg, binary_file, None
 
         # Parse compiler metrics from ptxas verbose output
         compiler_metrics = self._parse_ptxas_verbose(result.stderr)

@@ -23,10 +23,10 @@ COMPILE_REFLECTION = dedent("""\
 
     Your previous solution **failed to compile**.
 
-    ### Error context
-    - Strategy: {strategy}
-    - Common failure modes: missing #include, undefined helper functions,
-      changed launch_* signature, syntax errors in template/macro code.
+    ### Compiler error
+    ```
+    {error}
+    ```
 
     ### Your previous solution
     ```cuda
@@ -34,10 +34,11 @@ COMPILE_REFLECTION = dedent("""\
     ```
 
     ### What to fix
-    - Check for syntax errors and missing #include directives.
+    - Read the compiler error above carefully and fix the exact issue.
+    - Do NOT invent header files (e.g. "fp4_utils.cuh") -- only use the original #includes.
     - Only call functions defined in the included headers -- do NOT invent helpers.
     - The launch_* wrapper signature must not change.
-    - Verify template parameters and CUDA type casts are correct.
+    - If you see "undefined reference" to the launch function, you changed its signature.
     {hints}
 
     ### Instructions
@@ -411,9 +412,10 @@ def reflect(
     optimized_us = baseline_us / speedup if speedup > 0 else 0.0
 
     if not candidate.compile_ok:
+        error = getattr(candidate, 'compile_error', '') or "Unknown compilation error"
         prompt = COMPILE_REFLECTION.format(
             iteration=iteration,
-            strategy=candidate.strategy,
+            error=error,
             solution=solution,
             hints=hints,
         )
