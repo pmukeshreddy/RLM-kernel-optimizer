@@ -33,6 +33,7 @@ class KernelCandidate:
     refine_attempts: int = 0  # times this candidate was refined without improvement
     best_code: str = ""       # code that achieved best_speedup (for refinement base)
     best_speedup: float = 0.0 # best speedup seen for this beam lineage
+    strategy_context: str = "" # original strategy description — anchors refinement direction
 
     def is_viable(self) -> bool:
         return self.compile_ok and self.correct

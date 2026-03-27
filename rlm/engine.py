@@ -17,7 +17,7 @@ from .root_prompts import SYSTEM_PROMPT, decompose_prompt, combine_prompt
 from .sub_prompts import get_prompt_for_strategy
 from .reflector import (
     _get_launch_signature, _format_profile_section,
-    _format_suggestions_section, _format_history_section,
+    _format_history_section, _format_react_trace,
     _format_stagnation_section, _format_last_error_section,
     _format_delta_section, _compute_proven_ineffective,
 )
@@ -255,12 +255,14 @@ CRITICAL RULES:
         if not code:
             logger.warning("No CUDA code extracted for strategy=%s (response starts: %s)",
                            strat_name, response[:100])
-        return KernelCandidate(
+        c = KernelCandidate(
             code=code,
             strategy=strat_name,
             round_num=round_num,
             compile_ok=bool(code),
         )
+        c.strategy_context = strat_desc
+        return c
 
     async def generate_beams(
         self,
@@ -310,7 +312,6 @@ CRITICAL RULES:
             profile_section = _format_profile_section(prev_metrics, round_num)
             # Detect optimizations that changed metrics but didn't help timing
             ineffective, ineff_lines = _compute_proven_ineffective(prev_metrics, metrics)
-            suggestions_section = _format_suggestions_section(prev_metrics, ineffective=ineffective)
             # Delta: how last attempt differs from the current best code
             delta_section = _format_delta_section(prev_metrics, metrics,
                                                   title="Last Attempt vs Current Best")
@@ -323,52 +324,70 @@ CRITICAL RULES:
         else:
             # No viable refinement yet — show the current best's profile
             profile_section = _format_profile_section(metrics, round_num)
-            suggestions_section = _format_suggestions_section(metrics)
             # Don't show a misleading "= 0.000" delta
             delta_section = ""
             dead_ends = ""
 
-        stagnation_section = _format_stagnation_section(metrics, prev_metrics, round_num, candidate=parent)
         last_error_section = _format_last_error_section(parent)
-        history_section = _format_history_section(parent)
+        react_trace = _format_react_trace(parent)
+
+        strat_ctx = getattr(parent, 'strategy_context', '')
+        strat_name = parent.strategy.split("_r")[0]  # strip _r1, _r2 suffixes
 
         logger.info("Reflecting [%s_r%d]: compile=%s correct=%s speedup=%.3fx",
                      parent.strategy, round_num, parent.compile_ok, parent.correct, parent.speedup)
+        logger.info("STRATEGY DATA [%s]: fresh=%s profile=%d dead_ends=%d delta=%d trace=%d last_err=%d beam=%s",
+            parent.strategy, has_fresh_data, len(profile_section),
+            len(dead_ends), len(delta_section), len(react_trace),
+            len(last_error_section), strat_ctx[:50] if strat_ctx else "none")
 
-        # Debug: what data sections are populated?
-        logger.info("STRATEGY DATA [%s]: fresh=%s profile=%d suggestions=%d dead_ends=%d delta=%d stagnation=%d history=%d last_err=%d chars",
-            parent.strategy, has_fresh_data, len(profile_section), len(suggestions_section),
-            len(dead_ends), len(delta_section), len(stagnation_section), len(history_section),
-            len(last_error_section))
+        # ── Turn 1: ReAct — Observation → Thought → Action ────────────────
+        # Build observation block: raw profiler data + deltas + dead ends + errors
+        obs_parts = [profile_section]
+        if delta_section:
+            obs_parts.append(delta_section)
+        if dead_ends:
+            obs_parts.append(dead_ends)
+        if last_error_section:
+            obs_parts.append(last_error_section)
+        observation = "\n".join(p for p in obs_parts if p)
 
-        # ── Turn 1: Strategy — DATA ONLY, no code ─────────────────────────
+        # Build the ReAct prompt
+        prompt_parts = []
+
+        # Role: beam identity
+        if strat_ctx:
+            prompt_parts.append(
+                f"You are beam \"{strat_name}\" optimizing a CUDA kernel.\n"
+                f"Direction: {strat_ctx}")
+        else:
+            prompt_parts.append(
+                f"You are beam \"{strat_name}\" optimizing a CUDA kernel.")
+
+        # Status
         if has_fresh_data:
             last_spd = prev_metrics.get("speedup", 0)
-            header = (f"You are optimizing a CUDA kernel. Best so far: {parent.speedup:.3f}x. "
-                      f"Last attempt: {last_spd:.3f}x.\n"
-                      f"Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).")
+            prompt_parts.append(
+                f"Best so far: {parent.speedup:.3f}x. Last attempt: {last_spd:.3f}x.")
         else:
-            header = (f"You are optimizing a CUDA kernel currently at {parent.speedup:.3f}x speedup.\n"
-                      f"Target: >{self._get_target_speedup():.1f}x on NVIDIA B200 (sm_100a).")
+            prompt_parts.append(f"Current: {parent.speedup:.3f}x.")
 
-        strategy_prompt = f"""\
-{header}
-{profile_section}
-{suggestions_section}
-{dead_ends}
-{delta_section}
-{stagnation_section}
-{last_error_section}
-{history_section}
+        # Prior ReAct trace (if any rounds happened before)
+        if react_trace:
+            prompt_parts.append(react_trace)
 
-Based on the profiler data above, what ONE small, incremental optimization should be applied next?
-RULES:
-- Do NOT propose rewriting the algorithm or changing the parallelization strategy.
-- Do NOT propose "switching to" a different approach. The current code works; improve it.
-- Propose a SURGICAL change: ~5-15 lines modified, not a rewrite.
-- Be concrete: name the exact code transformation (e.g., "replace the 18 scalar LDG.32 loads
-  with 3 uint4 128-bit loads using reinterpret_cast<uint4*>").
-Respond in 2-3 sentences. No code."""
+        # Current observation from profiler
+        prompt_parts.append(f"Observation:\n{observation}")
+
+        # Thought + Action (model fills these in)
+        prompt_parts.append(
+            "Thought: <why did the last action succeed or fail? "
+            "what does the profiler data say is the real bottleneck "
+            "for your beam's direction?>\n"
+            "Action: <ONE surgical change, 5-15 lines. "
+            "Name the exact code transformation.>")
+
+        strategy_prompt = "\n\n".join(prompt_parts)
 
         logger.info("STRATEGY PROMPT [%s]: %d chars", parent.strategy, len(strategy_prompt))
 
@@ -438,6 +457,8 @@ RULES:
         )
         # Carry forward the strategy description so history can show what was tried
         refined.strategy_desc = strat_response[:300]
+        # Carry forward the beam's optimization direction for future rounds
+        refined.strategy_context = getattr(parent, 'strategy_context', '')
         return refined
 
     # ── Combination step ──────────────────────────────────────────────────────

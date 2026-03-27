@@ -397,6 +397,38 @@ def _format_history_section(candidate) -> str:
     return "\n".join(lines)
 
 
+def _format_react_trace(candidate) -> str:
+    """Format refinement history as a ReAct trace: Action → Result pairs.
+
+    Shows the model its own prior reasoning chain so it can learn from
+    what worked and what didn't — proper ReAct interleaving.
+    """
+    history = getattr(candidate, 'refinement_history', [])
+    if not history:
+        return ""
+
+    lines = []
+    for i, entry in enumerate(history, 1):
+        outcome = entry.get("outcome", "?")
+        speedup = entry.get("speedup", 0)
+        desc = entry.get("strategy_desc", "")
+
+        # Map outcomes to clear result labels
+        result_map = {
+            "improved": "IMPROVED",
+            "regression": "SLOWER",
+            "stagnant": "NO CHANGE",
+            "compile_fail": "COMPILE ERROR",
+            "correctness_fail": "WRONG OUTPUT",
+        }
+        result_label = result_map.get(outcome, outcome.upper())
+
+        action_text = desc[:250] if desc else "(no description)"
+        lines.append(f"Action {i}: {action_text}")
+        lines.append(f"Result {i}: {result_label} ({speedup:.3f}x)")
+    return "\n".join(lines)
+
+
 # ── Stagnation detection ─────────────────────────────────────────────────────
 
 def _format_stagnation_section(metrics: dict, prev_metrics: dict, iteration: int,
