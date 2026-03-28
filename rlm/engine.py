@@ -386,8 +386,8 @@ Respond with ONLY the JSON array, nothing else."""
                 "\nIMPORTANT: Synthesize an optimization based on the knowledge provided. Do NOT just tweak "
                 "the naive kernel — you must restructure the data flow.\n\n"
                 "Before calling submit_kernel, explain in 2-3 sentences:\n"
-                "1. What structural transformation you are applying\n"
-                "2. How many bytes of HBM traffic this eliminates\n\n"
+                "1. What your planned change is\n"
+                "2. Why it addresses the specific performance metrics without breaking correctness\n\n"
                 "Then call submit_kernel with your complete .cu file.",
             ])
             initial_prompt = "\n\n".join(prompt_parts)
@@ -506,8 +506,7 @@ hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
 
 {launch_sig}
 
-IMPORTANT: Apply the optimization logically. Do NOT just tweak the naive kernel.
-Restructure the data flow to eliminate unnecessary HBM traffic.
+IMPORTANT: Apply the optimization logically and carefully. Focus on practical speedups without introducing deadlocks or massive register spills.
 
 CRITICAL RULES:
 1. Return the COMPLETE .cu file in a single ```cuda code block
