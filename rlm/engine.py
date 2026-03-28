@@ -284,6 +284,7 @@ DO NOT propose these generic strategies (FlashInfer already does them):
 - "__ldg read-only cache" — already standard
 
 Propose exact structural techniques to solve the specific hardware bottlenecks described above.
+CRITICAL: You must order your strategy list by importance. Ensure that your proposed solutions for the B200 Cache write-thrashing and B200 FP4 arithmetic bottlenecks are placed at the very top of your JSON array, otherwise they will not strictly be evaluated!
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
