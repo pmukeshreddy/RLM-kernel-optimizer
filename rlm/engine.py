@@ -100,21 +100,10 @@ Rules:
 - Do not use torch headers (torch/extension.h, ATen, c10).
 """
 
-
-def _constraint_for_speedup(speedup: float) -> str:
-    """Constraint guard: only restrict changes when kernel is already fast."""
-    if speedup >= 1.6:
-        return (
-            "- Surgical changes only (5-15 lines). The kernel is already 1.6x+.\n"
-            "- Keep all existing optimizations — do not regress.\n"
-            "- Make targeted micro-optimizations, do not rewrite from scratch."
-        )
-    return "- Structural changes, algorithmic rewrites, and new optimization patterns are all allowed."
-
-
 def _build_refine_system_prompt(speedup: float) -> str:
     """Build REFINE_SYSTEM_PROMPT with dynamic constraint for current speedup."""
-    constraint = _constraint_for_speedup(speedup)
+    # Provide a unified constraint regardless of speedup
+    constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
     return REFINE_SYSTEM_PROMPT.replace("{{turns}}", str(MAX_INNER_TURNS)).replace("{{constraint}}", constraint)
 
 

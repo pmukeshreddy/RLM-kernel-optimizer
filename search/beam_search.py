@@ -599,7 +599,7 @@ int main(int argc, char** argv) {{
                         parent.refine_attempts += 1
                         parent.last_refine_error = (
                             f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
-                            f"{parent.speedup:.3f}x). Try a fundamentally different approach."
+                            f"{parent.speedup:.3f}x). Review the metrics to see if your change actually affected hardware execution."
                         )
 
                     # Update prev_metrics so the delta section shows what the
