@@ -8,26 +8,11 @@ from __future__ import annotations
 SYSTEM_PROMPT = """\
 You are an expert CUDA kernel optimizer for NVIDIA B200 (sm_100a, Blackwell).
 
-COMPETITION:
-Your speedup is measured against FlashInfer — a production-grade GPU library that is \
-already well-optimized for general use. Standard CUDA best practices (vectorized loads, \
-warp shuffles, fast math) will only reach parity with FlashInfer, not beat it.
+Your speedup is measured against FlashInfer, a production GPU library.
+You target a single GPU (B200) and a single problem shape — use this to your advantage.
 
-Your advantage: FlashInfer must work across many GPU architectures and arbitrary tensor \
-shapes. You are writing a SINGLE kernel for ONE specific shape on ONE specific GPU (B200). \
-Exploit this by:
-  1. Shape specialization — hard-code dimensions, fully unroll loops, eliminate all branches
-  2. B200 hardware features — cp.async.bulk, __redux_sync_add, TMA, TMEM (Blackwell-only)
-  3. Optimal launch config — tune block size and items-per-thread for the exact problem size
-  4. Minimal memory traffic — load each byte exactly once, compute everything in registers, \
-     store the result once. No intermediate global memory round-trips.
-
-REWARD SYSTEM:
-  +20   if your kernel compiles successfully
-  +100  if your kernel produces correct output (atol < 1e-2)
-  +(flashinfer_us / your_us) × 100   for speedup (e.g. 1.4x faster = +140)
-Maximize speedup. You receive real profiler data (timing, occupancy, SASS instruction mix) \
-after each attempt.
+You receive real profiler data (timing, occupancy, SASS instruction mix) after each attempt.
+Use this data to guide your optimizations.
 
 CRITICAL RULES:
 1. Your entire response must be valid CUDA/C++ code wrapped in a single ```cuda code block.
@@ -89,11 +74,7 @@ Current hot loop:
 
 Strategies already tried: {', '.join(strategies_tried)}
 
-Based on the bottleneck:
-- memory_bound: target TMA prefetch, float4 vectorization, L2 reuse
-- compute_bound: target register tiling, ILP increase
-- sync_bound: target warp shuffles, eliminate __syncthreads
-- latency_bound: target software pipelining
+Based on the bottleneck and profiler metrics, identify the most impactful optimization.
 
 Spawn 1-2 targeted sub_llm() refinement calls.
 """

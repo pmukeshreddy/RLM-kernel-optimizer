@@ -62,32 +62,19 @@ SUBMIT_KERNEL_TOOL = {
 REFINE_SYSTEM_PROMPT = f"""\
 You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
 
-COMPETITION — FlashInfer:
-Your speedup is measured against FlashInfer, a production GPU library that is already
-well-optimized for general use. Standard CUDA best practices will only reach parity (~1.0x).
-
-Your advantage over FlashInfer:
-- FlashInfer targets many GPU architectures. You target ONLY B200 (sm_100a, Blackwell).
-  Use Blackwell-specific features: cp.async.bulk, __redux_sync_add, TMA, TMEM.
-- FlashInfer handles arbitrary shapes. You know the EXACT shape for this problem.
-  Hard-code dimensions, fully unroll loops to exact trip counts, eliminate all branches.
-- You can tune block size and items-per-thread specifically for this problem's data size,
-  balancing occupancy vs per-thread work in ways a general library cannot.
-- You can structure the datapath to load each byte exactly once, compute everything
-  in registers, and store results once — no intermediate global memory round-trips.
+Your speedup is measured against FlashInfer, a production GPU library.
+You target a single GPU (B200, sm_100a) and a single problem shape — use this to your advantage.
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
 - L2 cache: 126 MB — benchmark uses L2 cache cycling (data is COLD every iteration)
 - 142 SMs, 228 KB shared memory per SM, 255 registers per thread
 - 128-bit load/store = uint4 = 8 bf16 values per transaction
-- __redux_sync_add: single-instruction warp reduction (~1 cycle vs __shfl_xor chain ~5)
-- cp.async.bulk: zero-overhead async HBM→shared memory copy (no register file pressure)
+- __redux_sync_add: single-instruction warp reduction
+- cp.async.bulk: async HBM→shared memory copy
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
-- __nv_cvt_float2_to_fp4x2(float2, __NV_E2M1, cudaRoundNearest): single-instruction float2→packed FP4 byte (~1 cycle vs ~30 cycles of branching). Requires #include <cuda_fp4.h>
-- __nv_fp8_e4m3 type: hardware FP8 E4M3 via constructor __nv_fp8_e4m3(float_val), replaces manual float_to_e4m3. Requires #include <cuda_fp8.h>
-
-
+- __nv_cvt_float2_to_fp4x2(float2, __NV_E2M1, cudaRoundNearest): hardware float2→packed FP4. Requires #include <cuda_fp4.h>
+- __nv_fp8_e4m3 type: hardware FP8 E4M3 via constructor __nv_fp8_e4m3(float_val). Requires #include <cuda_fp8.h>
 
 Before EVERY submit_kernel call, explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
@@ -270,24 +257,10 @@ class RLMEngine:
 You are a CUDA optimization expert. Analyze this kernel and propose exactly {num_strategies}
 DIVERSE optimization techniques that would give the biggest speedup.
 
-CONTEXT:
-- Speedup is measured against FlashInfer — a production GPU library already well-optimized
-  for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
-- Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
-  (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this.
-- Use the profiler data below to determine whether this kernel is memory-bound, latency-bound, or compute-bound.
+Speedup is measured against FlashInfer, a production GPU library.
+You target ONE GPU (B200, sm_100a) and ONE shape ({env.problem_shapes[0]}).
 
 {baseline_context}
-
-Step 1: Ensure basic optimizations are saturated (vectorization, fast math, shared memory cache).
-Step 2: Apply ONE extreme, shape-specialized orthogonal architecture strategy from the following list to surpass FlashInfer...
-
-Propose exact structural techniques to solve the specific hardware bottlenecks described above.
-CRITICAL: To ensure our optimizations stack multiplicatively, your generated strategies MUST map to these exact categories in order:
-1. Memory Hierarchy (L2, Async Bulk, Streaming)
-2. Compute Latency (Intrinsics, ILP)
-3. Structural Control Flow (Unrolling, Branchless logic)
-4. Resource Occupancy (SMem sharing, Block dimensions)
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
@@ -297,9 +270,10 @@ Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs, 228KB
 {kernel_src}
 ```
 
-For each optimization, give a short name and one-line description of what to do.
+Analyze the profiler data and kernel source. Propose {num_strategies} diverse optimizations,
+most impactful first. Each should be a concrete, actionable change.
 
-Return as a JSON array of objects, most impactful first:
+Return as a JSON array of objects:
 [
 {example_lines}
 ]
@@ -362,11 +336,9 @@ Respond with ONLY the JSON array, nothing else."""
             prompt_parts = [
                 f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
                 f"Direction: {strat_desc}",
-                f"\nProblem shape: {shape_str} (FIXED — hard-code ALL dimensions as compile-time constants).",
-                "\nYour speedup is measured against FlashInfer — a production GPU library "
-                "already well-optimized for general use. Your advantage: FlashInfer targets "
-                "many GPUs and arbitrary shapes. You target ONE GPU (B200) and ONE shape. "
-                "Exploit shape specialization and B200-specific hardware features.",
+                f"\nProblem shape: {shape_str} (FIXED — you may hard-code dimensions as compile-time constants).",
+                "\nSpeedup is measured against FlashInfer, a production GPU library. "
+                "You target ONE GPU (B200, sm_100a) and ONE shape.",
             ]
             
             prompt_parts.extend([
@@ -464,7 +436,6 @@ Respond with ONLY the JSON array, nothing else."""
         if strat_desc:
             shape_str = str(self.env.problem_shapes[0])
             
-            kb_snippet = ""
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -474,18 +445,8 @@ Apply this optimization to the kernel below:
 {strat_desc}
 
 ## Context
-Speedup is measured against FlashInfer — a production GPU library already well-optimized
-for general use. Your advantage: you target ONE GPU (B200) and ONE shape ({shape_str}).
-Exploit shape specialization (hard-code dimensions, fully unroll) and B200-specific
-hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
-
-## B200 Hardware:
-- HBM3e: 8 TB/s — use uint4 (128-bit) loads; L2 is cold (L2 cycling benchmark)
-- 142 SMs, 228 KB shared mem/SM, 255 regs/thread
-- __redux_sync_add: 1-cycle warp reduce vs __shfl_xor_sync chain ~5 cycles
-- Memory-bound: GPU is idle waiting for HBM. Compute-only changes won't help.
-
-{kb_snippet}
+Speedup is measured against FlashInfer, a production GPU library.
+You target ONE GPU (B200, sm_100a) and ONE shape ({shape_str}).
 
 ## Naive reference kernel (starting point):
 ```cuda
@@ -493,8 +454,6 @@ hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
 ```
 
 {launch_sig}
-
-IMPORTANT: Apply the optimization logically and carefully. Focus on practical speedups without introducing deadlocks or massive register spills.
 
 CRITICAL RULES:
 1. Return the COMPLETE .cu file in a single ```cuda code block
