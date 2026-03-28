@@ -268,13 +268,28 @@ CONTEXT:
 - Speedup is measured against FlashInfer — a production GPU library already well-optimized
   for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
 - Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
-  (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this by proposing:
-  * Shape specialization: hard-code dimensions, fully unroll, eliminate all branches
-  * B200-only features: cp.async.bulk, __redux_sync_add, TMA, TMEM (Blackwell-specific)
-  * Optimal launch config tuned for this exact problem size
-  * Minimal memory traffic: load once → compute everything in registers → store once
+  (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this.
 - These kernels are memory-bound (L2 cache is cycled, data comes from HBM every time).
   Compute-only optimizations will NOT help.
+
+DO NOT propose these generic strategies (FlashInfer already does them):
+- "vectorized loads" or "use uint4/float4" — already standard
+- "warp shuffle reduction" — already standard
+- "single pass fusion" — already standard
+- "fast math intrinsics" — already standard
+- "__ldg read-only cache" — already standard
+
+INSTEAD propose techniques like:
+- Shape specialization: hard-code dimensions {env.problem_shapes[0]} as compile-time
+  constants, fully unroll all loops to exact trip counts, eliminate every branch
+- __launch_bounds__ with low register budget (32-48 regs): maximize occupancy for
+  memory-bound kernels — higher occupancy hides HBM latency better
+- Hardware FP4/FP8 intrinsics: replace manual bit manipulation with __nv_cvt_float_to_fp8,
+  hardware FP4 packing — single-cycle vs ~20 instructions
+- Optimal launch config: tune block size and items-per-thread for this exact problem size
+- Data reuse: share loaded data across multiple output elements (e.g. multiple rows)
+- Register-only datapath: all computation in registers, no shared memory intermediates
+- Vectorized packed stores: accumulate FP4 output into uint2/uint4, store in one transaction
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
@@ -286,7 +301,6 @@ Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs, 228KB
 
 For each optimization, give a short name and one-line description of what to do.
 Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
-Focus on techniques that exploit shape-specificity or B200 hardware, not generic CUDA patterns.
 
 Return as a JSON array of objects, most impactful first:
 [

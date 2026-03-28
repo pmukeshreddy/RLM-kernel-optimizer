@@ -135,7 +135,11 @@ def _build_hw_context(hw_spec: dict) -> str:
 # ── Profile data formatter ───────────────────────────────────────────────────
 
 def _format_profile_section(metrics: dict, iteration: int) -> str:
-    """Format REAL profiler data only: timing, occupancy, compiler metrics, SASS."""
+    """Format REAL profiler data only: timing, occupancy, compiler metrics, SASS.
+
+    Bottleneck-filtered (CUDAMaster technique): when the kernel is memory-bound,
+    suppress compute metrics to prevent the LLM from chasing compute red herrings.
+    """
     if not metrics:
         return ""
 
@@ -148,25 +152,32 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
     speedup = metrics.get("speedup", 1.0)
 
     lines.append(f"Kernel timing:                 {duration:.3f} us")
-    lines.append(f"Speedup:                       {speedup:.3f}x")
+    lines.append(f"Speedup vs FlashInfer:         {speedup:.3f}x")
     lines.append(f"SM occupancy:                  {occupancy:.1f}%")
 
-    # Memory throughput metrics (from NCU) — critical for memory-bound diagnosis
+    # Classify bottleneck for metric filtering
     mem_tput = metrics.get("mem_throughput_pct", 0)
     compute_tput = metrics.get("compute_throughput_pct", 0)
     stall_mem = metrics.get("stall_memory", 0)
     dram_bw = metrics.get("dram_read_bw_gbps", 0)
     l2_hit = metrics.get("l2_hit_rate", 0)
+    is_memory_bound = (mem_tput > 40) or (stall_mem > 30 and compute_tput < 30)
+
     if mem_tput > 0 or compute_tput > 0:
         lines.append("")
         lines.append(f"Memory throughput:             {mem_tput:.1f}% of peak")
-        lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
+        # Only show compute throughput if kernel is NOT memory-bound
+        # (CUDAMaster: filtered metrics prevent LLM from chasing compute optimizations)
+        if not is_memory_bound:
+            lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
         if stall_mem > 0:
             lines.append(f"Warp stalls (memory):          {stall_mem:.1f}%")
         if dram_bw > 0:
             lines.append(f"DRAM read bandwidth:           {dram_bw:.0f} GB/s")
         if l2_hit > 0:
             lines.append(f"L2 hit rate:                   {l2_hit:.1f}%")
+        if is_memory_bound:
+            lines.append(f"Bottleneck:                    MEMORY (compute throughput hidden — not relevant)")
 
     # Compiler metrics (from nvcc -Xptxas -v)
     cm = metrics.get("_compiler", {})
@@ -177,6 +188,8 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 
         lines.append("")
         lines.append(f"Registers per thread:          {regs}")
+        if regs > 48 and is_memory_bound:
+            lines.append(f"  *** HIGH REGISTER COUNT — limits occupancy. Use __launch_bounds__ to target 32-48 regs ***")
         lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
         lines.append(f"Shared memory:                 {smem} bytes")
 
@@ -190,9 +203,6 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
             stg_32 = cm.get("sass_stg_32", 0)
             ldl = cm.get("sass_ldl", 0)
             stl = cm.get("sass_stl", 0)
-            ffma = cm.get("sass_ffma", 0)
-            hfma2 = cm.get("sass_hfma2", 0)
-            mufu = cm.get("sass_mufu", 0)
             bar = cm.get("sass_bar", 0)
             shfl = cm.get("sass_shfl", 0)
 
@@ -204,7 +214,12 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
             lines.append(f"Global loads:                  {total_ldg}  (128-bit: {ldg_128}, 64-bit: {ldg_64}, 32-bit: {ldg_32})  vectorization: {vec_pct:.0f}%")
             lines.append(f"Global stores:                 {stg_32 + stg_128}  (128-bit: {stg_128}, 32-bit: {stg_32})")
             lines.append(f"Spill load/store instructions: {ldl + stl}{' *** REGISTER SPILLS IN BINARY ***' if ldl + stl > 0 else ''}")
-            lines.append(f"Compute: FFMA={ffma}  HFMA2={hfma2}  MUFU(SFU)={mufu}")
+            # Only show compute instruction breakdown if NOT memory-bound
+            if not is_memory_bound:
+                ffma = cm.get("sass_ffma", 0)
+                hfma2 = cm.get("sass_hfma2", 0)
+                mufu = cm.get("sass_mufu", 0)
+                lines.append(f"Compute: FFMA={ffma}  HFMA2={hfma2}  MUFU(SFU)={mufu}")
             lines.append(f"Sync: barriers={bar}  shuffles={shfl}")
 
     lines.append("```")
@@ -390,11 +405,23 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
                 f"{spills} bytes of register spills — reduce register pressure"
             )
 
-        mufu = cm.get("sass_mufu", 0)
-        if mufu == 0:
+        # Only suggest fast math if kernel is NOT memory-bound
+        # (CUDAMaster: suppress compute suggestions for memory-bound kernels)
+        if not is_memory_bound:
+            mufu = cm.get("sass_mufu", 0)
+            if mufu == 0:
+                suggestions.append(
+                    "No MUFU (fast math SFU) instructions — "
+                    "use __expf/__rsqrtf instead of expf/rsqrtf"
+                )
+
+        # Register budget: hackathon winners used 32-48 regs for memory-bound kernels
+        regs = cm.get("registers_per_thread", 0)
+        if regs > 48 and is_memory_bound and "reduce_registers" not in ineffective:
             suggestions.append(
-                "No MUFU (fast math SFU) instructions — "
-                "use __expf/__rsqrtf instead of expf/rsqrtf"
+                f"Using {regs} registers/thread — too high for memory-bound kernel. "
+                f"Add __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS) to constrain to 32-48 regs. "
+                f"Higher occupancy from fewer registers will hide memory latency better"
             )
 
         stg_128 = cm.get("sass_stg_128", 0)
@@ -430,14 +457,22 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
     occ = metrics.get("sm_occupancy", 0)
     if "occupancy" not in ineffective:
         if occ >= 95:
-            suggestions.append(
-                "Occupancy is maxed — focus on instruction-level parallelism "
-                "or memory access patterns, not thread count"
-            )
+            if is_memory_bound:
+                suggestions.append(
+                    "Occupancy is maxed but kernel is still memory-bound — "
+                    "focus on reducing total memory transactions and increasing "
+                    "data reuse, not thread count"
+                )
+            else:
+                suggestions.append(
+                    "Occupancy is maxed — focus on instruction-level parallelism "
+                    "or memory access patterns, not thread count"
+                )
         elif 0 < occ < 50:
             suggestions.append(
-                f"SM occupancy is only {occ:.0f}% — reduce registers or "
-                f"shared memory to increase occupancy"
+                f"SM occupancy is only {occ:.0f}% — use __launch_bounds__ to constrain "
+                f"registers and increase occupancy. For memory-bound kernels, occupancy "
+                f"is critical for hiding HBM latency"
             )
 
     if not suggestions:

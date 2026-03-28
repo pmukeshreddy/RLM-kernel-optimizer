@@ -127,6 +127,51 @@ STRATEGY_BANK: dict = {
         priority=8,
         applicable_kernels=["nvfp4_quantize", "silu_mul", "add_rmsnorm"],
     ),
+    # ── Hackathon-winning strategies (from B200 NVFP4 competition analysis) ──
+    "launch_bounds_low_regs": Strategy(
+        name="launch_bounds_low_regs",
+        display_name="__launch_bounds__ Low Register Budget",
+        description="Add __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) to constrain "
+                    "the compiler to 32-48 registers per thread. On memory-bound kernels, "
+                    "higher occupancy from fewer registers beats per-thread efficiency. "
+                    "Hackathon winners used 32-45 regs vs 80+ for naive kernels",
+        targets_bottleneck=["memory_bound", "latency_bound"],
+        priority=11,
+        applicable_kernels=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
+    ),
+    "hardware_fp4_intrinsics": Strategy(
+        name="hardware_fp4_intrinsics",
+        display_name="Hardware FP4/FP8 Intrinsics",
+        description="Replace manual bit manipulation for E4M3/FP4 conversion with "
+                    "hardware intrinsics: __nv_cvt_float_to_fp8 for E4M3 scales, "
+                    "__nv_fp4x2_e2m1x2 for FP4 packing. Eliminates ~20 instructions "
+                    "per quantization block. On B200 these are single-cycle operations",
+        targets_bottleneck=["compute_bound", "latency_bound", "memory_bound"],
+        priority=11,
+        applicable_kernels=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
+    ),
+    "shape_specialized_unroll": Strategy(
+        name="shape_specialized_unroll",
+        display_name="Shape-Specialized Full Unroll",
+        description="Hard-code the exact problem dimensions as compile-time constants. "
+                    "Use constexpr/template parameters for hidden_size, rows, K. "
+                    "Compiler fully unrolls loops, eliminates bounds checks and branches. "
+                    "This is the #1 advantage over general-purpose libraries like FlashInfer",
+        targets_bottleneck=["memory_bound", "latency_bound", "compute_bound"],
+        priority=12,
+        applicable_kernels=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
+    ),
+    "multi_row_per_block": Strategy(
+        name="multi_row_per_block",
+        display_name="Multi-Row Per Block",
+        description="Process 2-4 rows per thread block instead of 1. Amortizes shared "
+                    "data loads (weight vector, scales) across rows — each extra row "
+                    "saves one full weight vector read from HBM. Use blockIdx.x for "
+                    "row groups, distribute rows across warps within the block",
+        targets_bottleneck=["memory_bound"],
+        priority=10,
+        applicable_kernels=["add_rmsnorm"],  # only kernel with shared weight vector
+    ),
 }
 
 # ── Kernel-type-specific ideal strategies ────────────────────────────────────
@@ -136,22 +181,28 @@ STRATEGY_BANK: dict = {
 
 KERNEL_IDEAL_STRATEGIES: dict = {
     "add_rmsnorm": [
-        "fuse_passes",        # eliminate redundant global mem round-trip
-        "vectorize_loads",    # 128-bit coalesced bf16 loads
-        "fp4_lut",            # replace quantize arithmetic with LUT
-        "thread_coarsening",  # process 2-4 rows per block
+        "shape_specialized_unroll",   # #1 advantage over FlashInfer
+        "launch_bounds_low_regs",     # maximize occupancy for memory-bound
+        "hardware_fp4_intrinsics",    # replace manual bit math
+        "fuse_passes",                # eliminate redundant global mem round-trip
+        "multi_row_per_block",        # amortize weight loads across rows
+        "vectorize_loads",            # 128-bit coalesced bf16 loads
     ],
     "silu_mul": [
-        "vectorize_loads",    # 2 input arrays loaded scalar-by-scalar
-        "fast_math_expf",     # SiLU uses slow expf, __expf is 3-5x faster
-        "fp4_lut",            # all outputs go to FP4, LUT replaces math
-        "thread_coarsening",  # 1 quant block/thread is too little work
+        "shape_specialized_unroll",   # hard-code B, M, K dimensions
+        "launch_bounds_low_regs",     # maximize occupancy for memory-bound
+        "hardware_fp4_intrinsics",    # replace manual FP4 bit packing
+        "vectorize_loads",            # 2 input arrays loaded scalar-by-scalar
+        "fast_math_expf",             # SiLU uses slow expf
+        "thread_coarsening",          # more work per thread
     ],
     "nvfp4_quantize": [
-        "fp4_lut",            # kernel does NOTHING but quantize, biggest win
-        "vectorize_loads",    # + vectorized stores for both sides
-        "thread_coarsening",  # 8 quant blocks/thread instead of 1
-        "ldg_readonly",       # input is read-only, free L1 texture cache
+        "shape_specialized_unroll",   # hard-code M, K dimensions
+        "launch_bounds_low_regs",     # maximize occupancy for memory-bound
+        "hardware_fp4_intrinsics",    # kernel is ALL quantization — biggest win
+        "vectorize_loads",            # + vectorized stores for both sides
+        "thread_coarsening",          # more quant blocks per thread
+        "vectorized_stores",          # fused packed output writes
     ],
 }
 
