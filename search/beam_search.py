@@ -208,7 +208,7 @@ int main(int argc, char** argv) {{
 }}
 """
 
-    def measure_search_baseline(self, problem_shape: tuple) -> Optional[float]:
+    def measure_search_baseline(self, problem_shape: tuple) -> tuple[Optional[float], Optional[CompilerMetrics]]:
         """Measure reference kernel timing with the SAME harness used for candidates.
 
         Ensures symmetric measurement: both baseline and candidate see the same
@@ -216,17 +216,19 @@ int main(int argc, char** argv) {{
         """
         harness = self._build_harness(problem_shape)
         safe_name = f"baseline_{self.env.kernel_type}_{int(time.time())}"
-        ok, err, binary, _ = self.profiler.compile_kernel(
+        ok, err, binary, baseline_cm = self.profiler.compile_kernel(
             kernel_src=self.env.kernel_src_raw, harness_src=harness,
             output_name=safe_name,
         )
         if not ok:
             logger.warning("Baseline compilation failed: %s", err[:200])
-            return None
+            return None, None
         timing = self.profiler.benchmark_timing(binary)
         if timing:
             logger.info("Search baseline (with L2 cycling): %.3f us", timing)
-        return timing
+        self.env.baseline_naive_us = timing
+        self.env.baseline_compiler_metrics = baseline_cm
+        return timing, baseline_cm
 
     def _profile_candidate(
         self,
@@ -390,7 +392,7 @@ int main(int argc, char** argv) {{
         # naive starting kernel.  Always use FlashInfer as the denominator.
         # Log naive-kernel timing for diagnostics (shows how much room there is).
         baseline_us = env.baseline_us_reported
-        search_naive_us = self.measure_search_baseline(problem_shape)
+        search_naive_us, baseline_cm = self.measure_search_baseline(problem_shape)
         if search_naive_us:
             logger.info("Naive reference kernel (harness): %.3f us", search_naive_us)
         logger.info("FlashInfer baseline (speedup denominator): %.3f us", baseline_us)

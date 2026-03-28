@@ -258,6 +258,28 @@ class RLMEngine:
         env = self.env
         kernel_src = env.kernel_src  # expanded includes
 
+        # Build baseline profiler context for strategy selection
+        baseline_context = ""
+        if env.baseline_naive_us and env.baseline_us_reported:
+            from .blueprints import get_roofline_feedback
+            roofline = get_roofline_feedback(
+                env.kernel_type, env.problem_shapes[0],
+                env.baseline_naive_us, 1.0,
+            )
+            rows = env.problem_shapes[0][0]
+            sm_count = env.hw_spec.get("sm", {}).get("count", 148)
+            cm = env.baseline_compiler_metrics
+            cm_str = cm.summary_str() if cm else "unavailable"
+            baseline_context = (
+                f"BASELINE PROFILER DATA (reference kernel):\n"
+                f"  Naive kernel timing: {env.baseline_naive_us:.3f} us\n"
+                f"  FlashInfer timing:   {env.baseline_us_reported:.3f} us\n"
+                f"  Compiler: {cm_str}\n"
+                f"  Grid: {rows} blocks launched on {sm_count} SMs"
+                f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
+                f"  {roofline}\n"
+            )
+
         num_strategies = self.beam_width * 2  # extra strategies held in reserve
         example_lines = "\n".join(
             f'  {{"name": "short_name", "what": "one line description of the concrete change"}},'
@@ -272,9 +294,11 @@ CONTEXT:
   for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
 - Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
   (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this.
-- These kernels are memory-bound.
+- Use the profiler data below to determine whether this kernel is memory-bound, latency-bound, or compute-bound. Do NOT assume memory-bound.
 - B200 L2 Cache Policy: Writing output data back to HBM through standard paths pollutes the L2 cache, kicking out the weights that you need to read over and over again! You must protect the L2 cache from write-thrashing.
 - B200 FP4 compute: Arithmetic float-to-fp4 conversions and bit-packing operations cost ~20 cycles and consume extreme register space compared to native hardware intrinsics.
+
+{baseline_context}
 
 DO NOT propose these generic strategies (FlashInfer already does them):
 - "vectorized loads" or "use uint4/float4" — already standard
@@ -284,7 +308,7 @@ DO NOT propose these generic strategies (FlashInfer already does them):
 - "__ldg read-only cache" — already standard
 
 Propose exact structural techniques to solve the specific hardware bottlenecks described above.
-CRITICAL: You must order your strategy list by importance. Ensure that your proposed solutions for the B200 Cache write-thrashing and B200 FP4 arithmetic bottlenecks are placed at the very top of your JSON array, otherwise they will not strictly be evaluated!
+CRITICAL: You must order your strategy list by importance. Place strategies that address the ACTUAL bottleneck shown in the profiler data at the very top of your JSON array, otherwise they will not strictly be evaluated!
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}

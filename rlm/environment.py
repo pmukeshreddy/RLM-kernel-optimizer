@@ -115,6 +115,8 @@ class RLMEnvironment:
         self.ncu_report: Optional[dict] = None
         self.baseline_us: Optional[float] = None
         self.baseline_us_reported: float = 12.4
+        self.baseline_naive_us: Optional[float] = None
+        self.baseline_compiler_metrics = None  # CompilerMetrics from reference kernel
 
         # Task-specific shape takes priority over config shapes
         if problem_shape is not None:
