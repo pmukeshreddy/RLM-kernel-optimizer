@@ -123,7 +123,9 @@ class RLMEngine:
         cfg = env.search_config
         # Sync client for root/combine calls (sequential); async client for parallel beams
         self.client       = anthropic.Anthropic()
-        self.async_client = AsyncAnthropic()
+        self.async_client = AsyncAnthropic(max_retries=10)
+        # Limit concurrent API calls to avoid 429 rate-limit errors
+        self._api_semaphore = asyncio.Semaphore(2)
         self._loop = None  # persistent event loop for async calls
 
         self.root_model    = cfg["models"]["root_model"]
@@ -179,13 +181,14 @@ class RLMEngine:
                 f"Budget exhausted: ${self.env.total_api_cost_usd:.4f} spent"
             )
 
-        response = await self.async_client.messages.create(
-            model=model,
-            max_tokens=self.max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        async with self._api_semaphore:
+            response = await self.async_client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
 
         text       = response.content[0].text
         tokens_in  = response.usage.input_tokens
@@ -211,14 +214,15 @@ class RLMEngine:
                 f"Budget exhausted: ${self.env.total_api_cost_usd:.4f} spent"
             )
 
-        response = await self.async_client.messages.create(
-            model=model,
-            max_tokens=self.max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=messages,
-            tools=tools,
-        )
+        async with self._api_semaphore:
+            response = await self.async_client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=messages,
+                tools=tools,
+            )
 
         tokens_in  = response.usage.input_tokens
         tokens_out = response.usage.output_tokens
