@@ -345,15 +345,13 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
     is_memory_bound = (mem_tput > 60) or (stall_mem > 40 and compute_tput < 30)
     if is_memory_bound and "memory_bound" not in ineffective:
         suggestions.append(
-            f"MEMORY-BOUND KERNEL ({mem_tput:.0f}% mem throughput, "
-            f"{stall_mem:.0f}% memory stalls). "
-            "Compute optimizations (faster math, more ILP) will NOT help. "
-            "The GPU is waiting for data from HBM. You MUST reduce memory traffic:\n"
-            "  (a) Fuse operations to avoid writing intermediate results to HBM and re-reading them\n"
-            "  (b) Increase data reuse per element — load once into registers, do all computation, then store once\n"
-            "  (c) Use vectorized 128-bit loads/stores (uint4) to maximize bandwidth utilization\n"
-            "  (d) Use software pipelining: load next data block while computing on current block (cp.async / double buffering)\n"
-            "  (e) Reduce the total bytes touched — e.g. pack/compress intermediates"
+            f"MEMORY-BOUND ({mem_tput:.0f}% mem throughput, {stall_mem:.0f}% stalls). "
+            "Compute-only changes will NOT help. To beat FlashInfer:\n"
+            "  (a) Reduce total memory transactions: load each byte once, compute in registers, store once\n"
+            "  (b) Shape-specific unrolling: hard-code exact dimensions, eliminate branches\n"
+            "  (c) cp.async.bulk: zero-overhead async HBM→smem (no register pressure)\n"
+            "  (d) Fused vectorized stores: pack output into uint2/uint4, store in one transaction\n"
+            "  (e) Increase data reuse: share loaded data across multiple output elements"
         )
     elif mem_tput > 40 and compute_tput < 20:
         suggestions.append(

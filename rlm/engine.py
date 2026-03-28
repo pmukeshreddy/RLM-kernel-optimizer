@@ -62,26 +62,35 @@ SUBMIT_KERNEL_TOOL = {
 REFINE_SYSTEM_PROMPT = f"""\
 You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
 
+COMPETITION — FlashInfer:
+Your speedup is measured against FlashInfer, a production GPU library that is already
+well-optimized for general use. Standard CUDA best practices will only reach parity (~1.0x).
+
+Your advantage over FlashInfer:
+- FlashInfer targets many GPU architectures. You target ONLY B200 (sm_100a, Blackwell).
+  Use Blackwell-specific features: cp.async.bulk, __redux_sync_add, TMA, TMEM.
+- FlashInfer handles arbitrary shapes. You know the EXACT shape for this problem.
+  Hard-code dimensions, fully unroll loops to exact trip counts, eliminate all branches.
+- You can tune block size and items-per-thread specifically for this problem's data size,
+  balancing occupancy vs per-thread work in ways a general library cannot.
+- You can structure the datapath to load each byte exactly once, compute everything
+  in registers, and store results once — no intermediate global memory round-trips.
+
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
-- L2 cache: 126 MB — but benchmark uses L2 cache cycling (data is COLD every iteration)
+- L2 cache: 126 MB — benchmark uses L2 cache cycling (data is COLD every iteration)
 - 142 SMs, 228 KB shared memory per SM, 255 registers per thread
-- Warp size 32, max 2048 threads per SM
 - 128-bit load/store = uint4 = 8 bf16 values per transaction
-- Warp shuffle (__shfl_xor_sync): ~2 cycles vs shared mem reduction ~10+
+- __redux_sync_add: single-instruction warp reduction (~1 cycle vs __shfl_xor chain ~5)
+- cp.async.bulk: zero-overhead async HBM→shared memory copy (no register file pressure)
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
 
-CRITICAL — These kernels are MEMORY-BOUND:
-- The benchmark forces L2 cache misses every iteration. Data comes from HBM, not L2.
-- The GPU is IDLE most of the time, waiting for HBM data to arrive.
-- Pure compute optimizations (faster math, ILP, register tiling) will NOT improve timing.
-- To get real speedup you MUST either reduce total memory traffic or overlap memory with compute:
-  * Software pipelining: load next tile via cp.async while computing on current tile
-  * Double buffering: use 2 shared memory buffers to overlap HBM loads with computation
-  * Fuse all operations into a single pass: load ONCE into registers, compute everything, store ONCE
-  * Vectorized 128-bit loads (uint4): maximize bytes per memory transaction
+These kernels are MEMORY-BOUND — data comes from HBM every iteration (L2 cold).
+Compute-only changes (faster math, ILP) will NOT improve timing.
+You must reduce total memory traffic, overlap memory with compute, or increase
+memory bus utilization (vectorized loads, coalescing, fewer transactions).
 
-Before EVERY submit_kernel call, you MUST first explain in 2-3 sentences:
+Before EVERY submit_kernel call, explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
 2. What specific code change you will make and why you expect it to help
 
@@ -255,30 +264,29 @@ class RLMEngine:
 You are a CUDA optimization expert. Analyze this kernel and propose exactly {num_strategies}
 DIVERSE optimization techniques that would give the biggest speedup.
 
-CRITICAL CONTEXT — This kernel is MEMORY-BOUND:
-- Benchmark uses L2 cache cycling — data is COLD every iteration, fetched from HBM (not L2).
-- The GPU is mostly IDLE, waiting for HBM data. Arithmetic is NOT the bottleneck.
-- Pure compute optimizations (faster math, ILP, register tiling) alone will NOT help.
-- To get real speedup, strategies MUST reduce total memory traffic or hide memory latency:
-  * Software pipelining / double buffering (cp.async + shared memory ping-pong)
-  * Fuse all passes into single-pass: load ONCE, compute everything in registers, store ONCE
-  * Vectorized 128-bit loads/stores (uint4) to maximize memory bus utilization
-  * Reduce total bytes: eliminate redundant loads/stores, compress intermediates
-  * Overlap: load next tile while computing on current tile
-
-You are NOT limited to any predefined list. Propose whatever CUDA optimizations
-you think are most impactful for THIS SPECIFIC kernel. Be specific and concrete.
-Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
-At least half your strategies MUST target memory access patterns, not compute.
+CONTEXT:
+- Speedup is measured against FlashInfer — a production GPU library already well-optimized
+  for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
+- Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
+  (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this by proposing:
+  * Shape specialization: hard-code dimensions, fully unroll, eliminate all branches
+  * B200-only features: cp.async.bulk, __redux_sync_add, TMA, TMEM (Blackwell-specific)
+  * Optimal launch config tuned for this exact problem size
+  * Minimal memory traffic: load once → compute everything in registers → store once
+- These kernels are memory-bound (L2 cache is cycled, data comes from HBM every time).
+  Compute-only optimizations will NOT help.
 
 Kernel type: {env.kernel_type}
-Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs)
+Problem shape: {env.problem_shapes[0]}
+Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs, 228KB smem/SM)
 
 ```cuda
 {kernel_src}
 ```
 
 For each optimization, give a short name and one-line description of what to do.
+Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
+Focus on techniques that exploit shape-specificity or B200 hardware, not generic CUDA patterns.
 
 Return as a JSON array of objects, most impactful first:
 [
@@ -339,18 +347,22 @@ Respond with ONLY the JSON array, nothing else."""
             constraint = _constraint_for_speedup(0.0)  # round 0 = aggressive
             system_prompt = _build_refine_system_prompt(0.0)
 
+            shape_str = str(self.env.problem_shapes[0])
             prompt_parts = [
-                f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel from scratch.",
+                f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
                 f"Direction: {strat_desc}",
-                "\nIMPORTANT: This kernel is MEMORY-BOUND. The benchmark uses L2 cache cycling "
-                "so data comes from HBM every time. The GPU is idle waiting for memory. "
-                "Compute-only optimizations won't help — you must reduce memory traffic or "
-                "overlap loads with compute (software pipelining, cp.async, double buffering).",
-                f"\n## Reference kernel (BASELINE — this is what you must beat):\n"
+                f"\nProblem shape: {shape_str} (FIXED — you can hard-code dimensions and unroll).",
+                "\nYour speedup is measured against FlashInfer — a production GPU library "
+                "already well-optimized for general use. Your advantage: FlashInfer targets "
+                "many GPUs and arbitrary shapes, while you target ONE GPU (B200) and ONE shape. "
+                "Exploit shape specialization and B200-specific hardware features.",
+                "\nMemory-bound: L2 cache is cycled, data comes from HBM every iteration. "
+                "Compute-only optimizations won't help.",
+                f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
                 "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
-                "1. What optimization you're applying and why it should help\n"
+                "1. What optimization you're applying and why\n"
                 "2. What specific code changes you're making\n\n"
                 "Then call submit_kernel with your complete .cu file.",
             ]
@@ -438,6 +450,7 @@ Respond with ONLY the JSON array, nothing else."""
 
         # ── One-shot fallback (no profile_fn or no description) ──────────
         if strat_desc:
+            shape_str = str(self.env.problem_shapes[0])
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -446,20 +459,19 @@ Apply this optimization to the kernel below:
 ## Optimization: {strat_name}
 {strat_desc}
 
+## Context
+Speedup is measured against FlashInfer — a production GPU library already well-optimized
+for general use. Your advantage: you target ONE GPU (B200) and ONE shape ({shape_str}).
+Exploit shape specialization (hard-code dimensions, fully unroll) and B200-specific
+hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
+
 ## B200 Hardware:
-- HBM3e: 8 TB/s bandwidth — use float4/uint4 (128-bit) loads to saturate it
-- L2 cache: 126 MB — but benchmark uses L2 cycling so data is COLD (from HBM)
-- 142 SMs, 228 KB shared memory per SM, 255 registers per thread
-- Warp shuffle (__shfl_xor_sync) costs ~2 cycles vs shared mem reduction ~10+ cycles
-- Fast math SFU: __expf ~4 cycles vs expf ~20 cycles; __frcp_rn for reciprocal
-- For bf16: load 8 values at once via reinterpret_cast<uint4*>, unpack to float for compute
+- HBM3e: 8 TB/s — use uint4 (128-bit) loads; L2 is cold (L2 cycling benchmark)
+- 142 SMs, 228 KB shared mem/SM, 255 regs/thread
+- __redux_sync_add: 1-cycle warp reduce vs __shfl_xor_sync chain ~5 cycles
+- Memory-bound: GPU is idle waiting for HBM. Compute-only changes won't help.
 
-## MEMORY-BOUND WARNING:
-This kernel is memory-bound — the GPU is idle waiting for HBM data most of the time.
-Compute tricks alone won't help. You MUST reduce memory traffic or overlap loads with compute.
-Key techniques: software pipelining (cp.async + double buffer), single-pass fusion, vectorized loads.
-
-## Full kernel source (headers expanded inline between === markers):
+## Naive reference kernel (starting point):
 ```cuda
 {kernel_slice}
 ```
