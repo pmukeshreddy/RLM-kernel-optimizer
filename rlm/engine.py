@@ -662,10 +662,10 @@ CRITICAL RULES:
             if roofline:
                 prompt_parts.append(f"### Roofline Analysis\n{roofline}")
 
-        # Blueprint for structural guidance during refinement
+        # Blueprint for structural guidance during refinement — always shown
         refine_blueprint = get_structural_blueprint(
             self.env.kernel_type, self.env.problem_shapes[0])
-        if refine_blueprint and parent.speedup < 1.4:
+        if refine_blueprint:
             prompt_parts.append(refine_blueprint)
 
         # Code + launch signature — model sees BOTH data and code
@@ -677,9 +677,14 @@ CRITICAL RULES:
             f"\n\n{launch_sig}")
 
         prompt_parts.append(
-            "Before calling submit_kernel, explain what the roofline analysis "
-            "shows is the gap and what STRUCTURAL change you'll make. Focus on "
-            "eliminating HBM traffic, not tweaking instructions.\n\n"
+            "Before calling submit_kernel, explain:\n"
+            "1. What the roofline gap is (your timing vs theoretical minimum)\n"
+            "2. What STRUCTURAL change eliminates the most HBM bytes\n"
+            "3. How many bytes of traffic your change removes\n\n"
+            "Example: \"Roofline shows 7% of peak BW. The kernel re-reads "
+            "residual_out from HBM (512KB wasted). I'll keep vals[8] in "
+            "registers across Phase 1→2, eliminating the re-read and saving "
+            "~1.0 us.\"\n\n"
             "Then call submit_kernel with your complete .cu file.")
 
         initial_prompt = "\n\n".join(prompt_parts)
