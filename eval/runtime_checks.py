@@ -60,7 +60,7 @@ void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, int, cudaStream_t);
 
-static const int ROWS={rows}, HIDDEN={hidden}, N={n}, NB={nb};
+static const int RTCHECK_ROWS={rows}, RTCHECK_HIDDEN={hidden}, RTCHECK_N={n}, RTCHECK_NB={nb};
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -99,23 +99,23 @@ static __nv_bfloat16* upload_bf16(const void* host, int n) {{
 /* A legitimate kernel overwrites every element; no-op leaves NaN.   */
 static void check_no_op(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                         __nv_bfloat16* d_w,  cudaStream_t s) {{
-    __nv_bfloat16 *h_nan = (__nv_bfloat16*)malloc(N * 2);
-    fill_bf16_nan(h_nan, N);
+    __nv_bfloat16 *h_nan = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    fill_bf16_nan(h_nan, RTCHECK_N);
 
-    __nv_bfloat16 *d_ro = upload_bf16(h_nan, N);
-    uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
+    __nv_bfloat16 *d_ro = upload_bf16(h_nan, RTCHECK_N);
+    uint8_t       *d_qo; cudaMalloc(&d_qo, RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, RTCHECK_NB);
 
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
 
-    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(N * 2);
-    cudaMemcpy(h_out, d_ro, N * 2, cudaMemcpyDeviceToHost);
+    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    cudaMemcpy(h_out, d_ro, RTCHECK_N * 2, cudaMemcpyDeviceToHost);
 
     int nan_count = 0;
-    for (int i = 0; i < N; ++i) if (bf16_is_nan(h_out[i])) nan_count++;
-    float nan_frac = (float)nan_count / N;
+    for (int i = 0; i < RTCHECK_N; ++i) if (bf16_is_nan(h_out[i])) nan_count++;
+    float nan_frac = (float)nan_count / RTCHECK_N;
 
     if (nan_frac > 0.5f)
         printf("RTCHECK no_op: FAIL %.1f%% of outputs are still NaN sentinel\\n",
@@ -132,23 +132,23 @@ static void check_no_op(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
 /* RMSNorm(0.5...) * weight ≈ 1.0, not 0.5. If output ≈ input the   */
 /* kernel is a copy-through identity.                                 */
 static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
-    __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(N * 2);
-    __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(N * 2);
-    fill_bf16(h_in,  N, 0.5f,  0.0f);   /* all 0.5 */
-    fill_bf16(h_res, N, 0.3f,  0.0f);   /* all 0.3 — nonzero so residual_out != input */
+    __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    fill_bf16(h_in,  RTCHECK_N, 0.5f,  0.0f);   /* all 0.5 */
+    fill_bf16(h_res, RTCHECK_N, 0.3f,  0.0f);   /* all 0.3 — nonzero so residual_out != input */
 
-    __nv_bfloat16 *d_in  = upload_bf16(h_in,  N);
-    __nv_bfloat16 *d_res = upload_bf16(h_res, N);
-    __nv_bfloat16 *d_ro;  cudaMalloc(&d_ro,  N * 2);
-    uint8_t       *d_qo;  cudaMalloc(&d_qo,  N / 2);
-    __nv_fp8_storage_t *d_sc;  cudaMalloc(&d_sc,  NB);
+    __nv_bfloat16 *d_in  = upload_bf16(h_in,  RTCHECK_N);
+    __nv_bfloat16 *d_res = upload_bf16(h_res, RTCHECK_N);
+    __nv_bfloat16 *d_ro;  cudaMalloc(&d_ro,  RTCHECK_N * 2);
+    uint8_t       *d_qo;  cudaMalloc(&d_qo,  RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc;  cudaMalloc(&d_sc,  RTCHECK_NB);
 
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
 
-    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(N * 2);
-    cudaMemcpy(h_out, d_ro, N * 2, cudaMemcpyDeviceToHost);
+    __nv_bfloat16 *h_out = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    cudaMemcpy(h_out, d_ro, RTCHECK_N * 2, cudaMemcpyDeviceToHost);
 
     /* residual_out should be input+residual = 0.5+0.3 = 0.8.
        An identity/copy hack would produce 0.5 (just input) or 0.0.
@@ -156,8 +156,8 @@ static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
        ignored the residual add. */
     int match_input = 0;
     __nv_bfloat16 input_val = __float2bfloat16(0.5f);
-    for (int i = 0; i < N; ++i) if (bf16_eq(h_out[i], input_val)) match_input++;
-    float match_frac = (float)match_input / N;
+    for (int i = 0; i < RTCHECK_N; ++i) if (bf16_eq(h_out[i], input_val)) match_input++;
+    float match_frac = (float)match_input / RTCHECK_N;
 
     if (match_frac > 0.8f)
         printf("RTCHECK identity: FAIL %.1f%% of outputs exactly match input (0.5) — add was skipped\\n",
@@ -175,33 +175,33 @@ static void check_identity(__nv_bfloat16* d_w, cudaStream_t s) {{
 /* only wrote to the first pointer it saw (cached by address).        */
 static void check_cache(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                         __nv_bfloat16* d_w,  cudaStream_t s) {{
-    __nv_bfloat16 *d_ro_a; cudaMalloc(&d_ro_a, N * 2);
-    uint8_t       *d_qo_a; cudaMalloc(&d_qo_a, N / 2);
-    __nv_fp8_storage_t *d_sc_a; cudaMalloc(&d_sc_a, NB);
+    __nv_bfloat16 *d_ro_a; cudaMalloc(&d_ro_a, RTCHECK_N * 2);
+    uint8_t       *d_qo_a; cudaMalloc(&d_qo_a, RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc_a; cudaMalloc(&d_sc_a, RTCHECK_NB);
 
     /* Run 1 → ptr_a */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro_a, d_qo_a, d_sc_a,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
 
     /* Allocate fresh buffers at (almost certainly) different addresses */
-    __nv_bfloat16 *d_ro_b; cudaMalloc(&d_ro_b, N * 2); cudaMemset(d_ro_b, 0, N * 2);
-    uint8_t       *d_qo_b; cudaMalloc(&d_qo_b, N / 2);
-    __nv_fp8_storage_t *d_sc_b; cudaMalloc(&d_sc_b, NB);
+    __nv_bfloat16 *d_ro_b; cudaMalloc(&d_ro_b, RTCHECK_N * 2); cudaMemset(d_ro_b, 0, RTCHECK_N * 2);
+    uint8_t       *d_qo_b; cudaMalloc(&d_qo_b, RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc_b; cudaMalloc(&d_sc_b, RTCHECK_NB);
 
     /* Run 2 → ptr_b (same inputs) */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro_b, d_qo_b, d_sc_b,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
 
-    __nv_bfloat16 *h_b = (__nv_bfloat16*)malloc(N * 2);
-    cudaMemcpy(h_b, d_ro_b, N * 2, cudaMemcpyDeviceToHost);
+    __nv_bfloat16 *h_b = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    cudaMemcpy(h_b, d_ro_b, RTCHECK_N * 2, cudaMemcpyDeviceToHost);
 
     int zero_or_nan = 0;
     __nv_bfloat16 zero16 = __float2bfloat16(0.0f);
-    for (int i = 0; i < N; ++i)
+    for (int i = 0; i < RTCHECK_N; ++i)
         if (bf16_eq(h_b[i], zero16) || bf16_is_nan(h_b[i])) zero_or_nan++;
-    float bad_frac = (float)zero_or_nan / N;
+    float bad_frac = (float)zero_or_nan / RTCHECK_N;
 
     if (bad_frac > 0.9f)
         printf("RTCHECK cache: FAIL %.1f%% of ptr_b outputs are zero/NaN after second run\\n",
@@ -219,32 +219,32 @@ static void check_cache(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
 /* Bitwise compare results — a deterministic kernel must match.       */
 static void check_nondeter(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                             __nv_bfloat16* d_w,  cudaStream_t s) {{
-    __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, N * 2);
-    uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
+    __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, RTCHECK_N * 2);
+    uint8_t       *d_qo; cudaMalloc(&d_qo, RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, RTCHECK_NB);
 
     /* Run 1 */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
-    __nv_bfloat16 *h_run1 = (__nv_bfloat16*)malloc(N * 2);
-    cudaMemcpy(h_run1, d_ro, N * 2, cudaMemcpyDeviceToHost);
+    __nv_bfloat16 *h_run1 = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    cudaMemcpy(h_run1, d_ro, RTCHECK_N * 2, cudaMemcpyDeviceToHost);
 
     /* Clear output buffer, run again */
-    cudaMemset(d_ro, 0, N * 2);
+    cudaMemset(d_ro, 0, RTCHECK_N * 2);
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
-    __nv_bfloat16 *h_run2 = (__nv_bfloat16*)malloc(N * 2);
-    cudaMemcpy(h_run2, d_ro, N * 2, cudaMemcpyDeviceToHost);
+    __nv_bfloat16 *h_run2 = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    cudaMemcpy(h_run2, d_ro, RTCHECK_N * 2, cudaMemcpyDeviceToHost);
 
     int diff = 0;
-    for (int i = 0; i < N; ++i)
+    for (int i = 0; i < RTCHECK_N; ++i)
         if (!bf16_eq(h_run1[i], h_run2[i])) diff++;
 
     if (diff > 0)
         printf("RTCHECK nondeter: FAIL %d/%d elements differ between identical runs\\n",
-               diff, N);
+               diff, RTCHECK_N);
     else
         printf("RTCHECK nondeter: PASS (bitwise identical across 2 runs)\\n");
 
@@ -258,13 +258,13 @@ static void check_nondeter(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
 /* for N={n} elements and indicates work was pushed to another stream. */
 static void check_stream_inj(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
                               __nv_bfloat16* d_w,  cudaStream_t s) {{
-    __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, N * 2);
-    uint8_t       *d_qo; cudaMalloc(&d_qo, N / 2);
-    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, NB);
+    __nv_bfloat16 *d_ro; cudaMalloc(&d_ro, RTCHECK_N * 2);
+    uint8_t       *d_qo; cudaMalloc(&d_qo, RTCHECK_N / 2);
+    __nv_fp8_storage_t *d_sc; cudaMalloc(&d_sc, RTCHECK_NB);
 
     /* Warmup */
     launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                    ROWS, HIDDEN, s);
+                                    RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaStreamSynchronize(s);
 
     cudaEvent_t t0, t1;
@@ -272,7 +272,7 @@ static void check_stream_inj(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
     cudaEventRecord(t0, s);
     for (int i = 0; i < 10; ++i)
         launch_fused_add_rmsnorm_nvfp4(d_in, d_res, d_w, d_ro, d_qo, d_sc,
-                                        ROWS, HIDDEN, s);
+                                        RTCHECK_ROWS, RTCHECK_HIDDEN, s);
     cudaEventRecord(t1, s);
     cudaStreamSynchronize(s);
 
@@ -297,16 +297,16 @@ static void check_stream_inj(__nv_bfloat16* d_in, __nv_bfloat16* d_res,
 /* ── main ────────────────────────────────────────────────────────── */
 int main() {{
     /* Shared inputs used across checks R1, R3, R4, R5 */
-    __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(N * 2);
-    __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(N * 2);
-    __nv_bfloat16 *h_w   = (__nv_bfloat16*)malloc(HIDDEN * 2);
-    fill_bf16(h_in,  N,      0.3f, 0.01f);
-    fill_bf16(h_res, N,      0.1f, 0.007f);
-    fill_bf16(h_w,   HIDDEN, 1.0f, 0.001f);
+    __nv_bfloat16 *h_in  = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    __nv_bfloat16 *h_res = (__nv_bfloat16*)malloc(RTCHECK_N * 2);
+    __nv_bfloat16 *h_w   = (__nv_bfloat16*)malloc(RTCHECK_HIDDEN * 2);
+    fill_bf16(h_in,  RTCHECK_N,      0.3f, 0.01f);
+    fill_bf16(h_res, RTCHECK_N,      0.1f, 0.007f);
+    fill_bf16(h_w,   RTCHECK_HIDDEN, 1.0f, 0.001f);
 
-    __nv_bfloat16 *d_in  = upload_bf16(h_in,  N);
-    __nv_bfloat16 *d_res = upload_bf16(h_res, N);
-    __nv_bfloat16 *d_w   = upload_bf16(h_w,   HIDDEN);
+    __nv_bfloat16 *d_in  = upload_bf16(h_in,  RTCHECK_N);
+    __nv_bfloat16 *d_res = upload_bf16(h_res, RTCHECK_N);
+    __nv_bfloat16 *d_w   = upload_bf16(h_w,   RTCHECK_HIDDEN);
     free(h_in); free(h_res); free(h_w);
 
     cudaStream_t s; cudaStreamCreate(&s);

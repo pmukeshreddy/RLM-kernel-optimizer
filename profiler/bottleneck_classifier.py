@@ -34,9 +34,12 @@ class BottleneckClassifier:
         if metrics.stall_memory >= self.latency_threshold:
             return Bottleneck.LATENCY_BOUND
 
-        # Low utilization on both axes → kernel is latency-bound
-        # (too small to saturate hardware, or stalled waiting for data)
+        # Low utilization on both axes (or fallback HybridProfiler running without NCU)
         if metrics.mem_throughput_pct < 30 and metrics.compute_throughput_pct < 30:
+            # Fallback heuristic using SASS metrics if available
+            if hasattr(metrics, '_compiler_metrics') and metrics._compiler_metrics:
+                if metrics._compiler_metrics.memory_instruction_ratio > 30.0:
+                    return Bottleneck.MEMORY_BOUND
             return Bottleneck.LATENCY_BOUND
 
         return Bottleneck.UNKNOWN
