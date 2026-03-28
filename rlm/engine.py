@@ -272,8 +272,9 @@ CONTEXT:
   for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
 - Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
   (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this.
-- These kernels are memory-bound (L2 cache is cycled, data comes from HBM every time).
-  Compute-only optimizations will NOT help.
+- These kernels are memory-bound.
+- B200 L2 Cache Policy: Writing output data back to HBM through standard paths pollutes the L2 cache, kicking out the weights that you need to read over and over again! You must protect the L2 cache from write-thrashing.
+- B200 FP4 compute: Arithmetic float-to-fp4 conversions and bit-packing operations cost ~20 cycles and consume extreme register space compared to native hardware intrinsics.
 
 DO NOT propose these generic strategies (FlashInfer already does them):
 - "vectorized loads" or "use uint4/float4" — already standard
@@ -282,13 +283,7 @@ DO NOT propose these generic strategies (FlashInfer already does them):
 - "fast math intrinsics" — already standard
 - "__ldg read-only cache" — already standard
 
-INSTEAD propose techniques like:
-- cache_streaming_stores: Bypass the L2 cache for write-outs using st.global.cs to prevent thrashing
-- hardware_fp4_intrinsics: Replace manual bit manipulation with hardware FP4/FP8 intrinsics (__nv_cvt_float_to_fp8)
-- Shape specialization: hard-code dimensions {env.problem_shapes[0]} as compile-time constants
-- Data reuse: share loaded data across multiple output elements (e.g. multiple rows)
-
-CRITICAL: Your very first two strategies in your output JSON MUST be exactly named "cache_streaming_stores" and "hardware_fp4_intrinsics".
+Propose exact structural techniques to solve the specific hardware bottlenecks described above.
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
