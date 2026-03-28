@@ -21,7 +21,8 @@ from .reflector import (
     _format_last_error_section, _format_delta_section,
     _compute_proven_ineffective,
 )
-from .blueprints import get_structural_blueprint, get_roofline_feedback
+from .blueprints import get_roofline_feedback
+from .rag_retriever import init_knowledge_base
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ class RLMEngine:
         self.refine_rounds = cfg["beam"]["refine_rounds"]
         self.combine_top_k = cfg["beam"]["combine_top_k"]
         self.max_tokens    = cfg["cost_control"]["max_tokens_per_sub_call"]
+        self.rag           = init_knowledge_base()
 
     # ── Low-level LLM call ────────────────────────────────────────────────────
 
@@ -363,8 +365,10 @@ Respond with ONLY the JSON array, nothing else."""
             system_prompt = _build_refine_system_prompt(0.0)
 
             shape_str = str(self.env.problem_shapes[0])
-            blueprint = get_structural_blueprint(
-                self.env.kernel_type, self.env.problem_shapes[0])
+            
+            # Query the RAG knowledge base generically based on the optimization description
+            rag_docs = self.rag.get_top_k(strat_desc, k=1)
+            
             prompt_parts = [
                 f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
                 f"Direction: {strat_desc}",
@@ -376,16 +380,17 @@ Respond with ONLY the JSON array, nothing else."""
                 "\nMemory-bound: L2 cache is cycled, data comes from HBM every iteration. "
                 "Compute-only optimizations won't help. You MUST reduce HBM traffic.",
             ]
-            if blueprint:
-                prompt_parts.append(f"\n{blueprint}")
+            
+            if rag_docs:
+                prompt_parts.append(f"\n### Relevant Knowledge (Apply these generic PTX/CUDA principles):\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n")
             prompt_parts.extend([
                 f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
-                "\nIMPORTANT: Follow the STRUCTURAL BLUEPRINT above. Do NOT just tweak "
+                "\nIMPORTANT: Synthesize an optimization based on the knowledge provided. Do NOT just tweak "
                 "the naive kernel — you must restructure the data flow.\n\n"
                 "Before calling submit_kernel, explain in 2-3 sentences:\n"
-                "1. What structural change you're making (refer to the blueprint)\n"
+                "1. What structural transformation you are applying\n"
                 "2. How many bytes of HBM traffic this eliminates\n\n"
                 "Then call submit_kernel with your complete .cu file.",
             ])
@@ -474,8 +479,12 @@ Respond with ONLY the JSON array, nothing else."""
         # ── One-shot fallback (no profile_fn or no description) ──────────
         if strat_desc:
             shape_str = str(self.env.problem_shapes[0])
-            oneshot_blueprint = get_structural_blueprint(
-                self.env.kernel_type, self.env.problem_shapes[0])
+            
+            rag_docs = self.rag.get_top_k(strat_desc, k=1)
+            kb_snippet = ""
+            if rag_docs:
+                kb_snippet = f"\n### Relevant Knowledge:\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n"
+                
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -496,7 +505,7 @@ hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
 - __redux_sync_add: 1-cycle warp reduce vs __shfl_xor_sync chain ~5 cycles
 - Memory-bound: GPU is idle waiting for HBM. Compute-only changes won't help.
 
-{oneshot_blueprint}
+{kb_snippet}
 
 ## Naive reference kernel (starting point):
 ```cuda
@@ -505,7 +514,7 @@ hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
 
 {launch_sig}
 
-IMPORTANT: Follow the STRUCTURAL BLUEPRINT above. Do NOT just tweak the naive kernel.
+IMPORTANT: Apply the optimization logically. Do NOT just tweak the naive kernel.
 Restructure the data flow to eliminate unnecessary HBM traffic.
 
 CRITICAL RULES:
@@ -662,11 +671,12 @@ CRITICAL RULES:
             if roofline:
                 prompt_parts.append(f"### Roofline Analysis\n{roofline}")
 
-        # Blueprint for structural guidance during refinement — always shown
-        refine_blueprint = get_structural_blueprint(
-            self.env.kernel_type, self.env.problem_shapes[0])
-        if refine_blueprint:
-            prompt_parts.append(refine_blueprint)
+        # Query RAG using profiler bottleneck data + strategy text
+        bottleneck = metrics.get("bottleneck", "unknown")
+        query = f"{bottleneck} {parent.strategy} {strat_ctx}"
+        rag_docs = self.rag.get_top_k(query, k=1)
+        if rag_docs:
+            prompt_parts.append(f"### Relevant Knowledge retrieved for bottleneck '{bottleneck}':\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n")
 
         # Code + launch signature — model sees BOTH data and code
         base_code = parent.best_code or parent.code

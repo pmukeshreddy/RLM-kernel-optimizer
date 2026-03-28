@@ -127,6 +127,16 @@ STRATEGY_BANK: dict = {
         priority=8,
         applicable_kernels=["nvfp4_quantize", "silu_mul", "add_rmsnorm"],
     ),
+    "cache_streaming_stores": Strategy(
+        name="cache_streaming_stores",
+        display_name="Cache-Streaming PTX Stores",
+        description="Bypass the L2 cache allocation for pure write-outs (like quantization blocks) "
+                    "using inline PTX cache-streaming modifiers. This prevents L2 cache thrashing "
+                    "when outputs are never read back by the same kernel.",
+        targets_bottleneck=["memory_bound"],
+        priority=12,
+        applicable_kernels=["nvfp4_quantize", "silu_mul", "add_rmsnorm"],
+    ),
     # ── Hackathon-winning strategies (from B200 NVFP4 competition analysis) ──
     "launch_bounds_low_regs": Strategy(
         name="launch_bounds_low_regs",
@@ -161,16 +171,16 @@ STRATEGY_BANK: dict = {
         priority=12,
         applicable_kernels=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
     ),
-    "multi_row_per_block": Strategy(
-        name="multi_row_per_block",
-        display_name="Multi-Row Per Block",
-        description="Process 2-4 rows per thread block instead of 1. Amortizes shared "
-                    "data loads (weight vector, scales) across rows — each extra row "
-                    "saves one full weight vector read from HBM. Use blockIdx.x for "
-                    "row groups, distribute rows across warps within the block",
+    "multi_row_processing": Strategy(
+        name="multi_row_processing",
+        display_name="Multi-Row (Thread Coarsening) Processing",
+        description="Process multiple rows within a single thread block instead of just one row. "
+                    "This amortizes shared data loads (like shared weight vectors or scales) "
+                    "across rows because the L1 cache retains the fetched weights for all warps "
+                    "handling the parallel rows, drastically cutting L1/L2 read bandwidth.",
         targets_bottleneck=["memory_bound"],
         priority=10,
-        applicable_kernels=["add_rmsnorm"],  # only kernel with shared weight vector
+        applicable_kernels=["add_rmsnorm", "silu_mul", "nvfp4_quantize"],
     ),
 }
 
@@ -183,9 +193,9 @@ KERNEL_IDEAL_STRATEGIES: dict = {
     "add_rmsnorm": [
         "shape_specialized_unroll",   # #1 advantage over FlashInfer
         "launch_bounds_low_regs",     # maximize occupancy for memory-bound
-        "hardware_fp4_intrinsics",    # replace manual bit math
+        "cache_streaming_stores",     # bypass L2 write cache thrashing
         "fuse_passes",                # eliminate redundant global mem round-trip
-        "multi_row_per_block",        # amortize weight loads across rows
+        "multi_row_processing",       # amortize weight loads across rows
         "vectorize_loads",            # 128-bit coalesced bf16 loads
     ],
     "silu_mul": [

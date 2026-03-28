@@ -52,13 +52,15 @@ class BottleneckClassifier:
         advice = {
             Bottleneck.MEMORY_BOUND: (
                 f"Memory bound at {metrics.mem_throughput_pct:.1f}% bandwidth. "
-                f"L2 hit={metrics.l2_hit_rate:.1f}%. "
-                "Try: TMA prefetch, float4 vectorization, improve L2 reuse."
+                "CUDAMaster Diagnosis: If writing heavily to HBM without reading back, L2 cache allocation thrashing is occurring. "
+                "If reading a shared weight vector across blocks, L1 read bandwidth is saturated. "
+                "Consider RAG queries: Cache-Streaming Stores (st.global.cs), or Multi-Row Processing."
             ),
             Bottleneck.COMPUTE_BOUND: (
                 f"Compute bound at {metrics.compute_throughput_pct:.1f}% throughput. "
                 f"Occupancy={metrics.sm_occupancy:.1f}%. "
-                "Try: register tiling, ILP increase, reduce register spills."
+                "CUDAMaster Diagnosis: SM instructions (FADD/FMUL/Bitwise) are dominating. "
+                "Consider RAG queries: Blackwell PTX Intrinsics, Thread Coarsening, Fast Math."
             ),
             Bottleneck.SYNC_BOUND: (
                 f"Sync bound: {metrics.stall_barrier:.1f}% barrier stalls. "
