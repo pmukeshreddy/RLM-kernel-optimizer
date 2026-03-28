@@ -353,7 +353,6 @@ Respond with ONLY the JSON array, nothing else."""
 
         # ── Tool-use path: compile/test/iterate like refinement ──────────
         if profile_fn and strat_desc:
-            constraint = _constraint_for_speedup(0.0)  # round 0 = aggressive
             system_prompt = _build_refine_system_prompt(0.0)
 
             shape_str = str(self.env.problem_shapes[0])
