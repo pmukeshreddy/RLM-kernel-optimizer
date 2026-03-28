@@ -27,3 +27,7 @@ uint8_t hi = float_to_nvfp4(val1);
 uint8_t packed = (hi << 4) | (lo & 0xF); 
 ```
 *(If the exact hardware intrinsic wrapper for e2m1 is missing in the header, fall back to branching, but ensure the E4M3 scale generation ALWAYS uses the `__nv_cvt_float_to_fp8` intrinsic.)*
+
+### ⚠️ CRITICAL DEADLOCK WARNING ⚠️
+Because this intrinsic requires generating a shared 'scale' for the block or warp, you will likely need to use `__shfl_xor_sync` or `__shfl_down_sync` to find the maximum value. 
+**DO NOT** place warp shuffle functions (`__shfl_*`) or `__syncthreads()` inside divergent `if` conditions (e.g., `if (tid < N)`). If threads in a warp diverge before the sync instruction, the GPU will permanently deadlock (Kernel hung timeout) and your strategy will be discarded with a 0.0x speedup! Always compute warp reductions unconditionally using the `0xffffffff` mask.
