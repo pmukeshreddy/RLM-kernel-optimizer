@@ -373,9 +373,7 @@ Respond with ONLY the JSON array, nothing else."""
                 f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
-                "\nIMPORTANT: Synthesize an optimization based on the knowledge provided. Do NOT just tweak "
-                "the naive kernel — you must restructure the data flow.\n\n"
-                "Before calling submit_kernel, explain in 2-3 sentences:\n"
+                "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
                 "1. What your planned change is\n"
                 "2. Why it addresses the specific performance metrics without breaking correctness\n\n"
                 "Then call submit_kernel with your complete .cu file.",
@@ -652,8 +650,10 @@ CRITICAL RULES:
             f"\n\n{launch_sig}")
 
         prompt_parts.append(
+            "Make ONE targeted change per submission so you can measure its impact. "
+            "Do not bundle multiple unrelated optimizations.\n\n"
             "Before calling submit_kernel, explain:\n"
-            "1. What your change is and why you expect it to help based on the metrics.\n\n"
+            "1. What single change you are making and why you expect it to help.\n\n"
             "Then call submit_kernel with your complete .cu file.")
 
         initial_prompt = "\n\n".join(prompt_parts)
