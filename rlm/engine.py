@@ -21,7 +21,6 @@ from .reflector import (
     _format_last_error_section, _format_delta_section,
     _compute_proven_ineffective,
 )
-from .blueprints import get_roofline_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -256,11 +255,6 @@ class RLMEngine:
         # Build baseline profiler context for strategy selection
         baseline_context = ""
         if env.baseline_naive_us and env.baseline_us_reported:
-            from .blueprints import get_roofline_feedback
-            roofline = get_roofline_feedback(
-                env.kernel_type, env.problem_shapes[0],
-                env.baseline_naive_us, 1.0,
-            )
             rows = env.problem_shapes[0][0]
             sm_count = env.hw_spec.get("sm", {}).get("count", 148)
             cm = env.baseline_compiler_metrics
@@ -272,7 +266,6 @@ class RLMEngine:
                 f"  Compiler: {cm_str}\n"
                 f"  Grid: {rows} blocks launched on {sm_count} SMs"
                 f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
-                f"  {roofline}\n"
             )
         if not baseline_context:
             baseline_context = "BASELINE PROFILER DATA: unavailable — analyze kernel source to infer bottleneck type.\n"
@@ -661,15 +654,6 @@ CRITICAL RULES:
 
         prompt_parts.append(f"Observation:\n{observation}")
 
-        # Roofline feedback for current timing
-        timing_us = metrics.get("duration_us", 0)
-        if timing_us > 0:
-            roofline = get_roofline_feedback(
-                self.env.kernel_type, self.env.problem_shapes[0],
-                timing_us, parent.speedup)
-            if roofline:
-                prompt_parts.append(f"### Roofline Analysis\n{roofline}")
-
         # Code + launch signature — model sees BOTH data and code
         base_code = parent.best_code or parent.code
         base_speedup = parent.best_speedup or parent.speedup
@@ -680,13 +664,7 @@ CRITICAL RULES:
 
         prompt_parts.append(
             "Before calling submit_kernel, explain:\n"
-            "1. What the roofline gap is (your timing vs theoretical minimum)\n"
-            "2. What STRUCTURAL change eliminates the most HBM bytes\n"
-            "3. How many bytes of traffic your change removes\n\n"
-            "Example: \"Roofline shows 7% of peak BW. The kernel re-reads "
-            "residual_out from HBM (512KB wasted). I'll keep vals[8] in "
-            "registers across Phase 1→2, eliminating the re-read and saving "
-            "~1.0 us.\"\n\n"
+            "1. What your change is and why you expect it to help based on the metrics.\n\n"
             "Then call submit_kernel with your complete .cu file.")
 
         initial_prompt = "\n\n".join(prompt_parts)
@@ -859,15 +837,6 @@ CRITICAL RULES:
         else:
             # First submission — show full profiler snapshot
             parts.append(_format_profile_section(metrics, 0))
-
-        # Roofline analysis — show how far from theoretical minimum
-        timing_us = metrics.get("duration_us", 0)
-        if timing_us > 0:
-            roofline = get_roofline_feedback(
-                self.env.kernel_type, self.env.problem_shapes[0],
-                timing_us, speedup)
-            if roofline:
-                parts.append(f"\n### Roofline Analysis\n{roofline}")
 
         # Data-driven suggestions for remaining bottlenecks
         suggestions = _format_suggestions_section(
