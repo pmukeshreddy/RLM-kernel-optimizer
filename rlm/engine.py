@@ -283,16 +283,12 @@ DO NOT propose these generic strategies (FlashInfer already does them):
 - "__ldg read-only cache" — already standard
 
 INSTEAD propose techniques like:
-- Shape specialization: hard-code dimensions {env.problem_shapes[0]} as compile-time
-  constants, fully unroll all loops to exact trip counts, eliminate every branch
-- __launch_bounds__ with low register budget (32-48 regs): maximize occupancy for
-  memory-bound kernels — higher occupancy hides HBM latency better
-- Hardware FP4/FP8 intrinsics: replace manual bit manipulation with __nv_cvt_float_to_fp8,
-  hardware FP4 packing — single-cycle vs ~20 instructions
-- Optimal launch config: tune block size and items-per-thread for this exact problem size
+- cache_streaming_stores: Bypass the L2 cache for write-outs using st.global.cs to prevent thrashing
+- hardware_fp4_intrinsics: Replace manual bit manipulation with hardware FP4/FP8 intrinsics (__nv_cvt_float_to_fp8)
+- Shape specialization: hard-code dimensions {env.problem_shapes[0]} as compile-time constants
 - Data reuse: share loaded data across multiple output elements (e.g. multiple rows)
-- Register-only datapath: all computation in registers, no shared memory intermediates
-- Vectorized packed stores: accumulate FP4 output into uint2/uint4, store in one transaction
+
+CRITICAL: Your very first two strategies in your output JSON MUST be exactly named "cache_streaming_stores" and "hardware_fp4_intrinsics".
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
