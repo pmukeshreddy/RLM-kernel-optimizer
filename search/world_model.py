@@ -80,27 +80,6 @@ CONTEXT:
 - Competition: FlashInfer — already well-optimized for general use.
   Your advantage: FlashInfer targets many GPUs/shapes. You target ONE GPU + ONE shape.
 - These kernels are memory-bound (L2 cache cycled, data from HBM every time).
-  Compute-only optimizations will NOT help.
-
-DO NOT propose these generic strategies (FlashInfer already does them, score=0):
-- "vectorized loads" / "use uint4/float4" — already standard in FlashInfer
-- "warp shuffle reduction" / "__shfl_xor_sync" — already standard
-- "single pass fusion" — already standard
-- "fast math intrinsics" / "__expf" — already standard
-- "__ldg read-only cache" — already standard
-These will NOT beat FlashInfer. Score them 0.0 if you include them.
-
-INSTEAD propose techniques that EXPLOIT your unique advantages:
-- Shape specialization: hard-code dimensions {self.problem_shape} as compile-time
-  constants, fully unroll all loops to exact trip counts, eliminate every branch
-- __launch_bounds__ with low register budget (32-48 regs): maximize occupancy for
-  memory-bound kernels — higher occupancy hides HBM latency better
-- Hardware FP4/FP8 intrinsics: __nv_cvt_float_to_fp8, hardware FP4 packing —
-  single-cycle vs ~20 instructions of manual bit manipulation
-- Optimal launch config: tune block size and items-per-thread for this exact problem size
-- Multi-row per block: share loaded data (weights, scales) across rows
-- Vectorized packed stores: accumulate FP4 output into uint2/uint4, store in one transaction
-- Register-only datapath: all computation in registers, no shared memory intermediates
 
 ```cuda
 {self.kernel_src}
@@ -175,22 +154,16 @@ You are the world model for a CUDA kernel optimization search.
 ## Instructions:
 Based on the profiler results, update the search tree:
 
-IMPORTANT: Do NOT propose generic strategies that FlashInfer already does (vectorized loads,
-warp shuffles, fast math, __ldg). These score 0. Instead propose strategies that exploit
-shape specialization ({self.problem_shape}), hardware intrinsics, launch config tuning,
-__launch_bounds__, or multi-row data reuse.
-
 1. UPDATES: Re-score existing OPEN strategies based on what we learned.
    - If a sibling strategy succeeded, related approaches should score higher.
    - If a strategy failed with specific errors, lower its score.
-   - Generic strategies (vectorized loads, warp shuffles) should be scored 0.0.
-   - Shape-specialized and hardware-intrinsic strategies should score highest.
+   - If profiler shows the kernel is memory-bound with 0% vectorized loads,
+     strategies targeting memory access should score higher.
 
 2. INSERTS: Propose 1-3 NEW strategies as children of successful (CLOSED) nodes.
    - Each new strategy should build ON TOP of the parent's optimization.
    - Focus on what the profiler data reveals as the remaining bottleneck.
    - New strategies must be DIFFERENT from existing tree nodes.
-   - Do NOT insert generic strategies — only shape-specific or hardware-specific ones.
 
 3. DELETES: Remove OPEN strategies that are now clearly wrong or dominated.
    - Only delete leaf nodes with no children.
