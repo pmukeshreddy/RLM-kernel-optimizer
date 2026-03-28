@@ -328,14 +328,8 @@ Respond with ONLY the JSON array, nothing else."""
                 pass
 
         if strategies:
-            # Force inclusion of the bleeding-edge Blackwell RAG methods to guarantee they are explored
-            from search.strategy_bank import STRATEGY_BANK
-            for hw_strat in ["cache_streaming_stores", "hardware_fp4_intrinsics"]:
-                if hw_strat in STRATEGY_BANK and not any(s.get("name") == hw_strat for s in strategies):
-                    strategies.insert(0, {"name": hw_strat, "what": STRATEGY_BANK[hw_strat].description})
-            
             names = [s["name"] for s in strategies]
-            logger.info("Strategies including forced Blackwell techniques (%d): %s", len(names), names)
+            logger.info("LLM-proposed strategies (%d): %s", len(names), names)
             return strategies  # return ALL — caller splits active vs reserve
 
         # Fallback: use kernel-aware defaults from strategy bank
