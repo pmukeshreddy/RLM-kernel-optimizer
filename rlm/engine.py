@@ -716,6 +716,12 @@ CRITICAL RULES:
                              parent.strategy, turn, e)
                 break
 
+            # Extract and log model's reasoning/thoughts
+            text_blocks = [b.text for b in response.content if hasattr(b, 'text') and b.text.strip()]
+            if text_blocks:
+                reasoning = "\n".join(text_blocks)
+                logger.info("\n🧠 MODEL THOUGHTS [%s turn %d]:\n%s\n", parent.strategy, turn, reasoning)
+
             # Append assistant message to conversation history
             messages.append({"role": "assistant", "content": response.content})
 
@@ -761,11 +767,15 @@ CRITICAL RULES:
                 {"type": "tool_result", "tool_use_id": tool_block.id,
                  "content": tool_result_text}
             ]})
+            
+            logger.info("\n📊 FEEDBACK QUALITY DELIVERED [%s turn %d]:\n%s\n", parent.strategy, turn, tool_result_text)
 
-            logger.info("REFINE [%s] turn %d: compile=%s correct=%s speedup=%.3fx",
+            new_spd = result.get("speedup", 0)
+            delta = new_spd - parent.speedup
+            logger.info("📈 IMPROVEMENT TRACKER [%s turn %d]: compile=%s correct=%s | Base=%.3fx -> New=%.3fx (Delta: %+.3fx)",
                          parent.strategy, turn,
                          result["compile_ok"], result["correct"],
-                         result.get("speedup", 0))
+                         parent.speedup, new_spd, delta)
 
             # Track best viable result
             if result["compile_ok"] and result["correct"]:
