@@ -15,8 +15,7 @@ import anthropic
 from anthropic import AsyncAnthropic
 
 from .environment import RLMEnvironment, KernelCandidate
-from .root_prompts import SYSTEM_PROMPT, decompose_prompt, combine_prompt
-from .sub_prompts import get_prompt_for_strategy
+from .root_prompts import SYSTEM_PROMPT, combine_prompt
 from .reflector import (
     _get_launch_signature, _format_profile_section,
     _format_suggestions_section, _format_react_trace,
@@ -124,11 +123,7 @@ Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - L2 cache: 126 MB — benchmark uses L2 cache cycling (data is COLD every iteration)
 - 142 SMs, 228 KB shared memory per SM, 255 registers per thread
 - 128-bit load/store = uint4 = 8 bf16 values per transaction
-- __redux_sync_add: single-instruction warp reduction
-- cp.async.bulk: async HBM→shared memory copy
-- Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
-- __nv_cvt_float2_to_fp4x2(float2, __NV_E2M1, cudaRoundNearest): hardware float2→packed FP4. Requires #include <cuda_fp4.h>
-- __nv_fp8_e4m3 type: hardware FP8 E4M3. float→fp8: __nv_fp8_e4m3(float_val). fp8→float: float(fp8_val). There is NO __nv_cvt_fp8_to_float function. Requires #include <cuda_fp8.h>
+- Use read_file to check available hardware intrinsics in the project headers
 
 Before EVERY submit_kernel call, explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
@@ -354,12 +349,15 @@ Respond with ONLY the JSON array, nothing else."""
             logger.info("LLM-proposed strategies (%d): %s", len(names), names)
             return strategies  # return ALL — caller splits active vs reserve
 
-        # Fallback: use kernel-aware defaults from strategy bank
-        from search.strategy_bank import select_for_kernel, STRATEGY_BANK
-        fallback = select_for_kernel(
-            kernel_type=env.kernel_type, tried=[], beam_width=num_strategies)
-        logger.info("Fallback to kernel-aware strategies: %s", fallback)
-        return [{"name": s, "what": STRATEGY_BANK[s].description} for s in fallback if s in STRATEGY_BANK]
+        # Fallback: generic strategies if LLM response couldn't be parsed
+        logger.warning("Could not parse LLM strategy response, using generic fallback")
+        generic = [
+            {"name": "optimization_a", "what": "Analyze kernel and apply the most impactful optimization"},
+            {"name": "optimization_b", "what": "Try a different optimization approach than beam A"},
+            {"name": "optimization_c", "what": "Try a third independent optimization approach"},
+            {"name": "optimization_d", "what": "Try a fourth independent optimization approach"},
+        ]
+        return generic[:num_strategies]
 
     # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
 
@@ -529,13 +527,20 @@ CRITICAL RULES:
    helper functions that aren't defined in the headers.
 """
         else:
-            # Legacy mode: use strategy bank prompts for refinement rounds
-            prompt = get_prompt_for_strategy(
-                strategy=strat_name,
-                kernel_slice=kernel_slice,
-                hw_spec=self.env.hw_spec,
-                current_metrics=current_metrics,
-            )
+            # No strategy description — use minimal prompt
+            prompt = f"""\
+You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
+
+Apply the "{strat_name}" optimization to this kernel:
+
+```cuda
+{kernel_slice}
+```
+
+{launch_sig}
+
+Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
+"""
 
         try:
             response, _, _ = await self._call_llm_async(
