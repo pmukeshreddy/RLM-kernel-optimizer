@@ -114,22 +114,32 @@ class HybridProfiler:
         # ── 2. Speedup ───────────────────────────────────────────────────
         speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 1.0
 
-        # ── 3. Build KernelMetrics (only real fields) ─────────────────────
+        # ── 3. Compute mem_throughput_pct from roofline math ────────────
+        mem_throughput_pct = 0.0
+        peak_bw_tbs = self.hw_spec.get("memory", {}).get("hbm_bandwidth_tbs", 8.0)
+        total_bytes = self._estimate_transfer_bytes(kernel_type, problem_shape)
+        if total_bytes > 0 and timing_us > 0:
+            achieved_bw = total_bytes / timing_us / 1e6  # TB/s
+            mem_throughput_pct = achieved_bw / peak_bw_tbs * 100
+
+        # ── 4. Build KernelMetrics ────────────────────────────────────────
         metrics = KernelMetrics(
             sm_occupancy=round(gpu_occupancy, 2),
             achieved_occupancy=round(gpu_occupancy * self.max_warps_per_sm / 100.0, 2),
             duration_us=timing_us,
             speedup=speedup,
+            mem_throughput_pct=round(mem_throughput_pct, 2),
         )
 
         # Attach compiler metrics for the reflection prompt
         metrics._compiler_metrics = cm
 
-        # ── 4. Log real data ──────────────────────────────────────────────
+        # ── 5. Log real data ──────────────────────────────────────────────
         log_parts = [
             f"occ={gpu_occupancy:.1f}%",
             f"timing={timing_us:.1f}us",
             f"speedup={speedup:.3f}x",
+            f"mem_bw={mem_throughput_pct:.1f}%",
         ]
         if cm.registers_per_thread > 0:
             log_parts.append(f"regs={cm.registers_per_thread}")
@@ -141,6 +151,23 @@ class HybridProfiler:
 
         logger.info("Hybrid profiler: %s", " ".join(log_parts))
         return metrics
+
+    # ── Transfer Bytes Estimation ─────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_transfer_bytes(kernel_type: str, problem_shape: tuple) -> int:
+        """Estimate total HBM bytes transferred (same math as get_roofline_feedback)."""
+        if kernel_type == "add_rmsnorm":
+            rows, hidden = problem_shape
+            n = rows * hidden
+            return n * 2 + n * 2 + hidden * 2 + n * 2 + n // 2 + n // 16 + n * 2
+        elif kernel_type == "silu_mul":
+            n = problem_shape[0] * problem_shape[1] * problem_shape[2] if len(problem_shape) == 3 else problem_shape[0]
+            return n * 2 * 2 + n // 2 + n // 16
+        elif kernel_type == "nvfp4_quantize":
+            n = problem_shape[0] * problem_shape[1] if len(problem_shape) == 2 else problem_shape[0]
+            return n * 2 + n // 2 + n // 16
+        return 0
 
     # ── Launch Config Parsing ──────────────────────────────────────────────
 
