@@ -22,7 +22,6 @@ from .reflector import (
     _compute_proven_ineffective,
 )
 from .blueprints import get_roofline_feedback
-from .rag_retriever import init_knowledge_base
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +86,7 @@ Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - cp.async.bulk: zero-overhead async HBM→shared memory copy (no register file pressure)
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
 
-These kernels are MEMORY-BOUND — data comes from HBM every iteration (L2 cold).
-Compute-only changes (faster math, ILP) will NOT improve timing.
-You must reduce total memory traffic, overlap memory with compute, or increase
-memory bus utilization (vectorized loads, coalescing, fewer transactions).
+
 
 Before EVERY submit_kernel call, explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
@@ -146,7 +142,6 @@ class RLMEngine:
         self.refine_rounds = cfg["beam"]["refine_rounds"]
         self.combine_top_k = cfg["beam"]["combine_top_k"]
         self.max_tokens    = cfg["cost_control"]["max_tokens_per_sub_call"]
-        self.rag           = init_knowledge_base()
 
     # ── Low-level LLM call ────────────────────────────────────────────────────
 
@@ -296,21 +291,19 @@ CONTEXT:
   for general use. Standard CUDA best practices will only match FlashInfer, not beat it.
 - Your advantage: FlashInfer targets many GPUs and arbitrary shapes. You target ONE GPU
   (B200) and ONE shape ({env.problem_shapes[0]}). Exploit this.
-- Use the profiler data below to determine whether this kernel is memory-bound, latency-bound, or compute-bound. Do NOT assume memory-bound.
-- B200 L2 Cache Policy: Writing output data back to HBM through standard paths pollutes the L2 cache, kicking out the weights that you need to read over and over again! You must protect the L2 cache from write-thrashing.
-- B200 FP4 compute: Arithmetic float-to-fp4 conversions and bit-packing operations cost ~20 cycles and consume extreme register space compared to native hardware intrinsics.
+- Use the profiler data below to determine whether this kernel is memory-bound, latency-bound, or compute-bound.
 
 {baseline_context}
 
-DO NOT propose these generic strategies (FlashInfer already does them):
-- "vectorized loads" or "use uint4/float4" — already standard
-- "warp shuffle reduction" — already standard
-- "single pass fusion" — already standard
-- "fast math intrinsics" — already standard
-- "__ldg read-only cache" — already standard
+Step 1: Ensure basic optimizations are saturated (vectorization, fast math, shared memory cache).
+Step 2: Apply ONE extreme, shape-specialized orthogonal architecture strategy from the following list to surpass FlashInfer...
 
 Propose exact structural techniques to solve the specific hardware bottlenecks described above.
-CRITICAL: You must order your strategy list by importance. Place strategies that address the ACTUAL bottleneck shown in the profiler data at the very top of your JSON array, otherwise they will not strictly be evaluated!
+CRITICAL: To ensure our optimizations stack multiplicatively, your generated strategies MUST map to these exact categories in order:
+1. Memory Hierarchy (L2, Async Bulk, Streaming)
+2. Compute Latency (Intrinsics, ILP)
+3. Structural Control Flow (Unrolling, Branchless logic)
+4. Resource Occupancy (SMem sharing, Block dimensions)
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
@@ -321,7 +314,6 @@ Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs, 228KB
 ```
 
 For each optimization, give a short name and one-line description of what to do.
-Each strategy should be FUNDAMENTALLY DIFFERENT — not variations of the same idea.
 
 Return as a JSON array of objects, most impactful first:
 [
@@ -384,27 +376,16 @@ Respond with ONLY the JSON array, nothing else."""
 
             shape_str = str(self.env.problem_shapes[0])
             
-            # Query the RAG knowledge base generically based on the optimization description
-            rag_docs = self.rag.get_top_k(strat_desc, k=1)
-            
             prompt_parts = [
                 f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
                 f"Direction: {strat_desc}",
                 f"\nProblem shape: {shape_str} (FIXED — hard-code ALL dimensions as compile-time constants).",
                 "\nYour speedup is measured against FlashInfer — a production GPU library "
                 "already well-optimized for general use. Your advantage: FlashInfer targets "
-                "many GPUs and arbitrary shapes, while you target ONE GPU (B200) and ONE shape. "
+                "many GPUs and arbitrary shapes. You target ONE GPU (B200) and ONE shape. "
                 "Exploit shape specialization and B200-specific hardware features.",
-                "\nMemory-bound: L2 cache is cycled, data comes from HBM every iteration. "
-                "Compute-only optimizations won't help. You MUST reduce HBM traffic.",
-                "\nUNIVERSAL MANDATE: Regardless of your specific Direction, you are NOT restricted to a single edit! "
-                "You MUST always restructure the code to use vectorized memory access (uint4/float4 128-bit loads) "
-                "and ensure high SM occupancy (e.g., using multiple threads/blocks). Without vectorized reads, "
-                "the B200 memory controllers will throttle instantly to 10% bandwidth.",
             ]
             
-            if rag_docs:
-                prompt_parts.append(f"\n### Relevant Knowledge (Apply these generic PTX/CUDA principles):\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n")
             prompt_parts.extend([
                 f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
@@ -502,11 +483,7 @@ Respond with ONLY the JSON array, nothing else."""
         if strat_desc:
             shape_str = str(self.env.problem_shapes[0])
             
-            rag_docs = self.rag.get_top_k(strat_desc, k=1)
             kb_snippet = ""
-            if rag_docs:
-                kb_snippet = f"\n### Relevant Knowledge:\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n"
-                
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -693,13 +670,6 @@ CRITICAL RULES:
             if roofline:
                 prompt_parts.append(f"### Roofline Analysis\n{roofline}")
 
-        # Query RAG using profiler bottleneck data + strategy text
-        bottleneck = metrics.get("bottleneck", "unknown")
-        query = f"{bottleneck} {parent.strategy} {strat_ctx}"
-        rag_docs = self.rag.get_top_k(query, k=1)
-        if rag_docs:
-            prompt_parts.append(f"### Relevant Knowledge retrieved for bottleneck '{bottleneck}':\n**{rag_docs[0]['title']}**\n{rag_docs[0]['content']}\n")
-
         # Code + launch signature — model sees BOTH data and code
         base_code = parent.best_code or parent.code
         base_speedup = parent.best_speedup or parent.speedup
@@ -726,7 +696,7 @@ CRITICAL RULES:
         messages = [{"role": "user", "content": initial_prompt}]
         best = None              # best KernelCandidate from inner loop
         last_error = ""
-        prev_inner_metrics = None  # for SASS deltas between submissions
+        prev_inner_metrics = metrics  # initialize to parent metrics for turn 0 deltas
 
         for turn in range(MAX_INNER_TURNS):
             try:

@@ -633,22 +633,33 @@ int main(int argc, char** argv) {{
                 if id(s) not in prev_survivor_ids:
                     s.prev_metrics = s.metrics
 
-        # ── Final: Combine top-2 ───────────────────────────────────────────
+        # ── Final: Combine Orthogonal Survivors (Tournament Bracket) ─────────────
         top_for_combine = self.selector.select_for_combination(survivors)
-        logger.info("Combining %d top beams", len(top_for_combine))
+        logger.info("Combining %d top beams via Tournament Bracket", len(top_for_combine))
 
-        if len(top_for_combine) >= 2:
-            final = self.engine.combine(top_for_combine)
-            m     = self._profile_candidate(final, problem_shape, baseline_us)
-            best_survivor = max(survivors, key=lambda c: c.speedup) if survivors else None
-            if best_survivor and final.speedup < best_survivor.speedup * 0.95:
-                logger.warning("Combination regressed (%.3fx < %.3fx) — reverting",
-                               final.speedup, best_survivor.speedup)
-                final = best_survivor
-        else:
-            final = (top_for_combine[0] if top_for_combine
-                     else survivors[0] if survivors
-                     else candidates[0])
+        current_pool = top_for_combine
+        while len(current_pool) > 1:
+            next_pool = []
+            for i in range(0, len(current_pool), 2):
+                if i + 1 < len(current_pool):
+                    merged = self.engine.combine([current_pool[i], current_pool[i+1]])
+                    self._profile_candidate(merged, problem_shape, baseline_us)
+                    
+                    # If regression or compilation failure, fallback to the best parent of the pair
+                    best_parent = max(current_pool[i], current_pool[i+1], key=lambda c: c.speedup)
+                    if not merged.compile_ok or merged.speedup < best_parent.speedup * 0.95:
+                        logger.warning("Merge regressed (%.3fx < %.3fx) — reverting to best parent", 
+                                       merged.speedup, best_parent.speedup)
+                        next_pool.append(best_parent)
+                    else:
+                        logger.info("Merge succeeded! Speedup compounded: %.3fx", merged.speedup)
+                        next_pool.append(merged)
+                else:
+                    # Odd-man out advances to next bracket automatically
+                    next_pool.append(current_pool[i])
+            current_pool = next_pool
+
+        final = current_pool[0] if current_pool else (survivors[0] if survivors else candidates[0])
 
         logger.info("="*60)
         logger.info("Search complete: %s", final.summary())

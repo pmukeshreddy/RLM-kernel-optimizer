@@ -155,29 +155,22 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
     lines.append(f"Speedup vs FlashInfer:         {speedup:.3f}x")
     lines.append(f"SM occupancy:                  {occupancy:.1f}%")
 
-    # Classify bottleneck for metric filtering
     mem_tput = metrics.get("mem_throughput_pct", 0)
     compute_tput = metrics.get("compute_throughput_pct", 0)
     stall_mem = metrics.get("stall_memory", 0)
     dram_bw = metrics.get("dram_read_bw_gbps", 0)
     l2_hit = metrics.get("l2_hit_rate", 0)
-    is_memory_bound = (mem_tput > 40) or (stall_mem > 30 and compute_tput < 30)
 
     if mem_tput > 0 or compute_tput > 0:
         lines.append("")
         lines.append(f"Memory throughput:             {mem_tput:.1f}% of peak")
-        # Only show compute throughput if kernel is NOT memory-bound
-        # (CUDAMaster: filtered metrics prevent LLM from chasing compute optimizations)
-        if not is_memory_bound:
-            lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
+        lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
         if stall_mem > 0:
             lines.append(f"Warp stalls (memory):          {stall_mem:.1f}%")
         if dram_bw > 0:
             lines.append(f"DRAM read bandwidth:           {dram_bw:.0f} GB/s")
         if l2_hit > 0:
             lines.append(f"L2 hit rate:                   {l2_hit:.1f}%")
-        if is_memory_bound:
-            lines.append(f"Bottleneck:                    MEMORY (compute throughput hidden — not relevant)")
 
     # Compiler metrics (from nvcc -Xptxas -v)
     cm = metrics.get("_compiler", {})
@@ -188,39 +181,8 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
 
         lines.append("")
         lines.append(f"Registers per thread:          {regs}")
-        if regs > 48 and is_memory_bound:
-            lines.append(f"  *** HIGH REGISTER COUNT — limits occupancy. Use __launch_bounds__ to target 32-48 regs ***")
         lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
         lines.append(f"Shared memory:                 {smem} bytes")
-
-        # SASS instruction breakdown (from cuobjdump -sass)
-        sass_total = cm.get("sass_total_instructions", 0)
-        if sass_total > 0:
-            ldg_128 = cm.get("sass_ldg_128", 0)
-            ldg_64 = cm.get("sass_ldg_64", 0)
-            ldg_32 = cm.get("sass_ldg_32", 0)
-            stg_128 = cm.get("sass_stg_128", 0)
-            stg_32 = cm.get("sass_stg_32", 0)
-            ldl = cm.get("sass_ldl", 0)
-            stl = cm.get("sass_stl", 0)
-            bar = cm.get("sass_bar", 0)
-            shfl = cm.get("sass_shfl", 0)
-
-            total_ldg = ldg_32 + ldg_64 + ldg_128
-            vec_pct = (ldg_128 / total_ldg * 100) if total_ldg > 0 else 0
-
-            lines.append("")
-            lines.append(f"SASS total instructions:       {sass_total}")
-            lines.append(f"Global loads:                  {total_ldg}  (128-bit: {ldg_128}, 64-bit: {ldg_64}, 32-bit: {ldg_32})  vectorization: {vec_pct:.0f}%")
-            lines.append(f"Global stores:                 {stg_32 + stg_128}  (128-bit: {stg_128}, 32-bit: {stg_32})")
-            lines.append(f"Spill load/store instructions: {ldl + stl}{' *** REGISTER SPILLS IN BINARY ***' if ldl + stl > 0 else ''}")
-            # Only show compute instruction breakdown if NOT memory-bound
-            if not is_memory_bound:
-                ffma = cm.get("sass_ffma", 0)
-                hfma2 = cm.get("sass_hfma2", 0)
-                mufu = cm.get("sass_mufu", 0)
-                lines.append(f"Compute: FFMA={ffma}  HFMA2={hfma2}  MUFU(SFU)={mufu}")
-            lines.append(f"Sync: barriers={bar}  shuffles={shfl}")
 
     lines.append("```")
     return "\n".join(lines)
@@ -250,82 +212,9 @@ def _format_last_error_section(candidate) -> str:
 # ── Proven-ineffective detection ──────────────────────────────────────────────
 
 def _compute_proven_ineffective(latest: dict, best: dict) -> tuple:
-    """Compare last attempt vs best: find metrics that changed substantially
-    but didn't improve timing. Returns (ineffective_set, description_lines).
-
-    Generalizes across kernels — purely data-driven, no kernel-specific rules.
-    """
-    if not latest or not best:
-        return set(), []
-
-    # Timing must NOT have improved for changes to be "ineffective"
-    best_us = best.get("duration_us", 0)
-    latest_us = latest.get("duration_us", 0)
-    if best_us <= 0 or latest_us <= 0:
-        return set(), []
-    # If timing actually improved, nothing is proven ineffective
-    if latest_us < best_us * 0.98:
-        return set(), []
-
-    ineffective = set()
-    lines = []
-
-    best_cm = best.get("_compiler", {})
-    latest_cm = latest.get("_compiler", {})
-    if not best_cm or not latest_cm:
-        return set(), []
-
-    # Vectorization
-    def _vec_pct(cm):
-        total = cm.get("sass_ldg_32", 0) + cm.get("sass_ldg_64", 0) + cm.get("sass_ldg_128", 0)
-        return (cm.get("sass_ldg_128", 0) / total * 100) if total > 0 else 0
-
-    best_vec, latest_vec = _vec_pct(best_cm), _vec_pct(latest_cm)
-    if abs(latest_vec - best_vec) > 20:
-        ineffective.add("vectorize_loads")
-        lines.append(f"Load vectorization {best_vec:.0f}%→{latest_vec:.0f}%: no timing improvement")
-
-    # Registers
-    best_regs = best_cm.get("registers_per_thread", 0)
-    latest_regs = latest_cm.get("registers_per_thread", 0)
-    if best_regs > 0 and latest_regs > 0 and abs(latest_regs - best_regs) >= 4:
-        ineffective.add("reduce_registers")
-        lines.append(f"Registers {best_regs}→{latest_regs}: no timing improvement")
-
-    # Barriers → shuffles
-    best_bars = best_cm.get("sass_bar", 0)
-    latest_bars = latest_cm.get("sass_bar", 0)
-    best_shfl = best_cm.get("sass_shfl", 0)
-    latest_shfl = latest_cm.get("sass_shfl", 0)
-    if (latest_shfl > best_shfl + 2) or (latest_bars < best_bars - 1):
-        ineffective.add("warp_shuffle")
-        lines.append(f"Barriers {best_bars}→{latest_bars}, shuffles {best_shfl}→{latest_shfl}: no timing improvement")
-
-    # Store vectorization
-    def _store_vec(cm):
-        total = cm.get("sass_stg_32", 0) + cm.get("sass_stg_128", 0)
-        return (cm.get("sass_stg_128", 0) / total * 100) if total > 0 else 0
-
-    best_svec, latest_svec = _store_vec(best_cm), _store_vec(latest_cm)
-    if abs(latest_svec - best_svec) > 20:
-        ineffective.add("vectorize_stores")
-        lines.append(f"Store vectorization {best_svec:.0f}%→{latest_svec:.0f}%: no timing improvement")
-
-    # SASS instruction count
-    best_sass = best_cm.get("sass_total_instructions", 0)
-    latest_sass = latest_cm.get("sass_total_instructions", 0)
-    if best_sass > 0 and latest_sass > 0 and abs(latest_sass - best_sass) > best_sass * 0.15:
-        ineffective.add("reduce_instructions")
-        lines.append(f"SASS instructions {best_sass}→{latest_sass}: no timing improvement")
-
-    # Occupancy
-    best_occ = best.get("sm_occupancy", 0)
-    latest_occ = latest.get("sm_occupancy", 0)
-    if abs(latest_occ - best_occ) > 10:
-        ineffective.add("occupancy")
-        lines.append(f"Occupancy {best_occ:.0f}%→{latest_occ:.0f}%: no timing improvement")
-
-    return ineffective, lines
+    """Stubbed: We no longer track hardcoded 'ineffective' metrics.
+    We pass pure universal metrics and let the LLM deduce failure."""
+    return set(), []
 
 
 # ── Data-driven optimization suggestions ─────────────────────────────────────
@@ -338,150 +227,9 @@ _REDUCTION_KERNEL_TYPES = frozenset({
 
 def _format_suggestions_section(metrics: dict, ineffective: set = None,
                                  kernel_type: str = "") -> str:
-    """Generate concrete actionable suggestions from profiler data.
-
-    ineffective: set of optimization categories proven not to help timing
-    (computed by _compute_proven_ineffective from actual profiler deltas).
-    Suggestions targeting these categories are suppressed.
-    kernel_type: kernel type string — enables reduction pattern detection.
-    """
-    if not metrics:
-        return ""
-
-    ineffective = ineffective or set()
-    suggestions = []
-
-    # Memory-bound diagnosis — check BEFORE compute suggestions
-    # When the kernel is memory-bound, compute optimizations won't help
-    mem_tput = metrics.get("mem_throughput_pct", 0)
-    compute_tput = metrics.get("compute_throughput_pct", 0)
-    stall_mem = metrics.get("stall_memory", 0)
-
-    is_memory_bound = (mem_tput > 60) or (stall_mem > 40 and compute_tput < 30)
-    if is_memory_bound and "memory_bound" not in ineffective:
-        suggestions.append(
-            f"MEMORY-BOUND ({mem_tput:.0f}% mem throughput, {stall_mem:.0f}% stalls). "
-            "Compute-only changes will NOT help. To beat FlashInfer:\n"
-            "  (a) Reduce total memory transactions: load each byte once, compute in registers, store once\n"
-            "  (b) Shape-specific unrolling: hard-code exact dimensions, eliminate branches\n"
-            "  (c) cp.async.bulk: zero-overhead async HBM→smem (no register pressure)\n"
-            "  (d) Fused vectorized stores: pack output into uint2/uint4, store in one transaction\n"
-            "  (e) Increase data reuse: share loaded data across multiple output elements"
-        )
-    elif mem_tput > 40 and compute_tput < 20:
-        suggestions.append(
-            f"Kernel is memory-limited ({mem_tput:.0f}% mem throughput vs "
-            f"{compute_tput:.0f}% compute). Focus on reducing HBM traffic and "
-            "overlapping memory access with computation rather than optimizing arithmetic."
-        )
-
-    cm = metrics.get("_compiler", {})
-
-    if cm:
-        ldg_128 = cm.get("sass_ldg_128", 0)
-        ldg_64 = cm.get("sass_ldg_64", 0)
-        ldg_32 = cm.get("sass_ldg_32", 0)
-        total_ldg = ldg_32 + ldg_64 + ldg_128
-        if total_ldg > 0 and "vectorize_loads" not in ineffective:
-            vec_pct = ldg_128 / total_ldg * 100
-            if vec_pct < 80:
-                suggestions.append(
-                    f"Only {vec_pct:.0f}% of loads are 128-bit vectorized — "
-                    f"convert remaining {ldg_32 + ldg_64} scalar loads to uint4 "
-                    f"(8 bf16 values per load)"
-                )
-
-        bars = cm.get("sass_bar", 0)
-        shfls = cm.get("sass_shfl", 0)
-        if bars > 0 and shfls == 0 and "warp_shuffle" not in ineffective:
-            suggestions.append(
-                f"{bars} barrier instructions but 0 warp shuffles — "
-                f"replace shared memory reductions with __shfl_down_sync"
-            )
-
-        spills = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
-        if spills > 0 and "reduce_registers" not in ineffective:
-            suggestions.append(
-                f"{spills} bytes of register spills — reduce register pressure"
-            )
-
-        # Only suggest fast math if kernel is NOT memory-bound
-        # (CUDAMaster: suppress compute suggestions for memory-bound kernels)
-        if not is_memory_bound:
-            mufu = cm.get("sass_mufu", 0)
-            if mufu == 0:
-                suggestions.append(
-                    "No MUFU (fast math SFU) instructions — "
-                    "use __expf/__rsqrtf instead of expf/rsqrtf"
-                )
-
-        # Register budget: hackathon winners used 32-48 regs for memory-bound kernels
-        regs = cm.get("registers_per_thread", 0)
-        if regs > 48 and is_memory_bound and "reduce_registers" not in ineffective:
-            suggestions.append(
-                f"Using {regs} registers/thread — too high for memory-bound kernel. "
-                f"Add __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS) to constrain to 32-48 regs. "
-                f"Higher occupancy from fewer registers will hide memory latency better"
-            )
-
-        stg_128 = cm.get("sass_stg_128", 0)
-        stg_32 = cm.get("sass_stg_32", 0)
-        if stg_32 > 0 and stg_128 == 0 and "vectorize_stores" not in ineffective:
-            suggestions.append(
-                f"All {stg_32} stores are 32-bit — vectorize stores with uint4"
-            )
-
-    # Reduction pattern detection: kernel has a row reduction but SASS shows
-    # no warp shuffles and no shared memory → reduction is serialized
-    if kernel_type in _REDUCTION_KERNEL_TYPES and cm and "reduction" not in ineffective:
-        shfls = cm.get("sass_shfl", 0)
-        lds = cm.get("sass_lds", 0)
-        sts = cm.get("sass_sts", 0)
-        smem = cm.get("static_smem_bytes", 0)
-        if shfls == 0 and lds == 0 and sts == 0 and smem == 0:
-            suggestions.append(
-                "CRITICAL: Row reduction is COMPLETELY SERIALIZED — 0 warp shuffles, "
-                "0 shared memory, 0 LDS/STS. Each thread is computing its own sum "
-                "without any cross-thread communication. You MUST add either:\n"
-                "  (a) __shfl_down_sync for warp-level reduction (2 cycles/op), or\n"
-                "  (b) shared memory + __syncthreads() for block-level reduction.\n"
-                "  Without this, the reduction loop runs sequentially per-thread."
-            )
-        elif shfls == 0 and (lds > 0 or sts > 0):
-            suggestions.append(
-                f"Reduction uses shared memory ({lds} LDS + {sts} STS) but 0 warp "
-                f"shuffles — replace intra-warp shared mem reduction with "
-                f"__shfl_down_sync (~2 cycles vs ~10+ for shared mem)"
-            )
-
-    occ = metrics.get("sm_occupancy", 0)
-    if "occupancy" not in ineffective:
-        if occ >= 95:
-            if is_memory_bound:
-                suggestions.append(
-                    "Occupancy is maxed but kernel is still memory-bound — "
-                    "focus on reducing total memory transactions and increasing "
-                    "data reuse, not thread count"
-                )
-            else:
-                suggestions.append(
-                    "Occupancy is maxed — focus on instruction-level parallelism "
-                    "or memory access patterns, not thread count"
-                )
-        elif 0 < occ < 50:
-            suggestions.append(
-                f"SM occupancy is only {occ:.0f}% — use __launch_bounds__ to constrain "
-                f"registers and increase occupancy. For memory-bound kernels, occupancy "
-                f"is critical for hiding HBM latency"
-            )
-
-    if not suggestions:
-        return ""
-
-    lines = ["\n### Optimization Targets (from profiler data)"]
-    for s in suggestions:
-        lines.append(f"- {s}")
-    return "\n".join(lines)
+    """Stubbed: We no longer generate hardcoded bottleneck suggestions.
+    The LLM interprets the pure physics metrics directly."""
+    return ""
 
 
 # ── Refinement history ────────────────────────────────────────────────────────
@@ -619,27 +367,7 @@ def _format_delta_section(current: dict, previous: dict,
             warn = "  *** REGRESSED ***" if cur_spills > prev_spills else "  (improved)" if cur_spills < prev_spills else ""
             lines.append(f"{'Register spill bytes':30s}  {prev_spills:6d}  -> {cur_spills:6d}{warn}")
 
-        cur_sass = cur_cm.get("sass_total_instructions", 0)
-        prev_sass = prev_cm.get("sass_total_instructions", 0)
-        if cur_sass != prev_sass and cur_sass > 0 and prev_sass > 0:
-            lines.append(f"{'SASS instructions':30s}  {prev_sass:6d}  -> {cur_sass:6d}")
-
-        # Vectorization delta
-        cur_ldg128 = cur_cm.get("sass_ldg_128", 0)
-        prev_ldg128 = prev_cm.get("sass_ldg_128", 0)
-        cur_ldg_total = cur_cm.get("sass_ldg_32", 0) + cur_cm.get("sass_ldg_64", 0) + cur_ldg128
-        prev_ldg_total = prev_cm.get("sass_ldg_32", 0) + prev_cm.get("sass_ldg_64", 0) + prev_ldg128
-        cur_vec = (cur_ldg128 / cur_ldg_total * 100) if cur_ldg_total > 0 else 0
-        prev_vec = (prev_ldg128 / prev_ldg_total * 100) if prev_ldg_total > 0 else 0
-        if cur_vec != prev_vec and (cur_ldg_total > 0 or prev_ldg_total > 0):
-            lines.append(f"{'Load vectorization':30s}  {prev_vec:5.0f}%  -> {cur_vec:5.0f}%")
-
-        # Spill instruction delta
-        cur_spill_insts = cur_cm.get("sass_ldl", 0) + cur_cm.get("sass_stl", 0)
-        prev_spill_insts = prev_cm.get("sass_ldl", 0) + prev_cm.get("sass_stl", 0)
-        if cur_spill_insts != prev_spill_insts:
-            warn = "  *** REGRESSED ***" if cur_spill_insts > prev_spill_insts else "  (improved)"
-            lines.append(f"{'Spill instructions':30s}  {prev_spill_insts:6d}  -> {cur_spill_insts:6d}{warn}")
+        # Removed complex SASS instruction delta tracking
 
     lines.append("```")
 
