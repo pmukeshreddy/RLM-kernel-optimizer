@@ -84,6 +84,8 @@ Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - __redux_sync_add: single-instruction warp reduction (~1 cycle vs __shfl_xor chain ~5)
 - cp.async.bulk: zero-overhead async HBM→shared memory copy (no register file pressure)
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
+- __nv_cvt_float2_to_fp4x2(float2, __NV_E2M1, cudaRoundNearest): single-instruction float2→packed FP4 byte (~1 cycle vs ~30 cycles of branching). Requires #include <cuda_fp4.h>
+- __nv_fp8_e4m3 type: hardware FP8 E4M3 via constructor __nv_fp8_e4m3(float_val), replaces manual float_to_e4m3. Requires #include <cuda_fp8.h>
 
 
 
