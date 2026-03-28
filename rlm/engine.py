@@ -21,6 +21,7 @@ from .reflector import (
     _format_last_error_section, _format_delta_section,
     _compute_proven_ineffective,
 )
+from .blueprints import get_structural_blueprint, get_roofline_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -362,24 +363,32 @@ Respond with ONLY the JSON array, nothing else."""
             system_prompt = _build_refine_system_prompt(0.0)
 
             shape_str = str(self.env.problem_shapes[0])
+            blueprint = get_structural_blueprint(
+                self.env.kernel_type, self.env.problem_shapes[0])
             prompt_parts = [
                 f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
                 f"Direction: {strat_desc}",
-                f"\nProblem shape: {shape_str} (FIXED — you can hard-code dimensions and unroll).",
+                f"\nProblem shape: {shape_str} (FIXED — hard-code ALL dimensions as compile-time constants).",
                 "\nYour speedup is measured against FlashInfer — a production GPU library "
                 "already well-optimized for general use. Your advantage: FlashInfer targets "
                 "many GPUs and arbitrary shapes, while you target ONE GPU (B200) and ONE shape. "
                 "Exploit shape specialization and B200-specific hardware features.",
                 "\nMemory-bound: L2 cache is cycled, data comes from HBM every iteration. "
-                "Compute-only optimizations won't help.",
+                "Compute-only optimizations won't help. You MUST reduce HBM traffic.",
+            ]
+            if blueprint:
+                prompt_parts.append(f"\n{blueprint}")
+            prompt_parts.extend([
                 f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
-                "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
-                "1. What optimization you're applying and why\n"
-                "2. What specific code changes you're making\n\n"
+                "\nIMPORTANT: Follow the STRUCTURAL BLUEPRINT above. Do NOT just tweak "
+                "the naive kernel — you must restructure the data flow.\n\n"
+                "Before calling submit_kernel, explain in 2-3 sentences:\n"
+                "1. What structural change you're making (refer to the blueprint)\n"
+                "2. How many bytes of HBM traffic this eliminates\n\n"
                 "Then call submit_kernel with your complete .cu file.",
-            ]
+            ])
             initial_prompt = "\n\n".join(prompt_parts)
 
             messages = [{"role": "user", "content": initial_prompt}]
@@ -465,6 +474,8 @@ Respond with ONLY the JSON array, nothing else."""
         # ── One-shot fallback (no profile_fn or no description) ──────────
         if strat_desc:
             shape_str = str(self.env.problem_shapes[0])
+            oneshot_blueprint = get_structural_blueprint(
+                self.env.kernel_type, self.env.problem_shapes[0])
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -485,12 +496,17 @@ hardware features (cp.async.bulk, __redux_sync_add, TMA, TMEM).
 - __redux_sync_add: 1-cycle warp reduce vs __shfl_xor_sync chain ~5 cycles
 - Memory-bound: GPU is idle waiting for HBM. Compute-only changes won't help.
 
+{oneshot_blueprint}
+
 ## Naive reference kernel (starting point):
 ```cuda
 {kernel_slice}
 ```
 
 {launch_sig}
+
+IMPORTANT: Follow the STRUCTURAL BLUEPRINT above. Do NOT just tweak the naive kernel.
+Restructure the data flow to eliminate unnecessary HBM traffic.
 
 CRITICAL RULES:
 1. Return the COMPLETE .cu file in a single ```cuda code block
@@ -637,6 +653,21 @@ CRITICAL RULES:
 
         prompt_parts.append(f"Observation:\n{observation}")
 
+        # Roofline feedback for current timing
+        timing_us = metrics.get("duration_us", 0)
+        if timing_us > 0:
+            roofline = get_roofline_feedback(
+                self.env.kernel_type, self.env.problem_shapes[0],
+                timing_us, parent.speedup)
+            if roofline:
+                prompt_parts.append(f"### Roofline Analysis\n{roofline}")
+
+        # Blueprint for structural guidance during refinement
+        refine_blueprint = get_structural_blueprint(
+            self.env.kernel_type, self.env.problem_shapes[0])
+        if refine_blueprint and parent.speedup < 1.4:
+            prompt_parts.append(refine_blueprint)
+
         # Code + launch signature — model sees BOTH data and code
         base_code = parent.best_code or parent.code
         base_speedup = parent.best_speedup or parent.speedup
@@ -646,13 +677,9 @@ CRITICAL RULES:
             f"\n\n{launch_sig}")
 
         prompt_parts.append(
-            "Before calling submit_kernel, explain what the profiler shows is the "
-            "bottleneck and what code change you'll make. Example:\n\n"
-            "\"SASS shows 18 scalar LDG.32 loads (0% vectorized) but occupancy "
-            "is 96%, so the bottleneck is memory transaction efficiency not "
-            "parallelism. I'll pack the scalar bf16 loads in the hot loop into "
-            "uint4 loads via reinterpret_cast<uint4*>, cutting 18 loads to 3 "
-            "and using the full 128-bit bus width.\"\n\n"
+            "Before calling submit_kernel, explain what the roofline analysis "
+            "shows is the gap and what STRUCTURAL change you'll make. Focus on "
+            "eliminating HBM traffic, not tweaking instructions.\n\n"
             "Then call submit_kernel with your complete .cu file.")
 
         initial_prompt = "\n\n".join(prompt_parts)
@@ -815,6 +842,15 @@ CRITICAL RULES:
         else:
             # First submission — show full profiler snapshot
             parts.append(_format_profile_section(metrics, 0))
+
+        # Roofline analysis — show how far from theoretical minimum
+        timing_us = metrics.get("duration_us", 0)
+        if timing_us > 0:
+            roofline = get_roofline_feedback(
+                self.env.kernel_type, self.env.problem_shapes[0],
+                timing_us, speedup)
+            if roofline:
+                parts.append(f"\n### Roofline Analysis\n{roofline}")
 
         # Data-driven suggestions for remaining bottlenecks
         suggestions = _format_suggestions_section(
