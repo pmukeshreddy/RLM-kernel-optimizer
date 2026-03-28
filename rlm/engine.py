@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ── Refinement: tool-use agent loop ────────────────────────────────────────
 
-MAX_INNER_TURNS = 3
+MAX_INNER_TURNS = 5
 
 SUBMIT_KERNEL_TOOL = {
     "name": "submit_kernel",
@@ -74,7 +74,7 @@ Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - cp.async.bulk: async HBM→shared memory copy
 - Fast math SFU: __expf/__rsqrtf ~4 cycles vs expf/rsqrtf ~20 cycles
 - __nv_cvt_float2_to_fp4x2(float2, __NV_E2M1, cudaRoundNearest): hardware float2→packed FP4. Requires #include <cuda_fp4.h>
-- __nv_fp8_e4m3 type: hardware FP8 E4M3 via constructor __nv_fp8_e4m3(float_val). Requires #include <cuda_fp8.h>
+- __nv_fp8_e4m3 type: hardware FP8 E4M3. float→fp8: __nv_fp8_e4m3(float_val). fp8→float: float(fp8_val). There is NO __nv_cvt_fp8_to_float function. Requires #include <cuda_fp8.h>
 
 Before EVERY submit_kernel call, explain in 2-3 sentences:
 1. What the profiler data tells you is the current bottleneck
