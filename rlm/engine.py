@@ -279,6 +279,8 @@ class RLMEngine:
                 f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
                 f"  {roofline}\n"
             )
+        if not baseline_context:
+            baseline_context = "BASELINE PROFILER DATA: unavailable — analyze kernel source to infer bottleneck type.\n"
 
         num_strategies = self.beam_width * 2  # extra strategies held in reserve
         example_lines = "\n".join(
