@@ -379,6 +379,10 @@ Respond with ONLY the JSON array, nothing else."""
                 "Exploit shape specialization and B200-specific hardware features.",
                 "\nMemory-bound: L2 cache is cycled, data comes from HBM every iteration. "
                 "Compute-only optimizations won't help. You MUST reduce HBM traffic.",
+                "\nUNIVERSAL MANDATE: Regardless of your specific Direction, you are NOT restricted to a single edit! "
+                "You MUST always restructure the code to use vectorized memory access (uint4/float4 128-bit loads) "
+                "and ensure high SM occupancy (e.g., using multiple threads/blocks). Without vectorized reads, "
+                "the B200 memory controllers will throttle instantly to 10% bandwidth.",
             ]
             
             if rag_docs:
