@@ -386,15 +386,14 @@ int main(int argc, char** argv) {{
         env           = self.env
         problem_shape = env.problem_shapes[0]
 
-        # Measure baseline with the SAME harness (L2 cycling, CUDA events) as candidates
-        # so the speedup comparison is symmetric.  Fall back to FlashInfer measurement.
-        search_baseline = self.measure_search_baseline(problem_shape)
-        baseline_us = search_baseline if search_baseline else env.baseline_us_reported
-        if search_baseline:
-            logger.info("Using search-harness baseline: %.3f us (FlashInfer was %.3f us)",
-                        baseline_us, env.baseline_us_reported)
-        else:
-            logger.info("Using FlashInfer baseline: %.3f us", baseline_us)
+        # KernelArena scores speedup vs FlashInfer (production reference), not vs the
+        # naive starting kernel.  Always use FlashInfer as the denominator.
+        # Log naive-kernel timing for diagnostics (shows how much room there is).
+        baseline_us = env.baseline_us_reported
+        search_naive_us = self.measure_search_baseline(problem_shape)
+        if search_naive_us:
+            logger.info("Naive reference kernel (harness): %.3f us", search_naive_us)
+        logger.info("FlashInfer baseline (speedup denominator): %.3f us", baseline_us)
 
         logger.info("="*60)
         logger.info("Beam search: kernel=%s beam_width=%d rounds=%d",
