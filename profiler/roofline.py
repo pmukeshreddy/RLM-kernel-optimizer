@@ -48,7 +48,7 @@ def efficiency_report(metrics: KernelMetrics, hw_spec: dict) -> str:
         f"HW limits: {hw_spec['memory']['hbm_bandwidth_tbs']} TB/s memory | "
         f"{hw_spec['compute']['fp32_tflops']} TFLOP/s FP32 | "
         f"{hw_spec['compute']['nvfp4_tflops']} TFLOP/s NVFP4\n"
-        f"NCU memory:   {metrics.mem_throughput_pct:.1f}% of peak\n"
-        f"NCU compute:  {metrics.compute_throughput_pct:.1f}% of peak\n"
+        f"Memory BW:    {metrics.mem_throughput_pct:.1f}% of peak\n"
+        f"Compute:      {metrics.compute_throughput_pct:.1f}% of peak\n"
         f"Speedup:      {metrics.speedup:.3f}x\n"
     )

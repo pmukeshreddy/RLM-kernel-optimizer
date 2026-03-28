@@ -215,71 +215,6 @@ int main() {
         print(stdout)
 
 
-def test_ncu_vs_hybrid():
-    """
-    Test 3: Try NCU on a simple kernel. If NCU works, compare with hybrid.
-    """
-    print("=" * 60)
-    print("TEST 3: NCU availability check")
-    print("=" * 60)
-
-    src = """
-#include <cstdio>
-#include <cuda_runtime.h>
-
-__global__ void simple_add(const float* a, const float* b, float* c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
-}
-
-int main() {
-    const int N = 1024 * 1024;
-    float *da, *db, *dc;
-    cudaMalloc(&da, N*4); cudaMalloc(&db, N*4); cudaMalloc(&dc, N*4);
-    simple_add<<<(N+255)/256, 256>>>(da, db, dc, N);
-    cudaDeviceSynchronize();
-    printf("ok\\n");
-    cudaFree(da); cudaFree(db); cudaFree(dc);
-    return 0;
-}
-"""
-    stdout, bin_path = compile_and_run(src, "ncu_test")
-    if not bin_path:
-        print("Compilation failed, skipping NCU test")
-        return
-
-    # Try NCU with --kernel-name-base
-    print(f"Running NCU on {bin_path}...")
-    ncu_cmd = [
-        "ncu", "--kernel-name-base", "simple_add",
-        "--launch-count", "1",
-        "--metrics", "dram__throughput.avg.pct_of_peak_sustained_elapsed,"
-                     "sm__warps_active.avg.pct_of_peak_sustained_active",
-        "--csv",
-        bin_path,
-    ]
-    try:
-        result = subprocess.run(ncu_cmd, capture_output=True, text=True, timeout=30)
-        if "ERR_NVGPUCTRPERM" in result.stderr:
-            print("NCU: PERMISSION DENIED (ERR_NVGPUCTRPERM)")
-            print("→ Hybrid profiler is your only option")
-        elif "No kernels were profiled" in result.stdout:
-            print("NCU: No kernels profiled (kernel matching issue)")
-            print(f"stdout: {result.stdout[:300]}")
-        elif result.returncode == 0 and result.stdout:
-            print("NCU: SUCCESS!")
-            print(result.stdout[:500])
-            print("→ NCU works! Consider setting tool: 'auto' in config")
-        else:
-            print(f"NCU: rc={result.returncode}")
-            print(f"stderr: {result.stderr[:300]}")
-            print(f"stdout: {result.stdout[:300]}")
-    except FileNotFoundError:
-        print("NCU: not installed")
-    except subprocess.TimeoutExpired:
-        print("NCU: timed out")
-
-
 def test_device_info():
     """
     Test 4: Get actual device specs to verify hybrid profiler constants.
@@ -331,14 +266,11 @@ if __name__ == "__main__":
     test_bandwidth_validation()
     print()
     test_occupancy_validation()
-    print()
-    test_ncu_vs_hybrid()
 
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     print("If Test 1 shows >100 GB/s → bandwidth measurement is real")
     print("If Test 2 shows varying occupancy → occupancy API is real")
-    print("If Test 3 NCU works → switch config to tool: 'auto'")
-    print("If Test 4 matches b200_spec.yaml → constants are correct")
+    print("If Test 3 matches b200_spec.yaml → constants are correct")
     print("=" * 60)

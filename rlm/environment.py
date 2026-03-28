@@ -25,7 +25,7 @@ class KernelCandidate:
     bottleneck: str = "unknown"
     compile_ok: bool = False
     correct: bool = False
-    ncu_report_path: Optional[str] = None
+    profile_report_path: Optional[str] = None
     prev_metrics: Optional[dict] = None  # parent's metrics for delta comparison
     compile_error: str = ""  # compiler error message for reflection
     last_refine_error: str = ""  # error from last failed refinement attempt
@@ -112,7 +112,7 @@ class RLMEnvironment:
         with open(search_cfg_path) as f:
             self.search_config: dict = yaml.safe_load(f)
 
-        self.ncu_report: Optional[dict] = None
+        self.profile_report: Optional[dict] = None
         self.baseline_us: Optional[float] = None
         self.baseline_us_reported: float = 12.4
         self.baseline_naive_us: Optional[float] = None

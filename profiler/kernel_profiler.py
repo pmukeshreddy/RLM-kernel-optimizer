@@ -1,5 +1,5 @@
 """
-ncu_runner.py — CUDA kernel compilation, timing, and profiling.
+kernel_profiler.py — CUDA kernel compilation, timing, and profiling.
 
 Handles: write .cu → nvcc compile → benchmark timing → hybrid profiling.
 Compiler metrics (registers, spills) extracted via -Xptxas,-v.
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
-class NCURunner:
+class KernelProfiler:
     """
     Manages CUDA kernel compilation, timing, and profiling.
     Workflow: write .cu → nvcc compile → CUDA event timing → hybrid profiling.

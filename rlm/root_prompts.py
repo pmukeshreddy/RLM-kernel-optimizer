@@ -77,7 +77,7 @@ def refine_prompt(
     return f"""\
 ## Task: Round {round_num} Refinement
 
-NCU Bottleneck: {bottleneck.upper()}
+Bottleneck: {bottleneck.upper()}
 
 Key metrics:
 {metric_str}

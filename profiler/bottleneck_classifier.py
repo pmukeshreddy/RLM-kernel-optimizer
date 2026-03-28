@@ -1,5 +1,5 @@
 """
-bottleneck_classifier.py — Classify kernel bottleneck from NCU metrics.
+bottleneck_classifier.py — Classify kernel bottleneck from profiler metrics.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ class BottleneckClassifier:
         if metrics.stall_memory >= self.latency_threshold:
             return Bottleneck.LATENCY_BOUND
 
-        # Low utilization on both axes (or fallback HybridProfiler running without NCU)
+        # Low utilization on both axes
         if metrics.mem_throughput_pct < 30 and metrics.compute_throughput_pct < 30:
             # Fallback heuristic using SASS metrics if available
             if hasattr(metrics, '_compiler_metrics') and metrics._compiler_metrics:

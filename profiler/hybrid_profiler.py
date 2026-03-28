@@ -1,16 +1,13 @@
 """
 hybrid_profiler.py — Lightweight profiler using CUDA Events + Occupancy API.
-Used when NCU is unavailable (permission denied, missing importer, etc.).
 
-Real data sources only:
+Real data sources:
   1. CUDA Event timing   -> duration_us, speedup  (measured by benchmark harness)
   2. CUDA Occupancy API  -> sm_occupancy (compiled query program)
   3. Theoretical occupancy fallback (from register count + block size + shared mem)
   4. Compiler metrics     -> registers, spills, smem (from nvcc -Xptxas -v)
   5. SASS instruction mix -> from cuobjdump -sass (via CompilerMetrics)
-
-No analytical/heuristic estimates: no fake bandwidth %, compute %, stall rates,
-L2 hit rates, or instruction counts.  Those require real NCU hardware counters.
+  6. Roofline math        -> mem_throughput_pct (from timing + transfer bytes)
 """
 
 from __future__ import annotations
@@ -56,11 +53,9 @@ def _estimate_shared_memory(kernel_src: str) -> int:
 
 class HybridProfiler:
     """
-    Computes kernel metrics from real data only (no heuristic estimates).
+    Computes kernel metrics from real data sources.
 
-    Returns: timing, speedup, SM occupancy, and compiler/SASS metrics.
-    All other KernelMetrics fields (bandwidth %, compute %, stalls, L2, etc.)
-    remain at 0 -- they require NCU hardware counters for real values.
+    Returns: timing, speedup, SM occupancy, mem_throughput_pct, and compiler/SASS metrics.
     """
 
     def __init__(self, config: dict, hw_spec: dict):

@@ -7,7 +7,7 @@ models:
 
 beam:
   width: 4                    # parallel strategy variants
-  refine_rounds: 4            # NCU feedback iterations
+  refine_rounds: 4            # profiler feedback iterations
   max_sub_calls_per_round: 2  # cap recursive depth
   combine_top_k: 2            # merge top-K into final
   diversity_mode: "bottleneck_cluster"  # cluster-based pruning
@@ -28,18 +28,9 @@ strategies:
   disabled: []
 
 profiler:
-  # Profiler mode: "ncu" (NCU only), "hybrid" (skip NCU, use analytical),
-  #                "auto" (try NCU first, fall back to hybrid on permission/importer errors)
-  tool: "auto"
-  ncu_path: "/usr/local/cuda/bin/ncu"
+  tool: "hybrid"
   warmup_iters: 3
   profile_iters: 10
-  sections:
-    - "SpeedOfLight"
-    - "MemoryWorkloadAnalysis"
-    - "ComputeWorkloadAnalysis"
-    - "WarpStateStatistics"
-    - "SchedulerStatistics"
 
 bottleneck:
   memory_bound_threshold_pct: 70
@@ -69,6 +60,6 @@ eval:
 
 output:
   save_all_candidates: true
-  save_ncu_reports: true
+  save_profiler_reports: true
   output_dir: "outputs/"
   log_level: "INFO"

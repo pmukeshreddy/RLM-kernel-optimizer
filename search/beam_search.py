@@ -1,6 +1,6 @@
 """
 beam_search.py — Main beam search orchestrator.
-Ties together: RLM engine, NCU profiler, diversity selection, and combination.
+Ties together: RLM engine, profiler, diversity selection, and combination.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Optional
 
 from rlm.engine import RLMEngine
 from rlm.environment import RLMEnvironment, KernelCandidate
-from profiler.ncu_runner import NCURunner
+from profiler.kernel_profiler import KernelProfiler
 from profiler.bottleneck_classifier import BottleneckClassifier
 from profiler.metrics import KernelMetrics, metrics_from_dict
 from search.diversity_selector import DiversitySelector
@@ -27,12 +27,12 @@ logger = logging.getLogger(__name__)
 
 class BeamSearch:
     """
-    NCU-guided beam search for CUDA kernel optimization.
+    Profiler-guided beam search for CUDA kernel optimization.
 
     Algorithm:
       0. Root LLM decomposes → selects strategies
       1. Generate N beams in parallel (sub-LLMs)
-      2. Compile + profile each beam with NCU
+      2. Compile + profile each beam
       3. Classify bottleneck per beam
       4. Select diverse survivors (1 per bottleneck cluster)
       5. Refine each survivor with targeted sub-LLM
@@ -43,7 +43,7 @@ class BeamSearch:
     def __init__(self, env: RLMEnvironment):
         self.env      = env
         self.engine   = RLMEngine(env)
-        self.profiler = NCURunner(env.search_config, hw_spec=env.hw_spec)
+        self.profiler = KernelProfiler(env.search_config, hw_spec=env.hw_spec)
         self.selector = DiversitySelector(env.search_config)
         self.clf      = BottleneckClassifier(env.search_config)
         self.checker  = CorrectnessChecker(env.search_config)
@@ -321,7 +321,7 @@ int main(int argc, char** argv) {{
                     )
                 return None
 
-        # Always set speedup from timing, even if NCU profiling failed
+        # Always set speedup from timing, even if profiling failed
         candidate.speedup = speedup
         if metrics:
             candidate.metrics    = metrics.to_dict()

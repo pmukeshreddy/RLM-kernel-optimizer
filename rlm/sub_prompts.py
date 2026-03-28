@@ -11,7 +11,7 @@ def vectorize_loads_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
             f"  DRAM stall rate: {current_metrics.get('stall_memory', 'N/A')}%\n"
             f"  L2 hit rate: {current_metrics.get('l2_hit_rate', 'N/A')}%\n"
@@ -44,7 +44,7 @@ def tma_prefetch_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict 
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
             f"  Long scoreboard stalls: {current_metrics.get('stall_memory', 'N/A')}%\n"
         )
@@ -80,7 +80,7 @@ def warp_reduction_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Barrier stall rate: {current_metrics.get('stall_barrier', 'N/A')}%\n"
             f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
@@ -113,7 +113,7 @@ def fuse_passes_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict =
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
             f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
@@ -145,7 +145,7 @@ def register_tiling_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
             f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
@@ -177,7 +177,7 @@ def async_pipeline_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Long scoreboard stalls: {current_metrics.get('stall_memory', 'N/A')}%\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
         )
@@ -211,7 +211,7 @@ def fp4_lut_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = Non
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
         )
@@ -258,7 +258,7 @@ def fast_math_expf_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
             f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
@@ -297,7 +297,7 @@ def thread_coarsening_prompt(kernel_slice: str, hw_spec: dict, current_metrics: 
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
             f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
@@ -340,7 +340,7 @@ def ldg_readonly_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict 
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
             f"  L2 hit rate: {current_metrics.get('l2_hit_rate', 'N/A')}%\n"
             f"  DRAM stall rate: {current_metrics.get('stall_memory', 'N/A')}%\n"
@@ -381,7 +381,7 @@ def vectorized_stores_prompt(kernel_slice: str, hw_spec: dict, current_metrics: 
     metrics_str = ""
     if current_metrics:
         metrics_str = (
-            f"\nCurrent NCU metrics:\n"
+            f"\nCurrent profiler metrics:\n"
             f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
             f"  Store throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
         )

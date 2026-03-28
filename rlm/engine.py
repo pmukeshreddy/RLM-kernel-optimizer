@@ -126,7 +126,7 @@ def _build_refine_system_prompt(speedup: float) -> str:
 class RLMEngine:
     """
     Main orchestrator for the RLM beam search loop.
-    Handles: decomposition → beam generation → NCU-guided refinement → combination.
+    Handles: decomposition → beam generation → profiler-guided refinement → combination.
     """
 
     def __init__(self, env: RLMEnvironment):

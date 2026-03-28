@@ -221,7 +221,7 @@ def _lock_gpu_clocks():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="RLM + NCU-guided beam search kernel optimizer for WaferBench NVFP4"
+        description="RLM beam search kernel optimizer for WaferBench NVFP4"
     )
     parser.add_argument("--kernel",     type=str, default=None)
     parser.add_argument("--dry-run",    action="store_true")
