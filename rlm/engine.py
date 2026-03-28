@@ -177,6 +177,19 @@ class RLMEngine:
         )
         return text, tokens_in, tokens_out
 
+    def call_llm_sync(
+        self,
+        prompt: str,
+        model: str = None,
+        system: str = "You are a GPU kernel optimization expert.",
+        temperature: float = 0.3,
+    ) -> str:
+        """Public LLM call for world model and other external callers."""
+        model = model or self.root_model
+        text, _, _ = self._call_llm(prompt, model=model, system=system,
+                                     temperature=temperature)
+        return text
+
     async def _call_llm_async(
         self,
         prompt: str,

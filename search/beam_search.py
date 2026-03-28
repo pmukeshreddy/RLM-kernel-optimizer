@@ -1,16 +1,24 @@
 """
-beam_search.py — Main beam search orchestrator.
-Ties together: RLM engine, NCU profiler, diversity selection, and combination.
+beam_search.py — K-Search tree search with world model.
+
+Implements the core K-Search algorithm (arxiv 2602.19128):
+1. World model scores strategies BEFORE trying them
+2. Deterministic selection: argmax by WM score
+3. Action cycles with stagnation window K (multiple attempts per strategy)
+4. WM evolution: Insert new strategies / Update scores / Prune dead ends
+5. Tree search with backtracking to earlier checkpoints
 """
 
 from __future__ import annotations
+import json
 import logging
 import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from rlm.engine import RLMEngine
 from rlm.environment import RLMEnvironment, KernelCandidate
@@ -18,26 +26,254 @@ from profiler.ncu_runner import NCURunner
 from profiler.bottleneck_classifier import BottleneckClassifier
 from profiler.metrics import KernelMetrics, metrics_from_dict
 from search.diversity_selector import DiversitySelector
+from search.world_model import WorldModel
 from eval.hack_detector import is_clean
 from eval.runtime_checks import run_runtime_checks
 from eval.correctness import CorrectnessChecker
 
 logger = logging.getLogger(__name__)
 
+# ── K-Search parameters ───────────────────────────────────────────────────
+STAGNATION_K = 5           # consecutive non-improving attempts before closing a node
+MAX_NODE_EXPANSIONS = 6    # max total attempts per node
+MAX_DIFFICULTY = 4         # skip strategies with difficulty > this (until we have good results)
+DIFFICULTY_UNLOCK_SPEEDUP = 1.3  # unlock difficulty 5 after this speedup
+
+
+@dataclass
+class SearchNode:
+    """A node in the K-Search optimization tree.
+
+    OPEN nodes have strategy metadata but no solution yet (frontier).
+    CLOSED nodes have an attached best solution from their action cycle.
+    """
+    node_id: str
+    strategy_name: str
+    strategy_description: str = ""
+    score: float = 0.5           # WM priority score (0-1)
+    difficulty: int = 3          # estimated difficulty (1-5)
+
+    # Solution state
+    candidate: Optional[KernelCandidate] = None  # best solution (None = OPEN)
+    is_open: bool = True
+
+    # Tree structure
+    parent: Optional[SearchNode] = None
+    children: List[SearchNode] = field(default_factory=list)
+    depth: int = 0
+
+    # Action cycle tracking
+    attempt_count: int = 0       # total implementation attempts
+    stagnant_count: int = 0      # consecutive non-improving attempts
+    best_cycle_speedup: float = 0.0  # best speedup in current action cycle
+
+    @property
+    def is_frontier(self) -> bool:
+        """Can be selected for the next action cycle."""
+        if not self.is_open:
+            return False
+        if self.attempt_count >= MAX_NODE_EXPANSIONS:
+            return False
+        # Parent must have a solution (or be root)
+        if self.parent is None:
+            return True
+        return not self.parent.is_open
+
+    @property
+    def speedup(self) -> float:
+        if self.candidate and self.candidate.is_viable():
+            return self.candidate.speedup
+        return 0.0
+
+    @property
+    def parent_code(self) -> str:
+        """Base code to generate from (parent's solution)."""
+        if self.parent and self.parent.candidate:
+            return self.parent.candidate.code
+        return ""
+
+
+class SearchTree:
+    """Manages the K-Search optimization tree with WM integration."""
+
+    def __init__(self):
+        self.root: Optional[SearchNode] = None
+        self.all_nodes: List[SearchNode] = []
+        self.global_best: Optional[SearchNode] = None
+        self._next_id = 0
+
+    def _gen_id(self) -> str:
+        self._next_id += 1
+        return f"n{self._next_id}"
+
+    def create_root(self, candidate: KernelCandidate) -> SearchNode:
+        """Create the root node (naive kernel)."""
+        node = SearchNode(
+            node_id=self._gen_id(),
+            strategy_name="root",
+            strategy_description="Naive reference kernel",
+            candidate=candidate,
+            is_open=False,  # root is always closed
+            depth=0,
+        )
+        self.root = node
+        self.all_nodes.append(node)
+        return node
+
+    def add_strategy_node(
+        self, parent: SearchNode, name: str, description: str,
+        score: float = 0.5, difficulty: int = 3,
+    ) -> SearchNode:
+        """Add an OPEN strategy node (proposed by WM)."""
+        node = SearchNode(
+            node_id=self._gen_id(),
+            strategy_name=name,
+            strategy_description=description,
+            score=score,
+            difficulty=difficulty,
+            parent=parent,
+            depth=parent.depth + 1,
+            is_open=True,
+        )
+        parent.children.append(node)
+        self.all_nodes.append(node)
+        return node
+
+    def close_node(self, node: SearchNode, candidate: KernelCandidate):
+        """Close a node by attaching its best solution."""
+        node.candidate = candidate
+        node.is_open = False
+        if candidate.is_viable():
+            if self.global_best is None or candidate.speedup > self.global_best.speedup:
+                self.global_best = node
+                logger.info("NEW GLOBAL BEST: %.3fx [%s] (depth=%d)",
+                            candidate.speedup, node.strategy_name, node.depth)
+
+    def choose_top_n_frontier(self, n: int) -> List[SearchNode]:
+        """Deterministic selection: argmax by score among frontier nodes.
+
+        K-Search selection: sort by (-score, difficulty, -speedup).
+        Difficulty gating: skip difficulty > MAX_DIFFICULTY unless we have
+        a good enough solution (DIFFICULTY_UNLOCK_SPEEDUP).
+        """
+        max_diff = MAX_DIFFICULTY
+        if self.global_best and self.global_best.speedup >= DIFFICULTY_UNLOCK_SPEEDUP:
+            max_diff = 5  # unlock hard strategies once we have a good base
+
+        frontier = [nd for nd in self.all_nodes
+                    if nd.is_frontier and nd.difficulty <= max_diff]
+
+        # K-Search sorting: best score first, then easier first, then faster first
+        frontier.sort(key=lambda nd: (-nd.score, nd.difficulty))
+        return frontier[:n]
+
+    def to_compact_json(self) -> str:
+        """Serialize tree for WM prompt (compact representation)."""
+        nodes = []
+        for nd in self.all_nodes:
+            entry = {
+                "id": nd.node_id,
+                "parent": nd.parent.node_id if nd.parent else None,
+                "strategy": nd.strategy_name,
+                "description": nd.strategy_description[:100],
+                "score": round(nd.score, 2),
+                "difficulty": nd.difficulty,
+                "status": "CLOSED" if not nd.is_open else "OPEN",
+            }
+            if nd.candidate and nd.candidate.is_viable():
+                entry["speedup"] = round(nd.speedup, 3)
+                m = nd.candidate.metrics or {}
+                cm = m.get("_compiler", {})
+                entry["regs"] = cm.get("registers_per_thread", 0)
+                entry["vec_ld_pct"] = cm.get("vectorized_load_pct", 0)
+                entry["sass_insts"] = cm.get("sass_total_instructions", 0)
+            if nd.attempt_count > 0:
+                entry["attempts"] = nd.attempt_count
+                entry["stagnant"] = nd.stagnant_count
+            nodes.append(entry)
+        return json.dumps(nodes, indent=1)
+
+    def apply_wm_edits(self, edits: dict):
+        """Apply Insert/Update/Delete operations from the world model."""
+        id_map = {nd.node_id: nd for nd in self.all_nodes}
+
+        # Updates
+        for upd in edits.get("updates", []):
+            node = id_map.get(upd.get("node_id"))
+            if node and node.is_open:
+                if "score" in upd:
+                    old = node.score
+                    node.score = max(0.0, min(1.0, float(upd["score"])))
+                    logger.info("  WM update [%s] %s: score %.2f -> %.2f (%s)",
+                                node.node_id, node.strategy_name,
+                                old, node.score,
+                                upd.get("reason", "")[:60])
+                if "difficulty" in upd:
+                    node.difficulty = int(upd["difficulty"])
+
+        # Inserts — add new OPEN strategy nodes
+        for ins in edits.get("inserts", []):
+            parent = id_map.get(ins.get("parent_id"))
+            if not parent:
+                # Default to global best or root
+                parent = self.global_best or self.root
+            if parent:
+                name = ins.get("name", "wm_proposed")
+                desc = ins.get("what", ins.get("description", ""))
+                new_node = self.add_strategy_node(
+                    parent, name, desc,
+                    score=float(ins.get("score", 0.5)),
+                    difficulty=int(ins.get("difficulty", 3)),
+                )
+                id_map[new_node.node_id] = new_node
+                logger.info("  WM insert [%s] %s (score=%.2f, d=%d) under [%s]",
+                            new_node.node_id, name, new_node.score,
+                            new_node.difficulty, parent.node_id)
+
+        # Deletes — only open leaves with no children
+        for dl in edits.get("deletes", []):
+            node = id_map.get(dl.get("node_id"))
+            if node and node.is_open and not node.children:
+                if node.parent:
+                    node.parent.children.remove(node)
+                self.all_nodes.remove(node)
+                logger.info("  WM delete [%s] %s: %s",
+                            node.node_id, node.strategy_name,
+                            dl.get("reason", "")[:60])
+
+    def has_frontier(self) -> bool:
+        return any(nd.is_frontier for nd in self.all_nodes)
+
+    def stats(self) -> str:
+        total = len(self.all_nodes)
+        open_n = sum(1 for nd in self.all_nodes if nd.is_open)
+        frontier = sum(1 for nd in self.all_nodes if nd.is_frontier)
+        closed = total - open_n
+        max_depth = max((nd.depth for nd in self.all_nodes), default=0)
+        best = self.global_best.speedup if self.global_best else 0.0
+        return (f"nodes={total} open={open_n} frontier={frontier} "
+                f"closed={closed} depth={max_depth} best={best:.3f}x")
+
+    def get_best_n(self, n: int) -> List[SearchNode]:
+        """Get n best viable CLOSED nodes."""
+        viable = [nd for nd in self.all_nodes
+                  if nd.candidate and nd.candidate.is_viable()]
+        viable.sort(key=lambda nd: -nd.speedup)
+        return viable[:n]
+
 
 class BeamSearch:
     """
-    NCU-guided beam search for CUDA kernel optimization.
+    K-Search tree search for CUDA kernel optimization.
 
     Algorithm:
-      0. Root LLM decomposes → selects strategies
-      1. Generate N beams in parallel (sub-LLMs)
-      2. Compile + profile each beam with NCU
-      3. Classify bottleneck per beam
-      4. Select diverse survivors (1 per bottleneck cluster)
-      5. Refine each survivor with targeted sub-LLM
-      6. Repeat rounds 2-5 until budget or round limit
-      7. Combine top-2 survivors → final kernel
+      0. World model proposes scored optimization strategies
+      1. Deterministic selection: pick top-N frontier nodes by WM score
+      2. Action cycles: generate + refine up to K attempts per strategy
+      3. Close nodes, attach best solutions
+      4. World model evolves: Insert children / Update scores / Prune dead ends
+      5. Repeat until budget or no frontier nodes remain
+      6. Combine top-2 from tree → final kernel
     """
 
     def __init__(self, env: RLMEnvironment):
@@ -65,7 +301,7 @@ class BeamSearch:
     def _harness_add_rmsnorm(self, shape: tuple) -> str:
         rows, hidden = shape
         n, nb = rows * hidden, rows * hidden // 16
-        input_bytes = n * 2 * 2 + hidden * 2  # (input+residual)*bf16 + weight
+        input_bytes = n * 2 * 2 + hidden * 2
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -79,7 +315,6 @@ int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int rows={rows}, hidden={hidden}, N={n}, nb={nb};
-    // Dynamic L2 cache cycling (KernelArena/ThunderKittens 2.0 methodology)
     int l2_bytes=0;
     cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
     int nbufs = 1;
@@ -94,10 +329,8 @@ int main(int argc, char** argv) {{
     cudaMalloc(&dw,hidden*2);
     cudaMalloc(&dro,N*2); cudaMalloc(&dq,N/2); cudaMalloc(&ds,nb);
     cudaStream_t s; cudaStreamCreate(&s);
-    // Warmup with L2 cycling
     for(int i=0;i<warmup;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
     cudaStreamSynchronize(s);
-    // Timed reps — 2 CUDA events wrapping all reps (ThunderKittens convention)
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
     for(int i=0;i<iters;++i) launch_fused_add_rmsnorm_nvfp4(di[i%nbufs],dr[i%nbufs],dw,dro,dq,ds,rows,hidden,s);
@@ -116,7 +349,7 @@ int main(int argc, char** argv) {{
         b, m, k = shape
         n = b * m * k
         nb = n // 16
-        input_bytes = n * 2 * 2  # (gate + up) * bf16
+        input_bytes = n * 2 * 2
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -131,7 +364,6 @@ int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int N={n}, nb={nb};
-    // Dynamic L2 cache cycling
     int l2_bytes=0;
     cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
     int nbufs = 1;
@@ -165,7 +397,7 @@ int main(int argc, char** argv) {{
         m, k = shape
         n = m * k
         nb = n // 16
-        input_bytes = n * 2  # input * bf16
+        input_bytes = n * 2
         return f"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -179,7 +411,6 @@ int main(int argc, char** argv) {{
     int warmup=500, iters=100;
     for(int i=1;i<argc;++i){{ sscanf(argv[i],"--warmup=%d",&warmup); sscanf(argv[i],"--iters=%d",&iters); }}
     const int N={n}, nb={nb};
-    // Dynamic L2 cache cycling
     int l2_bytes=0;
     cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
     int nbufs = 1;
@@ -209,11 +440,7 @@ int main(int argc, char** argv) {{
 """
 
     def measure_search_baseline(self, problem_shape: tuple) -> Optional[float]:
-        """Measure reference kernel timing with the SAME harness used for candidates.
-
-        Ensures symmetric measurement: both baseline and candidate see the same
-        L2 cache cycling, same CUDA event timing, same C++ dispatch overhead.
-        """
+        """Measure reference kernel timing with the SAME harness used for candidates."""
         harness = self._build_harness(problem_shape)
         safe_name = f"baseline_{self.env.kernel_type}_{int(time.time())}"
         ok, err, binary, _ = self.profiler.compile_kernel(
@@ -249,12 +476,9 @@ int main(int argc, char** argv) {{
             return None
 
         harness = self._build_harness(problem_shape)
-        # Sanitize strategy name for filesystem (freeform names may have spaces/slashes)
         safe_strat = re.sub(r'[^a-zA-Z0-9_-]', '_', candidate.strategy)
         name    = f"{safe_strat}_r{candidate.round_num}_{int(time.time())}_{id(candidate)}"
 
-        # Compile, check correctness, profile.
-        # Note: counters reflect ALL attempts including inner refinement retries.
         ok = False
         metrics = None
         speedup = 0.0
@@ -269,7 +493,7 @@ int main(int argc, char** argv) {{
             candidate.compile_error = err_msg[:800]
             logger.error("  Compile FAIL [%s]: %s", candidate.strategy, err_msg[:400])
         if compile_ok:
-            candidate.compile_ok = True  # nvcc succeeded
+            candidate.compile_ok = True
             with self._env_lock:
                 self.env.compile_passes += 1
             passed, max_err, msg = self.checker.check(candidate.code, problem_shape,
@@ -303,7 +527,6 @@ int main(int argc, char** argv) {{
                         logger.warning("  Profiler returned no metrics for [%s]", candidate.strategy)
                 ok = True
 
-        # Runtime hack checks — run after compile confirms the kernel is valid CUDA
         if ok:
             rt_clean, rt_hack = run_runtime_checks(candidate.code, kernel_type=self.env.kernel_type)
             if not rt_clean:
@@ -319,7 +542,6 @@ int main(int argc, char** argv) {{
                     )
                 return None
 
-        # Always set speedup from timing, even if NCU profiling failed
         candidate.speedup = speedup
         if metrics:
             candidate.metrics    = metrics.to_dict()
@@ -357,8 +579,7 @@ int main(int argc, char** argv) {{
         problem_shape: tuple,
         baseline_us: float,
     ) -> list:
-        """Profile all candidates in parallel using a thread pool.
-        Returns list of (candidate, KernelMetrics) tuples preserving input order."""
+        """Profile all candidates in parallel using a thread pool."""
         if not candidates:
             return []
 
@@ -381,14 +602,55 @@ int main(int argc, char** argv) {{
 
         return results
 
+    # ── Results formatting for WM ─────────────────────────────────────────
+
+    def _format_round_results(self, results: list) -> str:
+        """Format action cycle results for the WM evolve prompt."""
+        lines = []
+        for node, candidate in results:
+            status = "CLOSED" if not node.is_open else "OPEN"
+            if candidate and candidate.is_viable():
+                m = candidate.metrics or {}
+                cm = m.get("_compiler", {})
+                lines.append(
+                    f"- [{node.node_id}] {node.strategy_name}: "
+                    f"speedup={candidate.speedup:.3f}x "
+                    f"regs={cm.get('registers_per_thread', '?')} "
+                    f"vec_ld%={cm.get('vectorized_load_pct', '?')} "
+                    f"sass={cm.get('sass_total_instructions', '?')} "
+                    f"status={status}")
+            elif candidate:
+                err = (candidate.compile_error or "unknown")[:100]
+                lines.append(
+                    f"- [{node.node_id}] {node.strategy_name}: "
+                    f"FAILED ({err}) status={status}")
+            else:
+                lines.append(
+                    f"- [{node.node_id}] {node.strategy_name}: "
+                    f"no result status={status}")
+        return "\n".join(lines) if lines else "(no results)"
+
+    def _format_failed_nodes(self, nodes: list) -> str:
+        """Format failed nodes for the WM note_failure prompt."""
+        lines = []
+        for node in nodes:
+            err = ""
+            if node.candidate:
+                err = (node.candidate.compile_error or "unknown")[:150]
+            lines.append(
+                f"- [{node.node_id}] {node.strategy_name} "
+                f"(attempts={node.attempt_count}, "
+                f"difficulty={node.difficulty}): {err}")
+        return "\n".join(lines) if lines else "(none)"
+
+    # ── Main search loop ──────────────────────────────────────────────────
+
     def run(self) -> KernelCandidate:
-        """Execute the full beam search. Returns the best KernelCandidate."""
+        """Execute K-Search: WM-guided tree search with action cycles."""
         env           = self.env
         problem_shape = env.problem_shapes[0]
 
-        # KernelArena scores speedup vs FlashInfer (production reference), not vs the
-        # naive starting kernel.  Always use FlashInfer as the denominator.
-        # Log naive-kernel timing for diagnostics (shows how much room there is).
+        # ── Baselines ──────────────────────────────────────────────────────
         baseline_us = env.baseline_us_reported
         search_naive_us = self.measure_search_baseline(problem_shape)
         if search_naive_us:
@@ -396,249 +658,246 @@ int main(int argc, char** argv) {{
         logger.info("FlashInfer baseline (speedup denominator): %.3f us", baseline_us)
 
         logger.info("="*60)
-        logger.info("Beam search: kernel=%s beam_width=%d rounds=%d",
-                    env.kernel_name, self.beam_w, self.rounds)
+        logger.info("K-Search: kernel=%s beam_width=%d rounds=%d stagnation_K=%d",
+                    env.kernel_name, self.beam_w, self.rounds, STAGNATION_K)
         logger.info("="*60)
 
-        # ── Round 0: Decompose + generate initial beams ────────────────────
-        all_strategies = self.engine.run_decompose()
-        strategies = all_strategies[:self.beam_w]
-        self._reserve_strategies = all_strategies[self.beam_w:]
-        logger.info("Active strategies: %s", [s.get("name", s) if isinstance(s, dict) else s for s in strategies])
-        logger.info("Reserve strategies: %s", [s.get("name", s) if isinstance(s, dict) else s for s in self._reserve_strategies])
-        env.current_round = 0
-
-        kernel_slice = env.kernel_src
-        profile_fn = self._make_inner_profile_fn(problem_shape, baseline_us)
-        candidates = self.engine.run_generate_beams(
-            strategies=strategies, kernel_slice=kernel_slice, round_num=0,
-            profile_fn=profile_fn,
+        # ── World Model Init ──────────────────────────────────────────────
+        hw_summary = (
+            f"NVIDIA B200 (sm_100a, Blackwell) — 8 TB/s HBM3e, 142 SMs, "
+            f"228KB smem/SM, 255 regs/thread, 126MB L2 (cycled = cold)")
+        wm = WorldModel(
+            engine=self.engine,
+            kernel_src=env.kernel_src,
+            kernel_type=env.kernel_type,
+            problem_shape=problem_shape,
+            hw_summary=hw_summary,
         )
 
-        # Separate pre-profiled (from tool loop) vs unprofiled (from one-shot fallback)
-        pre_profiled = [c for c in candidates if c.metrics]
-        need_profiling = [c for c in candidates if not c.metrics]
+        wm_strategies = wm.init_strategies(n=self.beam_w * 2)
 
-        if need_profiling:
-            logger.info("Profiling %d one-shot beams in parallel...", len(need_profiling))
-            fresh_metrics = self._profile_candidates_parallel(
-                need_profiling, problem_shape, baseline_us)
-        else:
-            fresh_metrics = []
+        # Fallback to old decompose if WM fails
+        if not wm_strategies:
+            logger.warning("WM init failed — falling back to freeform decompose")
+            raw = self.engine.run_decompose()
+            wm_strategies = [
+                {"name": s.get("name", s) if isinstance(s, dict) else s,
+                 "what": s.get("what", "") if isinstance(s, dict) else "",
+                 "score": 0.5, "difficulty": 3, "rationale": ""}
+                for s in raw
+            ]
 
-        metrics_list = [
-            (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
-            for c in pre_profiled
-        ] + fresh_metrics
+        # ── Build search tree ─────────────────────────────────────────────
+        tree = SearchTree()
 
-        for c, _ in metrics_list:
-            env.optimization_history.record(c)
-            logger.info("  %s", c.summary())
+        # Root = naive kernel (always CLOSED)
+        naive_candidate = KernelCandidate(
+            code=env.kernel_src_raw, strategy="naive_reference",
+            round_num=0, compile_ok=True, correct=True,
+            speedup=baseline_us / search_naive_us if search_naive_us else 0.5,
+        )
+        root = tree.create_root(naive_candidate)
 
-        # Collect failed round-0 strategies for retry — these were the LLM's
-        # top picks but failed due to implementation bugs (not bad ideas)
-        self._failed_strategies = []
-        for (c, _), strat in zip(metrics_list, strategies):
-            if not c.is_viable():
-                error = c.compile_error or "Unknown failure"
-                self._failed_strategies.append((strat, error))
-        if self._failed_strategies:
-            names = [s.get("name", s) if isinstance(s, dict) else s
-                     for s, _ in self._failed_strategies]
-            logger.info("Failed strategies saved for retry: %s", names)
+        # Add WM-proposed strategies as OPEN children of root
+        for s in wm_strategies:
+            tree.add_strategy_node(
+                root, s["name"], s["what"],
+                score=s["score"], difficulty=s["difficulty"],
+            )
 
-        survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
-        for s in survivors:
-            if s.prev_metrics is None:
-                s.prev_metrics = s.metrics
-            # Initialize best-code tracking for refinement
-            s.best_code = s.code
-            s.best_speedup = s.speedup
+        logger.info("Tree initialized: %s", tree.stats())
+        env.current_round = 0
 
-        # ── Rounds 1-N: Refine ─────────────────────────────────────────────
-        for round_num in range(1, self.rounds + 1):
+        # ── Action cycles ─────────────────────────────────────────────────
+        # Each round: pick top-N frontier nodes, run action cycle, evolve WM
+        total_rounds = self.rounds + 1  # +1 because round 0 is first generation
+        kernel_slice = env.kernel_src
+
+        for round_num in range(total_rounds):
             env.current_round = round_num
 
             if env.over_budget():
                 logger.warning("Budget exhausted at round %d", round_num)
                 break
-            if not survivors:
-                logger.warning("No viable survivors — stopping early")
+            if not tree.has_frontier():
+                logger.warning("No frontier nodes — stopping")
                 break
 
-            logger.info("--- Round %d ---", round_num)
+            logger.info("--- Round %d (%s) ---", round_num, tree.stats())
 
-            # Split survivors into refineable vs stagnant
-            to_refine = []
-            stagnant = []
-            for s in survivors:
-                if s.refine_attempts >= 3:
-                    stagnant.append(s)
-                    logger.info("  Retiring stagnant [%s] after %d failed refine attempts",
-                                s.strategy, s.refine_attempts)
-                else:
-                    to_refine.append(s)
-                    # Don't increment here — increment based on outcome below
+            # ── Select top-N frontier nodes (deterministic argmax by score)
+            chosen = tree.choose_top_n_frontier(self.beam_w)
+            if not chosen:
+                logger.warning("No selectable frontier nodes")
+                break
 
-            # Refine non-stagnant survivors (inner loop profiles via callback)
-            refined = []
-            if to_refine:
-                profile_fn = self._make_inner_profile_fn(problem_shape, baseline_us)
-                refined = self.engine.run_refine_beams(
-                    to_refine, round_num, profile_fn=profile_fn)
+            for nd in chosen:
+                logger.info("  Selected [%s] %s (score=%.2f d=%d attempts=%d)",
+                            nd.node_id, nd.strategy_name,
+                            nd.score, nd.difficulty, nd.attempt_count)
 
-            # Fill stagnant slots: first retry failed strategies, then use reserves
-            fresh = []
-            slots_available = len(stagnant)
-            best_code = max(survivors, key=lambda c: c.speedup).code if survivors else kernel_slice
+            # ── Phase 1: Generate first attempts (parallel) ───────────────
+            # Nodes that haven't been tried yet → generate from parent code
+            to_generate_nodes = [nd for nd in chosen if nd.attempt_count == 0]
+            # Nodes with a previous best → refine it
+            to_refine_nodes = [nd for nd in chosen if nd.attempt_count > 0
+                               and nd.candidate and nd.candidate.is_viable()]
+            # Nodes that failed before → retry generation with error context
+            to_retry_nodes = [nd for nd in chosen if nd.attempt_count > 0
+                              and (not nd.candidate or not nd.candidate.is_viable())]
 
-            # Priority 1: retry failed strategies with error context
-            if slots_available > 0 and self._failed_strategies:
-                n_retry = min(slots_available, len(self._failed_strategies))
-                to_retry = self._failed_strategies[:n_retry]
-                self._failed_strategies = self._failed_strategies[n_retry:]
+            profile_fn = self._make_inner_profile_fn(problem_shape, baseline_us)
+            round_results = []  # list of (node, candidate)
 
-                retry_strats = []
-                for strat, error in to_retry:
-                    name = strat.get("name", strat) if isinstance(strat, dict) else strat
-                    what = strat.get("what", "") if isinstance(strat, dict) else ""
-                    retry_strats.append({
-                        "name": name,
-                        "what": (what + f"\n\nWARNING — Previous attempt FAILED:\n{error[:400]}\n"
-                                 "Fix the bug. Common cause: __syncthreads() inside if/else "
-                                 "causes deadlock — all threads in a block MUST hit every barrier."),
+            # Generate fresh beams
+            if to_generate_nodes:
+                strategies = []
+                for nd in to_generate_nodes:
+                    strategies.append({
+                        "name": nd.strategy_name,
+                        "what": nd.strategy_description,
                     })
 
-                logger.info("  Retrying %d failed strategies: %s",
-                            n_retry, [s["name"] for s in retry_strats])
-                fresh = self.engine.run_generate_beams(
-                    strategies=retry_strats, kernel_slice=best_code,
-                    round_num=round_num, profile_fn=profile_fn,
-                )
-                slots_available -= n_retry
+                # Use parent code as base (root's code = naive kernel)
+                # Group by parent to batch efficiently
+                parent_groups = {}
+                for nd, strat in zip(to_generate_nodes, strategies):
+                    base = nd.parent_code or kernel_slice
+                    parent_groups.setdefault(id(base), (base, []))[1].append(
+                        (nd, strat))
 
-            # Priority 2: fresh reserve strategies for remaining slots
-            if slots_available > 0 and self._reserve_strategies:
-                n_fresh = min(slots_available, len(self._reserve_strategies))
-                fresh_strats = self._reserve_strategies[:n_fresh]
-                self._reserve_strategies = self._reserve_strategies[n_fresh:]
-                logger.info("  Replacing %d stagnant beams with fresh strategies: %s",
-                            n_fresh, [s.get("name", s) if isinstance(s, dict) else s for s in fresh_strats])
-                fresh += self.engine.run_generate_beams(
-                    strategies=fresh_strats, kernel_slice=best_code,
-                    round_num=round_num, profile_fn=profile_fn,
-                )
+                for _, (base_code, items) in parent_groups.items():
+                    strats = [s for _, s in items]
+                    nodes = [n for n, _ in items]
+                    candidates = self.engine.run_generate_beams(
+                        strategies=strats,
+                        kernel_slice=base_code,
+                        round_num=round_num,
+                        profile_fn=profile_fn,
+                    )
+                    round_results.extend(zip(nodes, candidates))
 
-            # Refined candidates are already profiled by the inner loop.
-            # Fresh beams may be pre-profiled (tool loop) or need profiling (one-shot).
-            fresh_pre_profiled = [c for c in fresh if c.metrics]
-            fresh_need_profiling = [c for c in fresh if not c.metrics]
-            if fresh_need_profiling:
-                fresh_metrics = self._profile_candidates_parallel(
-                    fresh_need_profiling, problem_shape, baseline_us)
-            else:
-                fresh_metrics = []
+            # Refine existing viable candidates
+            if to_refine_nodes:
+                parents = []
+                for nd in to_refine_nodes:
+                    c = nd.candidate
+                    c.prev_metrics = c.metrics
+                    c.best_code = c.code
+                    c.best_speedup = c.speedup
+                    parents.append(c)
+                refined = self.engine.run_refine_beams(
+                    parents, round_num, profile_fn=profile_fn)
+                round_results.extend(zip(to_refine_nodes, refined))
 
-            # Combine: refined (already profiled) + fresh pre-profiled + fresh just-profiled
-            new_metrics = [
-                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
-                for c in refined
-            ] + [
-                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
-                for c in fresh_pre_profiled
-            ] + fresh_metrics
+            # Retry failed nodes with error context
+            if to_retry_nodes:
+                for nd in to_retry_nodes:
+                    err = (nd.candidate.compile_error if nd.candidate
+                           else "Unknown failure")
+                    strat = {
+                        "name": nd.strategy_name,
+                        "what": (nd.strategy_description +
+                                 f"\n\nPrevious attempt FAILED:\n{err[:400]}\n"
+                                 "Fix the bug. Try a different implementation."),
+                    }
+                    base_code = nd.parent_code or kernel_slice
+                    cands = self.engine.run_generate_beams(
+                        strategies=[strat],
+                        kernel_slice=base_code,
+                        round_num=round_num,
+                        profile_fn=profile_fn,
+                    )
+                    if cands:
+                        round_results.append((nd, cands[0]))
 
-            for c, _ in new_metrics:
-                env.optimization_history.record(c)
-                logger.info("  New: %s", c.summary())
+            # ── Profile unprofiled candidates ─────────────────────────────
+            for nd, c in round_results:
+                if c.code and not c.metrics:
+                    self._profile_candidate(c, problem_shape, baseline_us)
 
-            # Track refinement outcomes on parent survivors + build history
-            for i, (refined_c, _) in enumerate(new_metrics):
-                if i < len(to_refine):
-                    parent = to_refine[i]
-                    entry = {"round": round_num, "strategy": refined_c.strategy,
-                             "speedup": refined_c.speedup,
-                             "strategy_desc": getattr(refined_c, 'strategy_desc', '')}
+            # ── Update tree nodes with results ────────────────────────────
+            newly_closed = []
+            failed_nodes = []
 
-                    if not refined_c.compile_ok:
-                        entry["outcome"] = "compile_fail"
-                        parent.last_refine_error = refined_c.compile_error or "Compile failure"
-                        parent.refine_attempts += 1
-                    elif not refined_c.correct:
-                        entry["outcome"] = "correctness_fail"
-                        parent.last_refine_error = refined_c.compile_error or "Correctness failure (output mismatch or kernel hung)"
-                        parent.refine_attempts += 1
-                    elif refined_c.speedup < parent.speedup - 0.001:
-                        entry["outcome"] = "regression"
-                        parent.refine_attempts += 1
-                        msg = f"Your refinement was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
-                        rm = refined_c.metrics or {}
-                        rc = rm.get("_compiler", {})
-                        pm = parent.metrics or {}
-                        pc = pm.get("_compiler", {})
-                        if rc and pc:
-                            r_regs = rc.get("registers_per_thread", 0)
-                            p_regs = pc.get("registers_per_thread", 0)
-                            r_occ = rm.get("sm_occupancy", 0)
-                            p_occ = pm.get("sm_occupancy", 0)
-                            if r_regs != p_regs or r_occ != p_occ:
-                                msg += f" Registers: {p_regs}->{r_regs}, Occupancy: {p_occ:.0f}%->{r_occ:.0f}%."
-                        parent.last_refine_error = msg
-                    elif refined_c.speedup > parent.speedup + 0.02:
-                        entry["outcome"] = "improved"
-                        parent.last_refine_error = ""
-                        parent.refine_attempts = 0  # reset on real improvement
-                        # Update best-known code for this beam lineage
-                        if refined_c.speedup > (parent.best_speedup or 0):
-                            refined_c.best_code = refined_c.code
-                            refined_c.best_speedup = refined_c.speedup
+            for nd, child_c in round_results:
+                env.optimization_history.record(child_c)
+                nd.attempt_count += 1
+                logger.info("  %s", child_c.summary())
+
+                if child_c.is_viable():
+                    improved = child_c.speedup > nd.best_cycle_speedup + 0.02
+                    if improved:
+                        nd.best_cycle_speedup = child_c.speedup
+                        nd.candidate = child_c
+                        nd.stagnant_count = 0
+                        logger.info("    IMPROVED -> %.3fx (attempts=%d)",
+                                    child_c.speedup, nd.attempt_count)
                     else:
-                        entry["outcome"] = "stagnant"
-                        parent.refine_attempts += 1
-                        parent.last_refine_error = (
-                            f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
-                            f"{parent.speedup:.3f}x). Try a fundamentally different approach."
-                        )
-
-                    # Update prev_metrics so the delta section shows what the
-                    # failed refinement changed — closes the feedback loop
-                    if refined_c.metrics:
-                        parent.prev_metrics = refined_c.metrics
-
-                    parent.refinement_history.append(entry)
-                    refined_c.refinement_history = list(parent.refinement_history)
-
-            # Problem 2: only promote refinements that actually improved
-            improved_new = []
-            for i, (refined_c, m) in enumerate(new_metrics):
-                if i < len(to_refine):
-                    parent = to_refine[i]
-                    if refined_c.speedup > parent.speedup:
-                        improved_new.append((refined_c, m))
-                    # else: regressed/stagnant — don't pollute the beam
+                        nd.stagnant_count += 1
+                        # Keep better candidate
+                        if not nd.candidate or child_c.speedup > nd.candidate.speedup:
+                            nd.candidate = child_c
+                        logger.info("    STAGNANT (%d/%d) %.3fx",
+                                    nd.stagnant_count, STAGNATION_K,
+                                    child_c.speedup)
                 else:
-                    # Fresh beams always enter the pool
-                    improved_new.append((refined_c, m))
+                    nd.stagnant_count += 1
+                    if not nd.candidate:
+                        nd.candidate = child_c  # keep even failed for error tracking
+                    logger.info("    FAILED (attempts=%d stagnant=%d)",
+                                nd.attempt_count, nd.stagnant_count)
 
-            all_candidates = [
-                (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())
-                for s in survivors
-            ] + improved_new
-            prev_survivor_ids = {id(s) for s in survivors}
-            survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
-            # Only set prev_metrics on NEW entrants; carried-over survivors keep theirs
-            for s in survivors:
-                if id(s) not in prev_survivor_ids:
-                    s.prev_metrics = s.metrics
+                # Check stagnation → close the node
+                if nd.stagnant_count >= STAGNATION_K or nd.attempt_count >= MAX_NODE_EXPANSIONS:
+                    if nd.candidate and nd.candidate.is_viable():
+                        tree.close_node(nd, nd.candidate)
+                        newly_closed.append(nd)
+                        logger.info("    CLOSED [%s] at %.3fx after %d attempts",
+                                    nd.strategy_name, nd.speedup, nd.attempt_count)
+                    else:
+                        nd.is_open = False  # dead node
+                        failed_nodes.append(nd)
+                        logger.info("    DEAD [%s] after %d failed attempts",
+                                    nd.strategy_name, nd.attempt_count)
 
-        # ── Final: Combine top-2 ───────────────────────────────────────────
+            # ── World Model Evolution ─────────────────────────────────────
+            if newly_closed or failed_nodes:
+                tree_json = tree.to_compact_json()
+
+                # Evolve: insert children of successful nodes, update scores
+                if newly_closed:
+                    results_summary = self._format_round_results(
+                        [(nd, nd.candidate) for nd in newly_closed])
+                    edits = wm.evolve(tree_json, results_summary)
+                    tree.apply_wm_edits(edits)
+
+                # Handle failures: downgrade, propose alternatives
+                if failed_nodes:
+                    failed_summary = self._format_failed_nodes(failed_nodes)
+                    edits = wm.note_failure(tree_json, failed_summary)
+                    tree.apply_wm_edits(edits)
+
+                logger.info("  After WM evolution: %s", tree.stats())
+
+        # ── Final: Combine top-2 from entire tree ─────────────────────────
+        best_nodes = tree.get_best_n(max(self.beam_w, 4))
+        survivors = [nd.candidate for nd in best_nodes]
+
+        logger.info("K-Search complete: %s", tree.stats())
+        for i, nd in enumerate(best_nodes[:4]):
+            logger.info("  Top-%d: [%s] %s %.3fx (depth=%d)",
+                        i + 1, nd.node_id, nd.strategy_name,
+                        nd.speedup, nd.depth)
+
         top_for_combine = self.selector.select_for_combination(survivors)
         logger.info("Combining %d top beams", len(top_for_combine))
 
         if len(top_for_combine) >= 2:
             final = self.engine.combine(top_for_combine)
             m     = self._profile_candidate(final, problem_shape, baseline_us)
-            best_survivor = max(survivors, key=lambda c: c.speedup) if survivors else None
+            best_survivor = (max(survivors, key=lambda c: c.speedup)
+                             if survivors else None)
             if best_survivor and final.speedup < best_survivor.speedup * 0.95:
                 logger.warning("Combination regressed (%.3fx < %.3fx) — reverting",
                                final.speedup, best_survivor.speedup)
@@ -646,14 +905,12 @@ int main(int argc, char** argv) {{
         else:
             final = (top_for_combine[0] if top_for_combine
                      else survivors[0] if survivors
-                     else candidates[0])
+                     else KernelCandidate(code="", strategy="none"))
 
         logger.info("="*60)
         logger.info("Search complete: %s", final.summary())
         logger.info("Total API cost: $%.4f", env.total_api_cost_usd)
         logger.info("="*60)
 
-        # Clean up async client to prevent 'Event loop is closed' errors
         self.engine.close()
-
         return final
