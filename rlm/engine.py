@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 import anthropic
@@ -23,6 +25,8 @@ from .reflector import (
 )
 
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).parent.parent
 
 
 # ── Refinement: tool-use agent loop ────────────────────────────────────────
@@ -59,11 +63,61 @@ SUBMIT_KERNEL_TOOL = {
     },
 }
 
+INSPECT_SASS_TOOL = {
+    "name": "inspect_sass",
+    "description": (
+        "Compile CUDA code and return the full SASS assembly (cuobjdump -sass output). "
+        "Use this to see exactly what instructions the compiler generated — load widths, "
+        "branch counts, spills, vectorization, etc. Does NOT run or benchmark the kernel. "
+        "Costs no submit_kernel turn."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "cuda_code": {
+                "type": "string",
+                "description": "Complete .cu file to compile and disassemble.",
+            }
+        },
+        "required": ["cuda_code"],
+    },
+}
+
+READ_FILE_TOOL = {
+    "name": "read_file",
+    "description": (
+        "Read a source file from the project. Available files:\n"
+        "- kernels/common/nvfp4_utils.cuh — FP4/FP8 quantization helpers, pack/unpack\n"
+        "- kernels/common/b200_intrinsics.cuh — Blackwell TMA, TMEM, pipeline wrappers\n"
+        "- kernels/reference/add_rmsnorm.cu — Naive Add+RMSNorm+FP4 reference kernel\n"
+        "- kernels/reference/silu_mul.cu — Naive SiLU*Mul+FP4 reference kernel\n"
+        "- kernels/reference/nvfp4_quantize.cu — Naive BF16→FP4 reference kernel\n"
+        "Costs no submit_kernel turn."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path from project root (e.g. 'kernels/common/nvfp4_utils.cuh')",
+            }
+        },
+        "required": ["path"],
+    },
+}
+
+ALL_TOOLS = [SUBMIT_KERNEL_TOOL, INSPECT_SASS_TOOL, READ_FILE_TOOL]
+
 REFINE_SYSTEM_PROMPT = f"""\
 You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
 
 Your speedup is measured against FlashInfer, a production GPU library.
 You target a single GPU (B200, sm_100a) and a single problem shape — use this to your advantage.
+
+Available tools (inspect_sass and read_file do NOT count toward your submit limit):
+- submit_kernel: compile, test correctness, and benchmark your kernel
+- inspect_sass: compile code and see the raw SASS assembly (instruction-level view)
+- read_file: read project header files (nvfp4_utils.cuh, b200_intrinsics.cuh) or reference kernels
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
@@ -355,12 +409,16 @@ Respond with ONLY the JSON array, nothing else."""
             messages = [{"role": "user", "content": initial_prompt}]
             best = None
             prev_inner_metrics = None
+            submit_count = 0
+            max_api_turns = MAX_INNER_TURNS + 4  # extra turns for non-submit tools
 
-            for turn in range(MAX_INNER_TURNS):
+            for turn in range(max_api_turns):
+                if submit_count >= MAX_INNER_TURNS:
+                    break
                 try:
                     response = await self._call_llm_with_tools_async(
                         messages=messages,
-                        tools=[SUBMIT_KERNEL_TOOL],
+                        tools=ALL_TOOLS,
                         model=self.sub_model,
                         system=system_prompt,
                         temperature=0.5,
@@ -372,45 +430,47 @@ Respond with ONLY the JSON array, nothing else."""
 
                 messages.append({"role": "assistant", "content": response.content})
 
-                tool_block = next(
-                    (b for b in response.content
-                     if b.type == "tool_use" and b.name == "submit_kernel"),
-                    None,
-                )
-                if not tool_block:
-                    logger.info("GEN [%s] turn %d: no tool call", strat_name, turn)
-                    break
+                # Handle all tool calls (inspect_sass, read_file handled inline)
+                submit_code, submit_block_id, aux_results = self._handle_tool_calls(
+                    response, messages, profile_fn, strat_name, round_num,
+                    1.0, prev_inner_metrics)
 
-                code = tool_block.input.get("cuda_code", "")
-                if not code:
-                    messages.append({"role": "user", "content": [
-                        {"type": "tool_result", "tool_use_id": tool_block.id,
-                         "content": "Error: empty cuda_code. Submit the complete .cu file.",
-                         "is_error": True}
-                    ]})
+                # If only auxiliary tools were called, continue the conversation
+                if submit_code is None and not submit_block_id:
+                    if not aux_results:
+                        # No tool calls at all
+                        has_any_tool = any(b.type == "tool_use" for b in response.content)
+                        if not has_any_tool:
+                            logger.info("GEN [%s] turn %d: no tool call", strat_name, turn)
+                            break
                     continue
 
+                if submit_code is None:
+                    # submit_kernel with empty code — error already appended
+                    continue
+
+                submit_count += 1
                 result = await asyncio.get_event_loop().run_in_executor(
-                    None, profile_fn, code, strat_name, round_num)
+                    None, profile_fn, submit_code, strat_name, round_num)
 
                 tool_result_text = self._format_tool_result(
                     result, 1.0, prev_inner_metrics)
                 if result["compile_ok"] and result["correct"] and result.get("metrics"):
                     prev_inner_metrics = result["metrics"]
                 messages.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": tool_block.id,
+                    {"type": "tool_result", "tool_use_id": submit_block_id,
                      "content": tool_result_text}
                 ]})
 
-                logger.info("GEN [%s] turn %d: compile=%s correct=%s speedup=%.3fx",
-                            strat_name, turn,
+                logger.info("GEN [%s] submit %d: compile=%s correct=%s speedup=%.3fx",
+                            strat_name, submit_count,
                             result["compile_ok"], result["correct"],
                             result.get("speedup", 0))
 
                 if result["compile_ok"] and result["correct"]:
                     if best is None or result["speedup"] > best.speedup:
                         best = KernelCandidate(
-                            code=code,
+                            code=submit_code,
                             strategy=strat_name,
                             round_num=round_num,
                             compile_ok=True,
@@ -623,13 +683,17 @@ CRITICAL RULES:
         best = None              # best KernelCandidate from inner loop
         last_error = ""
         prev_inner_metrics = metrics  # initialize to parent metrics for turn 0 deltas
+        submit_count = 0
+        max_api_turns = MAX_INNER_TURNS + 4  # extra turns for non-submit tools
 
-        for turn in range(MAX_INNER_TURNS):
+        for turn in range(max_api_turns):
+            if submit_count >= MAX_INNER_TURNS:
+                break
             try:
                 system_prompt = _build_refine_system_prompt(parent.speedup)
                 response = await self._call_llm_with_tools_async(
                     messages=messages,
-                    tools=[SUBMIT_KERNEL_TOOL],
+                    tools=ALL_TOOLS,
                     model=self.sub_model,
                     system=system_prompt,
                     temperature=0.4,
@@ -648,34 +712,34 @@ CRITICAL RULES:
             # Append assistant message to conversation history
             messages.append({"role": "assistant", "content": response.content})
 
-            # Find submit_kernel tool call
-            tool_block = next(
-                (b for b in response.content
-                 if b.type == "tool_use" and b.name == "submit_kernel"),
-                None,
-            )
+            # Handle all tool calls (inspect_sass, read_file handled inline)
+            submit_code, submit_block_id, aux_results = self._handle_tool_calls(
+                response, messages, profile_fn, parent.strategy, round_num,
+                parent.speedup, prev_inner_metrics)
 
-            if not tool_block:
-                text_parts = [b.text for b in response.content
-                              if hasattr(b, 'text')]
-                logger.info("REFINE [%s] turn %d: no tool call: %s",
-                            parent.strategy, turn,
-                            " ".join(text_parts)[:200])
-                break
-
-            code = tool_block.input.get("cuda_code", "")
-            if not code:
-                messages.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": tool_block.id,
-                     "content": "Error: empty cuda_code. Submit the complete .cu file.",
-                     "is_error": True}
-                ]})
+            # If only auxiliary tools were called, continue the conversation
+            if submit_code is None and not submit_block_id:
+                if not aux_results:
+                    has_any_tool = any(b.type == "tool_use" for b in response.content)
+                    if not has_any_tool:
+                        text_parts = [b.text for b in response.content
+                                      if hasattr(b, 'text')]
+                        logger.info("REFINE [%s] turn %d: no tool call: %s",
+                                    parent.strategy, turn,
+                                    " ".join(text_parts)[:200])
+                        break
                 continue
+
+            if submit_code is None:
+                # submit_kernel with empty code — error already appended
+                continue
+
+            submit_count += 1
 
             # Profile the submission via callback
             if profile_fn:
                 result = await asyncio.get_event_loop().run_in_executor(
-                    None, profile_fn, code, parent.strategy, round_num)
+                    None, profile_fn, submit_code, parent.strategy, round_num)
             else:
                 result = {"compile_ok": False, "correct": False, "speedup": 0,
                           "metrics": {}, "error": "No profiler available",
@@ -687,16 +751,16 @@ CRITICAL RULES:
             if result["compile_ok"] and result["correct"] and result.get("metrics"):
                 prev_inner_metrics = result["metrics"]
             messages.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": tool_block.id,
+                {"type": "tool_result", "tool_use_id": submit_block_id,
                  "content": tool_result_text}
             ]})
-            
-            logger.info("\n📊 FEEDBACK QUALITY DELIVERED [%s turn %d]:\n%s\n", parent.strategy, turn, tool_result_text)
+
+            logger.info("\n📊 FEEDBACK QUALITY DELIVERED [%s submit %d]:\n%s\n", parent.strategy, submit_count, tool_result_text)
 
             new_spd = result.get("speedup", 0)
             delta = new_spd - parent.speedup
-            logger.info("📈 IMPROVEMENT TRACKER [%s turn %d]: compile=%s correct=%s | Base=%.3fx -> New=%.3fx (Delta: %+.3fx)",
-                         parent.strategy, turn,
+            logger.info("📈 IMPROVEMENT TRACKER [%s submit %d]: compile=%s correct=%s | Base=%.3fx -> New=%.3fx (Delta: %+.3fx)",
+                         parent.strategy, submit_count,
                          result["compile_ok"], result["correct"],
                          parent.speedup, new_spd, delta)
 
@@ -704,7 +768,7 @@ CRITICAL RULES:
             if result["compile_ok"] and result["correct"]:
                 if best is None or result["speedup"] > best.speedup:
                     best = KernelCandidate(
-                        code=code,
+                        code=submit_code,
                         strategy=f"{parent.strategy}_r{round_num}",
                         round_num=round_num,
                         compile_ok=True,
@@ -737,6 +801,151 @@ CRITICAL RULES:
         failed.strategy_context = strat_ctx
         failed.strategy_desc = ""
         return failed
+
+    # ── Auxiliary tool handlers ────────────────────────────────────────────────
+
+    def _handle_inspect_sass(self, cuda_code: str) -> str:
+        """Compile code and return raw SASS disassembly via cuobjdump."""
+        build_dir = Path(self.env.search_config.get("output", {}).get("output_dir", "outputs")) / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        kernel_file = build_dir / "_sass_inspect.cu"
+        binary_file = build_dir / "_sass_inspect"
+
+        # Write source — need harness for compilation, but we only care about SASS
+        kernel_file.write_text(cuda_code)
+
+        nvcc_flags = [
+            "-O3", "-arch=sm_100a", "--use_fast_math", "-std=c++17",
+            f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            "-c",  # compile only, no link — faster and avoids missing main()
+            "-o", str(binary_file) + ".o",
+        ]
+        cmd = ["nvcc"] + nvcc_flags + [str(kernel_file)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                error_lines = [l for l in result.stderr.splitlines()
+                               if 'error' in l.lower() and ('(' in l or ':' in l)]
+                first_err = error_lines[0].strip() if error_lines else result.stderr[:300]
+                return f"COMPILE ERROR (cannot inspect SASS):\n{first_err}"
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            return f"Compilation failed: {e}"
+
+        # Disassemble
+        try:
+            sass_result = subprocess.run(
+                ["cuobjdump", "-sass", str(binary_file) + ".o"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if sass_result.returncode != 0:
+                return f"cuobjdump failed: {sass_result.stderr[:300]}"
+            sass = sass_result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            return f"cuobjdump not available: {e}"
+
+        # Truncate if very long (keep first 400 lines — enough for one kernel)
+        lines = sass.splitlines()
+        if len(lines) > 400:
+            sass = "\n".join(lines[:400]) + f"\n... ({len(lines) - 400} more lines truncated)"
+
+        return sass if sass.strip() else "No SASS output (empty binary?)"
+
+    def _handle_read_file(self, path: str) -> str:
+        """Read an allowed project file."""
+        ALLOWED_PREFIXES = [
+            "kernels/common/",
+            "kernels/reference/",
+        ]
+        # Normalize and validate
+        clean = path.strip().lstrip("/")
+        if not any(clean.startswith(p) for p in ALLOWED_PREFIXES):
+            return (f"Access denied: '{path}'. Allowed paths:\n"
+                    "- kernels/common/nvfp4_utils.cuh\n"
+                    "- kernels/common/b200_intrinsics.cuh\n"
+                    "- kernels/reference/add_rmsnorm.cu\n"
+                    "- kernels/reference/silu_mul.cu\n"
+                    "- kernels/reference/nvfp4_quantize.cu")
+
+        full_path = PROJECT_ROOT / clean
+        if not full_path.exists():
+            return f"File not found: {clean}"
+        try:
+            content = full_path.read_text()
+            # Truncate very large files
+            if len(content) > 12000:
+                content = content[:12000] + "\n... (truncated)"
+            return content
+        except Exception as e:
+            return f"Error reading {clean}: {e}"
+
+    def _handle_tool_calls(self, response, messages, profile_fn, strategy_name,
+                           round_num, parent_speedup, prev_inner_metrics):
+        """Process all tool calls in a response. Returns (submit_result, updated_prev_metrics, had_submit).
+
+        Non-submit tools (inspect_sass, read_file) are handled inline and their
+        results appended to messages. Only submit_kernel triggers profiling.
+        Returns the submit_kernel result dict if one was found, else None.
+        """
+        tool_results = []
+        submit_result = None
+        submit_code = None
+        submit_block_id = None
+
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            if block.name == "inspect_sass":
+                code = block.input.get("cuda_code", "")
+                if not code:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty cuda_code.", "is_error": True,
+                    })
+                else:
+                    logger.info("🔍 INSPECT_SASS [%s]: compiling for SASS dump", strategy_name)
+                    sass_output = self._handle_inspect_sass(code)
+                    logger.info("🔍 SASS [%s]: %d lines returned", strategy_name,
+                                len(sass_output.splitlines()))
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": sass_output,
+                    })
+
+            elif block.name == "read_file":
+                path = block.input.get("path", "")
+                if not path:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty path.", "is_error": True,
+                    })
+                else:
+                    logger.info("📖 READ_FILE [%s]: %s", strategy_name, path)
+                    content = self._handle_read_file(path)
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": content,
+                    })
+
+            elif block.name == "submit_kernel":
+                code = block.input.get("cuda_code", "")
+                if not code:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty cuda_code. Submit the complete .cu file.",
+                        "is_error": True,
+                    })
+                else:
+                    submit_code = code
+                    submit_block_id = block.id
+
+        # Handle submit_kernel separately (needs async profiling)
+        # Return info for caller to handle
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+
+        return submit_code, submit_block_id, tool_results
 
     def _format_tool_result(self, result: dict, parent_speedup: float,
                             prev_inner_metrics: dict = None) -> str:
