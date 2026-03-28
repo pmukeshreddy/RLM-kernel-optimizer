@@ -333,11 +333,11 @@ Respond with ONLY the JSON array, nothing else."""
             return strategies  # return ALL — caller splits active vs reserve
 
         # Fallback: use kernel-aware defaults from strategy bank
-        from search.strategy_bank import select_for_kernel
+        from search.strategy_bank import select_for_kernel, STRATEGY_BANK
         fallback = select_for_kernel(
             kernel_type=env.kernel_type, tried=[], beam_width=num_strategies)
         logger.info("Fallback to kernel-aware strategies: %s", fallback)
-        return [{"name": s, "what": ""} for s in fallback]
+        return [{"name": s, "what": STRATEGY_BANK[s].description} for s in fallback if s in STRATEGY_BANK]
 
     # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
 
