@@ -452,23 +452,27 @@ Respond with ONLY the JSON array, nothing else."""
 
                 messages.append({"role": "assistant", "content": response.content})
 
-                # Handle all tool calls (inspect_sass, read_file handled inline)
+                # Handle all tool calls
                 submit_code, submit_block_id, aux_results = self._handle_tool_calls(
                     response, messages, profile_fn, strat_name, round_num,
                     1.0, prev_inner_metrics)
 
-                # If only auxiliary tools were called, continue the conversation
+                # If only auxiliary tools were called, send results and continue
                 if submit_code is None and not submit_block_id:
                     if not aux_results:
-                        # No tool calls at all
                         has_any_tool = any(b.type == "tool_use" for b in response.content)
                         if not has_any_tool:
                             logger.info("GEN [%s] turn %d: no tool call", strat_name, turn)
                             break
+                    # Send aux-only results as one message
+                    if aux_results:
+                        messages.append({"role": "user", "content": aux_results})
                     continue
 
                 if submit_code is None:
-                    # submit_kernel with empty code — error already appended
+                    # submit_kernel with empty code — error in aux_results
+                    if aux_results:
+                        messages.append({"role": "user", "content": aux_results})
                     continue
 
                 submit_count += 1
@@ -479,10 +483,12 @@ Respond with ONLY the JSON array, nothing else."""
                     result, 1.0, prev_inner_metrics)
                 if result["compile_ok"] and result["correct"] and result.get("metrics"):
                     prev_inner_metrics = result["metrics"]
-                messages.append({"role": "user", "content": [
+                # Merge aux results + submit result into ONE user message
+                all_results = list(aux_results) + [
                     {"type": "tool_result", "tool_use_id": submit_block_id,
                      "content": tool_result_text}
-                ]})
+                ]
+                messages.append({"role": "user", "content": all_results})
 
                 logger.info("GEN [%s] submit %d: compile=%s correct=%s speedup=%.3fx",
                             strat_name, submit_count,
@@ -741,12 +747,12 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             # Append assistant message to conversation history
             messages.append({"role": "assistant", "content": response.content})
 
-            # Handle all tool calls (inspect_sass, read_file handled inline)
+            # Handle all tool calls
             submit_code, submit_block_id, aux_results = self._handle_tool_calls(
                 response, messages, profile_fn, parent.strategy, round_num,
                 parent.speedup, prev_inner_metrics)
 
-            # If only auxiliary tools were called, continue the conversation
+            # If only auxiliary tools were called, send results and continue
             if submit_code is None and not submit_block_id:
                 if not aux_results:
                     has_any_tool = any(b.type == "tool_use" for b in response.content)
@@ -757,10 +763,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                                     parent.strategy, turn,
                                     " ".join(text_parts)[:200])
                         break
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
                 continue
 
             if submit_code is None:
-                # submit_kernel with empty code — error already appended
+                # submit_kernel with empty code — error in aux_results
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
                 continue
 
             submit_count += 1
@@ -774,15 +784,16 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                           "metrics": {}, "error": "No profiler available",
                           "bottleneck": "unknown"}
 
-            # Feed result back as tool_result (with delta from prev submission)
+            # Feed result back — merge aux results + submit result into ONE message
             tool_result_text = self._format_tool_result(
                 result, parent.speedup, prev_inner_metrics)
             if result["compile_ok"] and result["correct"] and result.get("metrics"):
                 prev_inner_metrics = result["metrics"]
-            messages.append({"role": "user", "content": [
+            all_results = list(aux_results) + [
                 {"type": "tool_result", "tool_use_id": submit_block_id,
                  "content": tool_result_text}
-            ]})
+            ]
+            messages.append({"role": "user", "content": all_results})
 
             logger.info("\n📊 FEEDBACK QUALITY DELIVERED [%s submit %d]:\n%s\n", parent.strategy, submit_count, tool_result_text)
 
@@ -835,11 +846,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     def _handle_inspect_sass(self, cuda_code: str) -> str:
         """Compile code and return raw SASS disassembly via cuobjdump."""
+        import hashlib
         build_dir = Path(self.env.search_config.get("output", {}).get("output_dir", "outputs")) / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
 
-        kernel_file = build_dir / "_sass_inspect.cu"
-        binary_file = build_dir / "_sass_inspect"
+        # Unique filename to avoid clobber when beams run concurrently
+        uid = hashlib.md5(cuda_code.encode()).hexdigest()[:8]
+        kernel_file = build_dir / f"_sass_inspect_{uid}.cu"
+        binary_file = build_dir / f"_sass_inspect_{uid}"
 
         # Write source — need harness for compilation, but we only care about SASS
         kernel_file.write_text(cuda_code)
@@ -910,14 +924,16 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     def _handle_tool_calls(self, response, messages, profile_fn, strategy_name,
                            round_num, parent_speedup, prev_inner_metrics):
-        """Process all tool calls in a response. Returns (submit_result, updated_prev_metrics, had_submit).
+        """Process all tool calls in a response.
 
-        Non-submit tools (inspect_sass, read_file) are handled inline and their
-        results appended to messages. Only submit_kernel triggers profiling.
-        Returns the submit_kernel result dict if one was found, else None.
+        Returns (submit_code, submit_block_id, aux_results).
+        aux_results is a list of tool_result dicts for non-submit tools.
+
+        IMPORTANT: Does NOT append to messages — caller is responsible for
+        combining aux_results with submit_kernel result into ONE user message
+        to avoid consecutive user messages (Anthropic API requirement).
         """
-        tool_results = []
-        submit_result = None
+        aux_results = []
         submit_code = None
         submit_block_id = None
 
@@ -928,7 +944,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             if block.name == "inspect_sass":
                 code = block.input.get("cuda_code", "")
                 if not code:
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": "Error: empty cuda_code.", "is_error": True,
                     })
@@ -937,7 +953,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     sass_output = self._handle_inspect_sass(code)
                     logger.info("🔍 SASS [%s]: %d lines returned", strategy_name,
                                 len(sass_output.splitlines()))
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": sass_output,
                     })
@@ -945,14 +961,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             elif block.name == "read_file":
                 path = block.input.get("path", "")
                 if not path:
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": "Error: empty path.", "is_error": True,
                     })
                 else:
                     logger.info("📖 READ_FILE [%s]: %s", strategy_name, path)
                     content = self._handle_read_file(path)
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": content,
                     })
@@ -960,7 +976,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             elif block.name == "search_docs":
                 query = block.input.get("query", "")
                 if not query:
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": "Error: empty query.", "is_error": True,
                     })
@@ -968,7 +984,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     from .cuda_docs import search_intrinsics
                     logger.info("📚 SEARCH_DOCS [%s]: %s", strategy_name, query)
                     doc_result = search_intrinsics(query)
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": doc_result,
                     })
@@ -976,7 +992,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             elif block.name == "submit_kernel":
                 code = block.input.get("cuda_code", "")
                 if not code:
-                    tool_results.append({
+                    aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": "Error: empty cuda_code. Submit the complete .cu file.",
                         "is_error": True,
@@ -985,12 +1001,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     submit_code = code
                     submit_block_id = block.id
 
-        # Handle submit_kernel separately (needs async profiling)
-        # Return info for caller to handle
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
-
-        return submit_code, submit_block_id, tool_results
+        return submit_code, submit_block_id, aux_results
 
     def _format_tool_result(self, result: dict, parent_speedup: float,
                             prev_inner_metrics: dict = None) -> str:
