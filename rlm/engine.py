@@ -105,7 +105,30 @@ READ_FILE_TOOL = {
     },
 }
 
-ALL_TOOLS = [SUBMIT_KERNEL_TOOL, INSPECT_SASS_TOOL, READ_FILE_TOOL]
+SEARCH_DOCS_TOOL = {
+    "name": "search_docs",
+    "description": (
+        "Search CUDA intrinsic documentation. Query by keyword to find correct "
+        "function signatures, headers, and usage examples. Covers: FP4/FP8 conversion "
+        "(cuda_fp4.h, cuda_fp8.h), warp intrinsics (shuffle, reduction), fast math "
+        "(SFU), memory intrinsics (ldg, stcg, async copy), bfloat16/half operations.\n"
+        "Example queries: 'fp4 convert float', 'fp8 e4m3 to float', 'warp reduction', "
+        "'fast reciprocal sqrt', 'bfloat16 pair load'\n"
+        "Costs no submit_kernel turn."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search keywords (e.g. 'fp4 quantize float', 'e4m3 convert', 'warp reduce')",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+ALL_TOOLS = [SUBMIT_KERNEL_TOOL, INSPECT_SASS_TOOL, READ_FILE_TOOL, SEARCH_DOCS_TOOL]
 
 REFINE_SYSTEM_PROMPT = f"""\
 You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
@@ -113,10 +136,11 @@ You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls
 Your speedup is measured against FlashInfer, a production GPU library.
 You target a single GPU (B200, sm_100a) and a single problem shape — use this to your advantage.
 
-Available tools (inspect_sass and read_file do NOT count toward your submit limit):
+Available tools (only submit_kernel counts toward your turn limit):
 - submit_kernel: compile, test correctness, and benchmark your kernel
 - inspect_sass: compile code and see the raw SASS assembly (instruction-level view)
 - read_file: read project header files (nvfp4_utils.cuh, b200_intrinsics.cuh) or reference kernels
+- search_docs: look up CUDA intrinsic signatures and usage (fp4, fp8, warp, fast math, memory)
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
@@ -931,6 +955,22 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": content,
+                    })
+
+            elif block.name == "search_docs":
+                query = block.input.get("query", "")
+                if not query:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty query.", "is_error": True,
+                    })
+                else:
+                    from .cuda_docs import search_intrinsics
+                    logger.info("📚 SEARCH_DOCS [%s]: %s", strategy_name, query)
+                    doc_result = search_intrinsics(query)
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": doc_result,
                     })
 
             elif block.name == "submit_kernel":
