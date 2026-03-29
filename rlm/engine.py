@@ -1106,15 +1106,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         speedup = result.get("speedup", 0)
 
         if parent_speedup <= 0:
-            # First submission — no previous to compare against
             above = "above" if speedup >= 1.0 else "below"
             verdict = f"FIRST RESULT: {speedup:.3f}x ({above} FlashInfer baseline)"
-        elif speedup > parent_speedup + 0.02:
+        elif speedup > parent_speedup:
             verdict = f"IMPROVED: {speedup:.3f}x (was {parent_speedup:.3f}x)"
-        elif speedup < parent_speedup - 0.01:
+        elif speedup < parent_speedup:
             verdict = f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x) — revert to your previous approach and make a smaller change"
         else:
-            verdict = f"NO CHANGE: {speedup:.3f}x (was {parent_speedup:.3f}x)"
+            verdict = f"NO CHANGE: {speedup:.3f}x"
 
         parts = [verdict]
 
