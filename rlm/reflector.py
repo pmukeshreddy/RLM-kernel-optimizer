@@ -373,14 +373,15 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
             f"keep computation in native bf16 using bfloat162 pair operations"
         )
 
-    # Bit packing overhead
+    # Bit packing overhead (only penalize if still using software FP4 conversion)
     prmt = cm.get("sass_prmt", 0)
     lop3 = cm.get("sass_lop3", 0)
     shf = cm.get("sass_shf", 0)
-    if prmt + lop3 + shf > 8:
+    if (prmt + lop3 + shf > 8) and (fsetp + sel >= 4):
         hints.append(
             f"Bit manipulation (PRMT={prmt} + LOP3={lop3} + SHF={shf}) — "
-            f"software FP4 packing; use hardware conversion intrinsics"
+            f"software FP4 packing detected alongside predicate chains. "
+            f"Use __nv_cvt_bfloat16raw2_to_fp4x2 conversion intrinsic."
         )
 
     # High total instruction count

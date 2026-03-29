@@ -195,8 +195,11 @@ def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> st
         prmt = cm.get("sass_prmt", 0)
         lop3 = cm.get("sass_lop3", 0)
         shf_cnt = cm.get("sass_shf", 0)
-        if prmt + lop3 + shf_cnt > 8:
-            bottlenecks.append(f"PRMT={prmt}+LOP3={lop3}+SHF={shf_cnt} bit manipulation — use hardware pack intrinsics")
+        # Only penalize PRMT/LOP3/SHF if we are still doing software FP4 quantization
+        # (indicated by high FSETP + SEL). If FSETP is low, PRMT is being used correctly
+        # to pack uint8_t values into uint32_t/uint64_t for vectorized stores!
+        if (prmt + lop3 + shf_cnt > 8) and (fsetp + sel >= 4):
+            bottlenecks.append(f"PRMT={prmt}+LOP3={lop3}+SHF={shf_cnt} bit manipulation — use __nv_cvt_bfloat16raw2_to_fp4x2 instead of manual packing")
 
         if bottlenecks:
             hint = "; ".join(bottlenecks)
