@@ -145,7 +145,7 @@ Available tools (only submit_kernel counts toward your turn limit):
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
 - L2 cache: 126 MB — benchmark uses L2 cache cycling (data is COLD every iteration)
-- 142 SMs, 228 KB shared memory per SM, 255 registers per thread
+- 148 SMs, 228 KB shared memory per SM, 255 registers per thread
 - 128-bit load/store = uint4 = 8 bf16 values per transaction
 - Use read_file to check available hardware intrinsics in the project headers
 
@@ -387,7 +387,7 @@ You target ONE GPU (B200, sm_100a) and ONE shape ({env.problem_shapes[0]}).
 
 Kernel type: {env.kernel_type}
 Problem shape: {env.problem_shapes[0]}
-Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 142 SMs, 228KB smem/SM)
+Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 148 SMs, 228KB smem/SM)
 
 ```cuda
 {kernel_src}
@@ -687,12 +687,13 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         prev_metrics = parent.prev_metrics
         has_fresh_data = bool(prev_metrics) and prev_metrics != metrics
 
-        # Build profiler observation
+        # Build profiler observation — always show CURRENT best's SASS profile
+        # so the model knows what's left to optimize in the kernel it's refining
         if has_fresh_data:
-            profile_section = _format_profile_section(prev_metrics, round_num)
+            profile_section = _format_profile_section(metrics, round_num)
             ineffective, ineff_lines = _compute_proven_ineffective(prev_metrics, metrics)
-            delta_section = _format_delta_section(prev_metrics, metrics,
-                                                  title="Last Attempt vs Current Best")
+            delta_section = _format_delta_section(metrics, prev_metrics,
+                                                  title="How Current Best Improved vs Previous")
             if ineff_lines:
                 dead_ends = "\n### Proven Non-Bottlenecks (do NOT optimize these)\n"
                 dead_ends += "\n".join(f"- {l}" for l in ineff_lines)

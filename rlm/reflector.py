@@ -544,8 +544,37 @@ def _format_delta_section(current: dict, previous: dict,
             lines.append(f"{'SASS instructions':30s}  {prev_sass:6d}  -> {cur_sass:6d}  ({abs(delta)} {direction})")
 
         # Key instruction category deltas
-        for label, key in [("Branches (BRA)", "sass_bra"), ("Barriers (BAR)", "sass_bar"),
-                           ("Shuffles (SHFL)", "sass_shfl")]:
+        for label, key in [
+            # Memory access widths
+            ("Loads LDG.32", "sass_ldg_32"),
+            ("Loads LDG.64", "sass_ldg_64"),
+            ("Loads LDG.128", "sass_ldg_128"),
+            ("Stores STG.32", "sass_stg_32"),
+            ("Stores STG.64", "sass_stg_64"),
+            ("Stores STG.128", "sass_stg_128"),
+            # Compute
+            ("FFMA (fused mul-add)", "sass_ffma"),
+            ("HFMA2 (half2 FMA)", "sass_hfma2"),
+            ("MUFU (SFU/transcendental)", "sass_mufu"),
+            ("FADD", "sass_fadd"),
+            ("FMUL", "sass_fmul"),
+            # Type conversions
+            ("F2F (type convert)", "sass_f2f"),
+            # Predicate/select
+            ("FSETP (FP predicate)", "sass_fsetp"),
+            ("SEL (select)", "sass_sel"),
+            # Bit manipulation
+            ("PRMT (permute)", "sass_prmt"),
+            ("LOP3 (logic op)", "sass_lop3"),
+            ("SHF (funnel shift)", "sass_shf"),
+            # Control flow
+            ("Branches (BRA)", "sass_bra"),
+            ("Barriers (BAR)", "sass_bar"),
+            ("Shuffles (SHFL)", "sass_shfl"),
+            # Spills
+            ("LDL (spill load)", "sass_ldl"),
+            ("STL (spill store)", "sass_stl"),
+        ]:
             cur_v = cur_cm.get(key, 0)
             prev_v = prev_cm.get(key, 0)
             if cur_v != prev_v and (cur_v > 0 or prev_v > 0):
