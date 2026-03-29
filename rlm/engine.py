@@ -183,6 +183,21 @@ def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> st
         if stg32 > 1:
             bottlenecks.append(f"STG.32={stg32} narrow stores — pack into wider writes")
 
+        fsetp = cm.get("sass_fsetp", 0)
+        sel = cm.get("sass_sel", 0)
+        if fsetp + sel > 10:
+            bottlenecks.append(f"FSETP={fsetp}+SEL={sel} predicate chains — replace software FP4 quantization with hardware intrinsics")
+
+        f2f = cm.get("sass_f2f", 0)
+        if f2f > 8:
+            bottlenecks.append(f"F2F={f2f} type conversions — keep math in native bf16 pairs")
+
+        prmt = cm.get("sass_prmt", 0)
+        lop3 = cm.get("sass_lop3", 0)
+        shf_cnt = cm.get("sass_shf", 0)
+        if prmt + lop3 + shf_cnt > 8:
+            bottlenecks.append(f"PRMT={prmt}+LOP3={lop3}+SHF={shf_cnt} bit manipulation — use hardware pack intrinsics")
+
         if bottlenecks:
             hint = "; ".join(bottlenecks)
             constraint = (

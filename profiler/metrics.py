@@ -85,6 +85,22 @@ class CompilerMetrics:
     sass_shfl: int = 0             # SHFL (warp shuffle)
     sass_bra: int = 0              # BRA (branch)
 
+    # New: categories that dominate FP4 quantization / type conversion overhead
+    sass_mov: int = 0              # MOV (register move)
+    sass_setp: int = 0             # SETP (integer set predicate)
+    sass_sel: int = 0              # SEL (predicated select)
+    sass_fsetp: int = 0            # FSETP (float set predicate — from comparisons)
+    sass_imad: int = 0             # IMAD (integer multiply-add — address math)
+    sass_iadd: int = 0             # IADD (integer add)
+    sass_isetp: int = 0            # ISETP (integer set predicate)
+    sass_f2f: int = 0              # F2F (float-to-float conversion — bf16↔f32)
+    sass_i2f: int = 0              # I2F (int-to-float)
+    sass_f2i: int = 0              # F2I (float-to-int)
+    sass_prmt: int = 0             # PRMT (byte permute — FP4 packing)
+    sass_lop3: int = 0             # LOP3 (3-input logic op — bit manipulation)
+    sass_shf: int = 0              # SHF (funnel shift — bit packing)
+    sass_other: int = 0            # Unclassified
+
     @property
     def has_spills(self) -> bool:
         return self.spill_stores_bytes > 0 or self.spill_loads_bytes > 0

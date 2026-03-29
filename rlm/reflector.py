@@ -206,11 +206,36 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
             fadd = cm.get("sass_fadd", 0)
             fmul = cm.get("sass_fmul", 0)
             lines.append(f"  Compute:                     FFMA={ffma}  HFMA2={hfma2}  MUFU={mufu}  FADD={fadd}  FMUL={fmul}")
+            # Type conversions (bf16↔float overhead)
+            f2f = cm.get("sass_f2f", 0)
+            i2f = cm.get("sass_i2f", 0)
+            f2i = cm.get("sass_f2i", 0)
+            if f2f + i2f + f2i > 0:
+                lines.append(f"  Type convert:                F2F={f2f}  I2F={i2f}  F2I={f2i}")
+            # Predicate/select (from branchy FP4 quantization)
+            fsetp = cm.get("sass_fsetp", 0)
+            setp = cm.get("sass_setp", 0)
+            sel = cm.get("sass_sel", 0)
+            if fsetp + setp + sel > 0:
+                lines.append(f"  Predicate/select:            FSETP={fsetp}  SETP={setp}  SEL={sel}")
+            # Integer/address math
+            imad = cm.get("sass_imad", 0)
+            iadd = cm.get("sass_iadd", 0)
+            isetp = cm.get("sass_isetp", 0)
+            if imad + iadd + isetp > 0:
+                lines.append(f"  Integer/addr math:           IMAD={imad}  IADD={iadd}  ISETP={isetp}")
+            # Bit manipulation (FP4 packing overhead)
+            prmt = cm.get("sass_prmt", 0)
+            lop3 = cm.get("sass_lop3", 0)
+            shf = cm.get("sass_shf", 0)
+            if prmt + lop3 + shf > 0:
+                lines.append(f"  Bit manipulation:            PRMT={prmt}  LOP3={lop3}  SHF={shf}")
             # Control flow
             bra = cm.get("sass_bra", 0)
             bar = cm.get("sass_bar", 0)
             shfl = cm.get("sass_shfl", 0)
-            lines.append(f"  Control/sync:                BRA={bra}  BAR={bar}  SHFL={shfl}")
+            mov = cm.get("sass_mov", 0)
+            lines.append(f"  Control/sync:                BRA={bra}  BAR={bar}  SHFL={shfl}  MOV={mov}")
             # Shared mem and spill instructions
             lds = cm.get("sass_lds", 0)
             sts = cm.get("sass_sts", 0)
@@ -218,6 +243,10 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
             stl = cm.get("sass_stl", 0)
             if lds + sts + ldl + stl > 0:
                 lines.append(f"  Shared/local:                LDS={lds}  STS={sts}  LDL={ldl}  STL={stl}")
+            # Other
+            other = cm.get("sass_other", 0)
+            if other > 0:
+                lines.append(f"  Other unclassified:          {other}")
 
     lines.append("```")
     return "\n".join(lines)
@@ -324,6 +353,34 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
         hints.append(
             f"Register spills (LDL={ldl} + STL={stl}, {spill_pct:.0f}% of total) — "
             f"reduce register pressure or add __launch_bounds__"
+        )
+
+    # FSETP+SEL chains — branchy FP4 quantization code
+    fsetp = cm.get("sass_fsetp", 0)
+    sel = cm.get("sass_sel", 0)
+    if fsetp + sel > 10:
+        hints.append(
+            f"Predicate/select chains (FSETP={fsetp} + SEL={sel}) — "
+            f"these come from threshold-based FP4 quantization; "
+            f"use search_docs to find hardware FP4 conversion intrinsics"
+        )
+
+    # F2F type conversion overhead
+    f2f = cm.get("sass_f2f", 0)
+    if f2f > 8:
+        hints.append(
+            f"Type conversions (F2F={f2f}) — bf16↔float conversion overhead; "
+            f"keep computation in native bf16 using bfloat162 pair operations"
+        )
+
+    # Bit packing overhead
+    prmt = cm.get("sass_prmt", 0)
+    lop3 = cm.get("sass_lop3", 0)
+    shf = cm.get("sass_shf", 0)
+    if prmt + lop3 + shf > 8:
+        hints.append(
+            f"Bit manipulation (PRMT={prmt} + LOP3={lop3} + SHF={shf}) — "
+            f"software FP4 packing; use hardware conversion intrinsics"
         )
 
     # High total instruction count
