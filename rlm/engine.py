@@ -1040,16 +1040,16 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
         parts = [verdict]
 
-        # SASS delta from previous submission — model sees what its change did
+        # Always show full profiler snapshot (includes SASS instruction breakdown)
+        parts.append(_format_profile_section(metrics, 0))
+
+        # Also show delta from previous submission so model sees what changed
         if prev_inner_metrics:
             delta = _format_delta_section(
                 metrics, prev_inner_metrics,
                 title="Changes from Previous Submission")
             if delta:
                 parts.append(delta)
-        else:
-            # First submission — show full profiler snapshot
-            parts.append(_format_profile_section(metrics, 0))
 
         # Data-driven suggestions for remaining bottlenecks
         suggestions = _format_suggestions_section(

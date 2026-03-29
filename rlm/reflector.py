@@ -262,9 +262,84 @@ _REDUCTION_KERNEL_TYPES = frozenset({
 
 def _format_suggestions_section(metrics: dict, ineffective: set = None,
                                  kernel_type: str = "") -> str:
-    """Stubbed: We no longer generate hardcoded bottleneck suggestions.
-    The LLM interprets the pure physics metrics directly."""
-    return ""
+    """Generate data-driven suggestions based on SASS instruction breakdown.
+    No hardcoded strategies — just quantitative observations about the instruction mix."""
+    cm = metrics.get("_compiler", {})
+    sass_total = cm.get("sass_total_instructions", 0)
+    if sass_total == 0:
+        return ""
+
+    hints: list[str] = []
+
+    # Branch analysis
+    bra = cm.get("sass_bra", 0)
+    if bra > 0:
+        bra_pct = bra / sass_total * 100
+        if bra_pct > 5:
+            hints.append(
+                f"Branch instructions (BRA={bra}, {bra_pct:.0f}% of total) — "
+                f"look for branchless alternatives or hardware intrinsics"
+            )
+
+    # Store width analysis
+    stg32 = cm.get("sass_stg_32", 0)
+    stg64 = cm.get("sass_stg_64", 0)
+    stg128 = cm.get("sass_stg_128", 0)
+    total_stg = stg32 + stg64 + stg128
+    if stg32 > 0 and total_stg > 0:
+        narrow_pct = stg32 / total_stg * 100
+        if narrow_pct > 50:
+            hints.append(
+                f"Narrow stores (STG.32={stg32}/{total_stg} total, {narrow_pct:.0f}% are 32-bit) — "
+                f"pack outputs into wider stores (64/128-bit)"
+            )
+
+    # Load width analysis
+    ldg32 = cm.get("sass_ldg_32", 0)
+    ldg128 = cm.get("sass_ldg_128", 0)
+    total_ldg = ldg32 + cm.get("sass_ldg_64", 0) + ldg128
+    if ldg32 > 0 and total_ldg > 0:
+        narrow_ld_pct = ldg32 / total_ldg * 100
+        if narrow_ld_pct > 30:
+            hints.append(
+                f"Narrow loads (LDG.32={ldg32}/{total_ldg} total) — "
+                f"use vectorized 128-bit loads (uint4/float4)"
+            )
+
+    # Separate mul+add vs fused
+    fadd = cm.get("sass_fadd", 0)
+    fmul = cm.get("sass_fmul", 0)
+    ffma = cm.get("sass_ffma", 0)
+    if fadd > 0 and fmul > 0 and (fadd + fmul) > ffma:
+        hints.append(
+            f"Separate FADD={fadd} + FMUL={fmul} vs FFMA={ffma} — "
+            f"use fmaf() to fuse multiply-add into single instructions"
+        )
+
+    # Spill analysis
+    ldl = cm.get("sass_ldl", 0)
+    stl = cm.get("sass_stl", 0)
+    if ldl + stl > 0:
+        spill_pct = (ldl + stl) / sass_total * 100
+        hints.append(
+            f"Register spills (LDL={ldl} + STL={stl}, {spill_pct:.0f}% of total) — "
+            f"reduce register pressure or add __launch_bounds__"
+        )
+
+    # High total instruction count
+    if sass_total > 400:
+        hints.append(
+            f"High total instruction count ({sass_total}) — "
+            f"look for multi-instruction sequences that could be replaced with single hardware intrinsics"
+        )
+
+    if not hints:
+        return ""
+
+    lines = ["\n### SASS Analysis"]
+    for h in hints:
+        lines.append(f"- {h}")
+    return "\n".join(lines)
 
 
 # ── Refinement history ────────────────────────────────────────────────────────
