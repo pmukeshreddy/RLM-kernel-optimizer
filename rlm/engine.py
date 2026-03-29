@@ -455,8 +455,6 @@ Respond with ONLY the JSON array, nothing else."""
 
         # ── Tool-use path: compile/test/iterate like refinement ──────────
         if profile_fn and strat_desc:
-            system_prompt = _build_refine_system_prompt(0.0)
-
             shape_str = str(self.env.problem_shapes[0])
             
             prompt_parts = [
@@ -480,6 +478,7 @@ Respond with ONLY the JSON array, nothing else."""
 
             messages = [{"role": "user", "content": initial_prompt}]
             best = None
+            best_speedup = 0.0
             prev_inner_metrics = None
             submit_count = 0
             max_api_turns = MAX_INNER_TURNS + 4  # extra turns for non-submit tools
@@ -487,6 +486,9 @@ Respond with ONLY the JSON array, nothing else."""
             for turn in range(max_api_turns):
                 if submit_count >= MAX_INNER_TURNS:
                     break
+                # Rebuild system prompt each turn — once model beats baseline,
+                # switch from "structural changes allowed" to "surgical only"
+                system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
                 try:
                     response = await self._call_llm_with_tools_async(
                         messages=messages,
@@ -530,7 +532,7 @@ Respond with ONLY the JSON array, nothing else."""
                     None, profile_fn, submit_code, strat_name, round_num)
 
                 tool_result_text = self._format_tool_result(
-                    result, 1.0, prev_inner_metrics)
+                    result, max(best_speedup, 1.0), prev_inner_metrics)
                 if result["compile_ok"] and result["correct"] and result.get("metrics"):
                     prev_inner_metrics = result["metrics"]
                 # Merge aux results + submit result into ONE user message
@@ -558,6 +560,7 @@ Respond with ONLY the JSON array, nothing else."""
                             bottleneck=result.get("bottleneck", "unknown"),
                         )
                         best.strategy_context = strat_desc
+                        best_speedup = result["speedup"]
 
             if best:
                 return best
