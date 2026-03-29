@@ -542,7 +542,7 @@ Respond with ONLY the JSON array, nothing else."""
                     None, profile_fn, submit_code, strat_name, round_num)
 
                 tool_result_text = self._format_tool_result(
-                    result, max(best_speedup, 1.0), prev_inner_metrics)
+                    result, best_speedup, prev_inner_metrics)
                 if result["compile_ok"] and result["correct"] and result.get("metrics"):
                     prev_inner_metrics = result["metrics"]
                     cm_keys = list(prev_inner_metrics.get("_compiler", {}).keys())[:5]
@@ -1105,10 +1105,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         metrics = result.get("metrics", {})
         speedup = result.get("speedup", 0)
 
-        if speedup > parent_speedup + 0.02:
+        if parent_speedup <= 0:
+            # First submission — no previous to compare against
+            above = "above" if speedup >= 1.0 else "below"
+            verdict = f"FIRST RESULT: {speedup:.3f}x ({above} FlashInfer baseline)"
+        elif speedup > parent_speedup + 0.02:
             verdict = f"IMPROVED: {speedup:.3f}x (was {parent_speedup:.3f}x)"
         elif speedup < parent_speedup - 0.01:
-            verdict = f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x)"
+            verdict = f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x) — revert to your previous approach and make a smaller change"
         else:
             verdict = f"NO CHANGE: {speedup:.3f}x (was {parent_speedup:.3f}x)"
 
