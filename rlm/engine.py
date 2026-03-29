@@ -489,6 +489,9 @@ Respond with ONLY the JSON array, nothing else."""
                 # Rebuild system prompt each turn — once model beats baseline,
                 # switch from "structural changes allowed" to "surgical only"
                 system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
+                constraint_mode = "SURGICAL" if best_speedup >= 1.0 else "OPEN"
+                logger.info("GEN [%s] turn %d: best_speedup=%.3f constraint=%s sys_prompt_len=%d",
+                            strat_name, turn, best_speedup, constraint_mode, len(system_prompt))
                 try:
                     response = await self._call_llm_with_tools_async(
                         messages=messages,
@@ -502,12 +505,18 @@ Respond with ONLY the JSON array, nothing else."""
                                  strat_name, turn, e)
                     break
 
+                # Log model's reasoning
+                text_blocks = [b.text for b in response.content if hasattr(b, 'text') and b.text.strip()]
+                if text_blocks:
+                    reasoning = "\n".join(text_blocks)
+                    logger.info("\n🧠 GEN MODEL THOUGHTS [%s turn %d]:\n%s\n", strat_name, turn, reasoning)
+
                 messages.append({"role": "assistant", "content": response.content})
 
                 # Handle all tool calls
                 submit_code, submit_block_id, aux_results = self._handle_tool_calls(
                     response, messages, profile_fn, strat_name, round_num,
-                    1.0, prev_inner_metrics)
+                    max(best_speedup, 1.0), prev_inner_metrics)
 
                 # If only auxiliary tools were called, send results and continue
                 if submit_code is None and not submit_block_id:
@@ -546,6 +555,8 @@ Respond with ONLY the JSON array, nothing else."""
                             strat_name, submit_count,
                             result["compile_ok"], result["correct"],
                             result.get("speedup", 0))
+                logger.info("\n📊 GEN FEEDBACK [%s submit %d]:\n%s\n",
+                            strat_name, submit_count, tool_result_text)
 
                 if result["compile_ok"] and result["correct"]:
                     if best is None or result["speedup"] > best.speedup:
