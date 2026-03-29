@@ -510,6 +510,7 @@ class CorrectnessChecker:
         self.nvcc_flags = [
             "-O2", "-arch=sm_100a", "-std=c++17",
             f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
         ]
 
     def check(self, candidate_src: str, problem_shape: tuple,
