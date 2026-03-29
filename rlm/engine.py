@@ -722,7 +722,11 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         # Build initial prompt: profiler data + code in ONE message
         prompt_parts = []
 
-        if strat_ctx:
+        # When above baseline, drop the stale Round 0 strategy direction.
+        # It conflicts with the system prompt's "instruction-level only" constraint.
+        # e.g., strategy_context="use shared memory" causes the model to do structural
+        # changes even though SASS says the bottleneck is FADD/FMUL fusion.
+        if strat_ctx and parent.speedup < 1.0:
             prompt_parts.append(
                 f"You are beam \"{strat_name}\" optimizing a CUDA kernel.\n"
                 f"Direction: {strat_ctx}")
