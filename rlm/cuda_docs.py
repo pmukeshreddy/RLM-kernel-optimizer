@@ -297,23 +297,31 @@ CUDA_INTRINSICS_DB = [
 
 
 def search_intrinsics(query: str, max_results: int = 8) -> str:
-    """Search the CUDA intrinsics database by keyword matching."""
+    """Search the CUDA intrinsics database using BM25-style fuzzy matching."""
+    import re
     query_lower = query.lower()
-    keywords = query_lower.split()
+    keywords = set(re.findall(r'\w+', query_lower))
 
     scored = []
     for entry in CUDA_INTRINSICS_DB:
-        score = 0
-        searchable = (
+        score = 0.0
+        searchable_text = (
             entry["name"].lower() + " " +
             entry.get("description", "").lower() + " " +
             " ".join(entry.get("tags", []))
         )
+        
         for kw in keywords:
+            # Boost exact name matches massively
             if kw in entry["name"].lower():
-                score += 10  # exact name match is highest
-            elif kw in searchable:
-                score += 3
+                score += 15.0
+            
+            # Count term frequencies in the description/tags
+            tf = searchable_text.count(kw)
+            if tf > 0:
+                # Diminishing returns for spamming the same word (BM25 principle)
+                score += 3.0 * (tf / (tf + 0.5))
+                
         if score > 0:
             scored.append((score, entry))
 
@@ -321,7 +329,7 @@ def search_intrinsics(query: str, max_results: int = 8) -> str:
     results = scored[:max_results]
 
     if not results:
-        return f"No results found for '{query}'. Try keywords like: fp4, fp8, e4m3, reduction, shuffle, fast math, bfloat16, fma, ldg, async"
+        return f"No results found for '{query}'. Try keywords like: fp4, fp8, e4m3, reduction, shuffle, fast math, bfloat16, fma, ldg, stcg, async"
 
     lines = []
     for _, entry in results:
