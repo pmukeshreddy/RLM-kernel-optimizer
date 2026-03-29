@@ -162,10 +162,44 @@ Rules:
 - Do not use torch headers (torch/extension.h, ATen, c10).
 """
 
-def _build_refine_system_prompt(speedup: float) -> str:
-    """Build REFINE_SYSTEM_PROMPT with dynamic constraint for current speedup."""
-    # Provide a unified constraint regardless of speedup
-    constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
+def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> str:
+    """Build REFINE_SYSTEM_PROMPT with data-driven constraint based on SASS analysis."""
+    if speedup >= 1.0 and prev_metrics:
+        # Already beating baseline — structural changes regress at this point.
+        # Guide model toward the specific instruction-level bottlenecks SASS identified.
+        cm = prev_metrics.get("_compiler", {})
+        sass_total = cm.get("sass_total_instructions", 0)
+        bra = cm.get("sass_bra", 0)
+        fadd = cm.get("sass_fadd", 0)
+        fmul = cm.get("sass_fmul", 0)
+        ffma = cm.get("sass_ffma", 0)
+        stg32 = cm.get("sass_stg_32", 0)
+
+        bottlenecks = []
+        if fadd > 0 and fmul > 0 and (fadd + fmul) > ffma:
+            bottlenecks.append(f"FADD={fadd}+FMUL={fmul} not fused into FFMA — use fmaf()")
+        if bra > 3:
+            bottlenecks.append(f"BRA={bra} branch instructions — use branchless alternatives")
+        if stg32 > 1:
+            bottlenecks.append(f"STG.32={stg32} narrow stores — pack into wider writes")
+
+        if bottlenecks:
+            hint = "; ".join(bottlenecks)
+            constraint = (
+                f"- You are ABOVE baseline ({speedup:.2f}x). DO NOT make structural changes "
+                f"(no row-splitting, no atomics, no block count changes, no shared memory layout changes). "
+                f"These consistently regress at this stage.\n"
+                f"- Focus on instruction-level optimizations: {hint}\n"
+                f"- Each change should target reducing specific SASS instruction counts."
+            )
+        else:
+            constraint = (
+                f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical instruction-level "
+                f"changes over structural rewrites. Structural changes at this stage usually regress."
+            )
+    else:
+        constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
+
     return REFINE_SYSTEM_PROMPT.replace("{{turns}}", str(MAX_INNER_TURNS)).replace("{{constraint}}", constraint)
 
 
@@ -725,7 +759,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             if submit_count >= MAX_INNER_TURNS:
                 break
             try:
-                system_prompt = _build_refine_system_prompt(parent.speedup)
+                system_prompt = _build_refine_system_prompt(parent.speedup, prev_inner_metrics)
                 response = await self._call_llm_with_tools_async(
                     messages=messages,
                     tools=ALL_TOOLS,
