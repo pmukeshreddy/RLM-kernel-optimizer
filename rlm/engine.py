@@ -490,8 +490,9 @@ Respond with ONLY the JSON array, nothing else."""
                 # switch from "structural changes allowed" to "surgical only"
                 system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
                 constraint_mode = "SURGICAL" if best_speedup >= 1.0 else "OPEN"
-                logger.info("GEN [%s] turn %d: best_speedup=%.3f constraint=%s sys_prompt_len=%d",
-                            strat_name, turn, best_speedup, constraint_mode, len(system_prompt))
+                has_compiler = bool(prev_inner_metrics and prev_inner_metrics.get("_compiler"))
+                logger.info("GEN [%s] turn %d: best_speedup=%.3f constraint=%s has_compiler=%s sys_prompt_len=%d",
+                            strat_name, turn, best_speedup, constraint_mode, has_compiler, len(system_prompt))
                 try:
                     response = await self._call_llm_with_tools_async(
                         messages=messages,
@@ -544,6 +545,9 @@ Respond with ONLY the JSON array, nothing else."""
                     result, max(best_speedup, 1.0), prev_inner_metrics)
                 if result["compile_ok"] and result["correct"] and result.get("metrics"):
                     prev_inner_metrics = result["metrics"]
+                    cm_keys = list(prev_inner_metrics.get("_compiler", {}).keys())[:5]
+                    logger.info("GEN [%s] prev_inner_metrics updated: speedup=%.3f _compiler_keys=%s",
+                                strat_name, prev_inner_metrics.get("speedup", 0), cm_keys)
                 # Merge aux results + submit result into ONE user message
                 all_results = list(aux_results) + [
                     {"type": "tool_result", "tool_use_id": submit_block_id,
