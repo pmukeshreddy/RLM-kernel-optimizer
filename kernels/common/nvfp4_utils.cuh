@@ -8,9 +8,12 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-// Try to include FP8 header; provide fallback if unavailable
+// Try to include FP8/FP4 headers; provide fallback if unavailable
 #if __has_include(<cuda_fp8.h>)
 #include <cuda_fp8.h>
+#endif
+#if __has_include(<cuda_fp4.h>)
+#include <cuda_fp4.h>
 #endif
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -125,6 +128,19 @@ __device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Hardware FP4 pair conversion (sm_100a+): 2 scaled floats → 1 packed byte
+// Usage: pack_fp4_pair(val0 * inv_scale, val1 * inv_scale)
+// Values must be pre-scaled to [-6, 6] range before calling.
+// ────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ uint8_t pack_fp4_pair(float a, float b) {
+#if defined(__NV_E2M1)
+    return (uint8_t)__nv_cvt_float2_to_fp4x2(make_float2(a, b), __NV_E2M1, cudaRoundNearest);
+#else
+    return (float_to_nvfp4(b) << 4) | (float_to_nvfp4(a) & 0xF);
+#endif
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Core decode: 4-bit code → float
 // ────────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ float nvfp4_to_float(uint8_t code) {
@@ -158,9 +174,15 @@ __device__ __forceinline__ void quantize_block_nvfp4(
     // Encode each element and pack 2 fp4 per byte
     #pragma unroll
     for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
+#if defined(__NV_E2M1)
+        // Hardware FP4 conversion — single instruction per pair on sm_100a
+        float2 pair = make_float2(x[2*i] * inv_s, x[2*i+1] * inv_s);
+        packed[i] = (uint8_t)__nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
+#else
         uint8_t lo = float_to_nvfp4(x[2*i]   * inv_s);
         uint8_t hi = float_to_nvfp4(x[2*i+1] * inv_s);
         packed[i] = (hi << 4) | (lo & 0xF);
+#endif
     }
 }
 
