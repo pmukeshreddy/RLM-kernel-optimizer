@@ -8,9 +8,9 @@ CUDA_INTRINSICS_DB = [
     {
         "name": "__nv_cvt_float2_to_fp4x2",
         "signature": "__nv_fp4x2_storage_t __nv_cvt_float2_to_fp4x2(const float2 x, const __nv_fp4_interpretation_t fp4_interpretation, const enum cudaRoundMode rounding)",
-        "description": "Convert two floats (packed as float2) to two FP4 values packed in one byte. Single hardware instruction on sm_100a.",
+        "description": "Convert two floats (packed as float2) to two FP4 values packed in one byte. Single hardware instruction on sm_100a. Note: Cast the result to (uint8_t) before storing to a uint8_t* array.",
         "header": "cuda_fp4.h",
-        "example": "__nv_fp4x2_storage_t packed = __nv_cvt_float2_to_fp4x2(make_float2(a, b), __NV_E2M1, cudaRoundNearest);",
+        "example": "uint8_t packed = (uint8_t)__nv_cvt_float2_to_fp4x2(make_float2(a, b), __NV_E2M1, cudaRoundNearest);",
         "tags": ["fp4", "quantize", "convert", "float", "pack", "e2m1", "nvfp4"],
     },
     {
@@ -40,9 +40,9 @@ CUDA_INTRINSICS_DB = [
     {
         "name": "__nv_cvt_bfloat16raw2_to_fp4x2",
         "signature": "__nv_fp4x2_storage_t __nv_cvt_bfloat16raw2_to_fp4x2(const __nv_bfloat162_raw x, const __nv_fp4_interpretation_t fp4_interpretation, const enum cudaRoundMode rounding)",
-        "description": "Convert two bfloat16 values to two packed FP4 values. Direct bf16→fp4 without float intermediate.",
+        "description": "Convert two bfloat16 values to two packed FP4 values. Direct bf16→fp4 without float intermediate. Note: Cast the result to (uint8_t) before storing to a uint8_t* array.",
         "header": "cuda_fp4.h",
-        "example": "__nv_fp4x2_storage_t packed = __nv_cvt_bfloat16raw2_to_fp4x2(bf16_pair, __NV_E2M1, cudaRoundNearest);",
+        "example": "uint8_t packed = (uint8_t)__nv_cvt_bfloat16raw2_to_fp4x2(bf16_pair, __NV_E2M1, cudaRoundNearest);",
         "tags": ["fp4", "quantize", "convert", "bfloat16", "bf16", "e2m1", "pack"],
     },
     {
@@ -271,6 +271,27 @@ CUDA_INTRINSICS_DB = [
         "description": "Fused multiply-add on two pairs of half precision values. a*b + c.",
         "header": "cuda_fp16.h",
         "tags": ["half", "fp16", "fma", "vectorize", "simd"],
+    },
+    {
+        "name": "__hadd2 (bfloat162)",
+        "signature": "__nv_bfloat162 __hadd2(const __nv_bfloat162 a, const __nv_bfloat162 b)",
+        "description": "Add two pairs of bfloat16 values simultaneously. 2x throughput vs scalar.",
+        "header": "cuda_bf16.h",
+        "tags": ["bfloat16", "bf16", "add", "vectorize", "simd"],
+    },
+    {
+        "name": "__hmul2 (bfloat162)",
+        "signature": "__nv_bfloat162 __hmul2(const __nv_bfloat162 a, const __nv_bfloat162 b)",
+        "description": "Multiply two pairs of bfloat16 values simultaneously.",
+        "header": "cuda_bf16.h",
+        "tags": ["bfloat16", "bf16", "multiply", "vectorize", "simd"],
+    },
+    {
+        "name": "__hfma2 (bfloat162)",
+        "signature": "__nv_bfloat162 __hfma2(const __nv_bfloat162 a, const __nv_bfloat162 b, const __nv_bfloat162 c)",
+        "description": "Fused multiply-add on two pairs of bfloat16 values. a*b + c.",
+        "header": "cuda_bf16.h",
+        "tags": ["bfloat16", "bf16", "fma", "vectorize", "simd"],
     },
 ]
 
