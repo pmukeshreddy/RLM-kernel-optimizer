@@ -77,6 +77,7 @@ class HybridProfiler:
         self.nvcc_flags = [
             "-O3", f"-arch={self.cuda_arch}", "--use_fast_math", "-std=c++17",
             f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
         ]
 
     # ── Main Entry Point ───────────────────────────────────────────────────

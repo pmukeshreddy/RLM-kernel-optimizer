@@ -52,7 +52,7 @@ class Benchmarker:
         self.warmup      = config["eval"]["benchmark_warmup"]
         self.iters       = config["eval"]["benchmark_iters"]
         self.kernel_type = kernel_type
-        self.include_dirs = [str(PROJECT_ROOT / 'kernels' / 'common')]
+        self.include_dirs = [str(PROJECT_ROOT / 'kernels' / 'common'), str(PROJECT_ROOT)]
 
     @staticmethod
     def _compute_l2_cycle_bufs(input_bytes: int) -> int:

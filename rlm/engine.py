@@ -861,6 +861,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         nvcc_flags = [
             "-O3", "-arch=sm_100a", "--use_fast_math", "-std=c++17",
             f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
             "-c",  # compile only, no link — faster and avoids missing main()
             "-o", str(binary_file) + ".o",
         ]
