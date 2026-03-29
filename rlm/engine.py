@@ -186,16 +186,14 @@ def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> st
         if bottlenecks:
             hint = "; ".join(bottlenecks)
             constraint = (
-                f"- You are ABOVE baseline ({speedup:.2f}x). DO NOT make structural changes "
-                f"(no row-splitting, no atomics, no block count changes, no shared memory layout changes). "
-                f"These consistently regress at this stage.\n"
-                f"- Focus on instruction-level optimizations: {hint}\n"
+                f"- You are ABOVE baseline ({speedup:.2f}x). Your remaining bottleneck is instruction-level, "
+                f"not structural. The SASS shows: {hint}\n"
                 f"- Each change should target reducing specific SASS instruction counts."
             )
         else:
             constraint = (
                 f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical instruction-level "
-                f"changes over structural rewrites. Structural changes at this stage usually regress."
+                f"changes over structural rewrites."
             )
     else:
         constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
