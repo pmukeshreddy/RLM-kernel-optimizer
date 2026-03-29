@@ -184,6 +184,41 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
         lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
         lines.append(f"Shared memory:                 {smem} bytes")
 
+        # SASS instruction breakdown — the agent needs this to optimize at instruction level
+        sass_total = cm.get("sass_total_instructions", 0)
+        if sass_total > 0:
+            lines.append("")
+            lines.append(f"SASS instruction count:        {sass_total}")
+            # Loads by width
+            ldg32 = cm.get("sass_ldg_32", 0)
+            ldg64 = cm.get("sass_ldg_64", 0)
+            ldg128 = cm.get("sass_ldg_128", 0)
+            lines.append(f"  Global loads:                LDG.32={ldg32}  LDG.64={ldg64}  LDG.128={ldg128}")
+            # Stores by width
+            stg32 = cm.get("sass_stg_32", 0)
+            stg64 = cm.get("sass_stg_64", 0)
+            stg128 = cm.get("sass_stg_128", 0)
+            lines.append(f"  Global stores:               STG.32={stg32}  STG.64={stg64}  STG.128={stg128}")
+            # Compute
+            ffma = cm.get("sass_ffma", 0)
+            hfma2 = cm.get("sass_hfma2", 0)
+            mufu = cm.get("sass_mufu", 0)
+            fadd = cm.get("sass_fadd", 0)
+            fmul = cm.get("sass_fmul", 0)
+            lines.append(f"  Compute:                     FFMA={ffma}  HFMA2={hfma2}  MUFU={mufu}  FADD={fadd}  FMUL={fmul}")
+            # Control flow
+            bra = cm.get("sass_bra", 0)
+            bar = cm.get("sass_bar", 0)
+            shfl = cm.get("sass_shfl", 0)
+            lines.append(f"  Control/sync:                BRA={bra}  BAR={bar}  SHFL={shfl}")
+            # Shared mem and spill instructions
+            lds = cm.get("sass_lds", 0)
+            sts = cm.get("sass_sts", 0)
+            ldl = cm.get("sass_ldl", 0)
+            stl = cm.get("sass_stl", 0)
+            if lds + sts + ldl + stl > 0:
+                lines.append(f"  Shared/local:                LDS={lds}  STS={sts}  LDL={ldl}  STL={stl}")
+
     lines.append("```")
     return "\n".join(lines)
 
@@ -367,7 +402,21 @@ def _format_delta_section(current: dict, previous: dict,
             warn = "  *** REGRESSED ***" if cur_spills > prev_spills else "  (improved)" if cur_spills < prev_spills else ""
             lines.append(f"{'Register spill bytes':30s}  {prev_spills:6d}  -> {cur_spills:6d}{warn}")
 
-        # Removed complex SASS instruction delta tracking
+        # SASS instruction count delta — critical for tracking instruction-level progress
+        cur_sass = cur_cm.get("sass_total_instructions", 0)
+        prev_sass = prev_cm.get("sass_total_instructions", 0)
+        if cur_sass > 0 and prev_sass > 0 and cur_sass != prev_sass:
+            delta = cur_sass - prev_sass
+            direction = "fewer" if delta < 0 else "more"
+            lines.append(f"{'SASS instructions':30s}  {prev_sass:6d}  -> {cur_sass:6d}  ({abs(delta)} {direction})")
+
+        # Key instruction category deltas
+        for label, key in [("Branches (BRA)", "sass_bra"), ("Barriers (BAR)", "sass_bar"),
+                           ("Shuffles (SHFL)", "sass_shfl")]:
+            cur_v = cur_cm.get(key, 0)
+            prev_v = prev_cm.get(key, 0)
+            if cur_v != prev_v and (cur_v > 0 or prev_v > 0):
+                lines.append(f"{'  ' + label:30s}  {prev_v:6d}  -> {cur_v:6d}")
 
     lines.append("```")
 
