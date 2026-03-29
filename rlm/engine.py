@@ -131,13 +131,8 @@ SEARCH_DOCS_TOOL = {
 ALL_TOOLS = [SUBMIT_KERNEL_TOOL, INSPECT_SASS_TOOL, READ_FILE_TOOL, SEARCH_DOCS_TOOL]
 
 REFINE_SYSTEM_PROMPT = f"""\
-You are a CUDA kernel optimization agent. You have {MAX_INNER_TURNS} submit_kernel calls.
+You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
 
-OPTIMIZATION WORKFLOW:
-1. MEASURE FIRST: Before your first code change, call `inspect_sass` on the starting kernel to see what the compiler actually generated. Count the total instructions — this is your baseline.
-2. DIAGNOSE: After each submission, if speedup did not improve, call `inspect_sass` again. Compare instruction counts. If your change didn't reduce instructions, the compiler may have ignored or undone your optimization.
-3. FIND INTRINSICS: When you identify instruction sequences that seem disproportionately long for their purpose, use `search_docs` or `read_file` to find hardware-native single-instruction alternatives.
-4. VERIFY: After each change, check that total SASS instruction count decreased AND timing improved. If instructions dropped but timing didn't, you have a different bottleneck.
 Your speedup is measured against FlashInfer, a production GPU library.
 You target a single GPU (B200, sm_100a) and a single problem shape — use this to your advantage.
 
@@ -169,16 +164,8 @@ Rules:
 
 def _build_refine_system_prompt(speedup: float) -> str:
     """Build REFINE_SYSTEM_PROMPT with dynamic constraint for current speedup."""
-    if speedup > 1.0:
-        # Kernel already beats baseline — structure is good, focus on instructions
-        constraint = (
-            "- Your kernel structure is already producing a speedup. "
-            "Focus on reducing total SASS instruction count: replace multi-instruction sequences "
-            "with hardware intrinsics, widen load/store widths, and eliminate branches. "
-            "Make ONE small surgical change per submission."
-        )
-    else:
-        constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
+    # Provide a unified constraint regardless of speedup
+    constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
     return REFINE_SYSTEM_PROMPT.replace("{{turns}}", str(MAX_INNER_TURNS)).replace("{{constraint}}", constraint)
 
 
@@ -434,9 +421,7 @@ Respond with ONLY the JSON array, nothing else."""
                 f"\n## Naive reference kernel (starting point):\n"
                 f"```cuda\n{kernel_slice}\n```",
                 f"\n{launch_sig}",
-                "\nStart by calling `inspect_sass` on the reference kernel above to see the compiler's baseline instruction mix. "
-                "Then use what you learn to make targeted changes.\n\n"
-                "Before calling submit_kernel, explain in 2-3 sentences:\n"
+                "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
                 "1. What your planned change is\n"
                 "2. Why it addresses the specific performance metrics without breaking correctness\n\n"
                 "Then call submit_kernel with your complete .cu file.",
@@ -721,7 +706,6 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         prompt_parts.append(
             "Make ONE targeted change per submission so you can measure its impact. "
             "Do not bundle multiple unrelated optimizations.\n\n"
-            "Consider calling `inspect_sass` on your current kernel to see the actual instruction mix before deciding what to change.\n\n"
             "Before calling submit_kernel, explain:\n"
             "1. What single change you are making and why you expect it to help.\n\n"
             "Then call submit_kernel with your complete .cu file.")
