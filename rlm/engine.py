@@ -583,7 +583,7 @@ class RLMEngine:
                     best.best_speedup = result["speedup"]
                     best_speedup = result["speedup"]
             else:
-                last_error = result.get("error", "") or feedback.root_cause
+                last_error = result.get("error", "") or "; ".join(feedback.leading_signals) or feedback.uncertainty
 
         if best:
             return best
@@ -792,7 +792,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     "goal": "Repair the failing or below-baseline branch.",
                     "what": feedback.next_action,
                     "change_summary": feedback.next_action,
-                    "bottleneck": feedback.root_cause,
+                    "bottleneck": "; ".join(feedback.leading_signals) or feedback.uncertainty,
                     "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
                     "rag_queries": feedback.rag_queries,
                     "planner_notes": feedback.planner_summary(),

@@ -37,7 +37,8 @@ class SandboxFeedback:
     confidence: float
     speedup: float
     parent_speedup: float
-    root_cause: str
+    leading_signals: list[str]
+    uncertainty: str
     next_action: str
     action_type: str
     evidence: list[dict] = field(default_factory=list)
@@ -68,7 +69,8 @@ class SandboxFeedback:
             "confidence": self.confidence,
             "speedup": round(self.speedup, 6),
             "parent_speedup": round(self.parent_speedup, 6),
-            "root_cause": self.root_cause,
+            "leading_signals": self.leading_signals,
+            "uncertainty": self.uncertainty,
             "observations": self.observations,
             "hypothesis_test": self.hypothesis_test,
             "evidence": self.evidence,
@@ -102,7 +104,8 @@ class SandboxFeedback:
             "route": self.route,
             "speedup": round(self.speedup, 6),
             "parent_speedup": round(self.parent_speedup, 6),
-            "root_cause": self.root_cause,
+            "leading_signals": self.leading_signals[:4],
+            "uncertainty": self.uncertainty,
             "hypothesis_test": {
                 "previous_hypothesis": self.hypothesis_test.get("previous_hypothesis", ""),
                 "status": self.hypothesis_test.get("status", ""),
@@ -218,7 +221,7 @@ def _latest_experiment_label(candidate: Any) -> str:
     return strategy or "latest optimization attempt"
 
 
-def _candidate_memory(candidate: Any, root_cause: str) -> dict:
+def _candidate_memory(candidate: Any, leading_signals: list[str], uncertainty: str) -> dict:
     history = list(_get_candidate_attr(candidate, "refinement_history", []) or [])
     failed = []
     helped = []
@@ -247,28 +250,29 @@ def _candidate_memory(candidate: Any, root_cause: str) -> dict:
         "refine_attempts": int(_get_candidate_attr(candidate, "refine_attempts", 0) or 0),
         "tried_and_failed": failed[-4:],
         "tried_and_helped": helped[-4:],
-        "current_root_cause": root_cause,
+        "current_signals": leading_signals,
+        "uncertainty": uncertainty,
     }
 
 
-def _bottleneck_focus_terms(metrics: dict, root_cause: str | None = None) -> list[str]:
+def _bottleneck_focus_terms(metrics: dict, leading_signals: list[str] | None = None) -> list[str]:
     compiler = metrics.get("_compiler", {}) if metrics else {}
     focus = []
-    cause = (root_cause or "").lower()
+    signal_set = set(leading_signals or [])
 
-    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0) or "spill" in cause:
+    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0) or "spills_present" in signal_set:
         focus.append("spill elimination")
-    if compiler.get("registers_per_thread", 0) > 96 or "register pressure" in cause:
+    if compiler.get("registers_per_thread", 0) > 96 or "occupancy_limited" in signal_set:
         focus.extend(["register pressure", "occupancy tuning", "launch bounds"])
 
     mem_tput = metrics.get("mem_throughput_pct", 0)
     compute_tput = metrics.get("compute_throughput_pct", 0)
     occupancy = metrics.get("sm_occupancy", 0)
-    if "memory traffic" in cause or (mem_tput > compute_tput and mem_tput > 0):
+    if "memory_traffic_high" in signal_set or (mem_tput > compute_tput and mem_tput > 0):
         focus.extend(["pass elimination", "coalesced memory path", "vectorized access", "cache reuse"])
-    elif "arithmetic throughput" in cause or compute_tput > 0:
+    elif "compute_pressure_high" in signal_set or compute_tput > 0:
         focus.extend(["hot-path simplification", "hardware intrinsics", "branchless arithmetic"])
-    elif "latency" in cause or occupancy < 75.0:
+    elif "low_occupancy" in signal_set or occupancy < 75.0:
         focus.extend(["latency hiding", "occupancy tuning", "independent work per thread"])
     else:
         focus.extend(["single hot path", "localized experiment"])
@@ -290,8 +294,8 @@ def _build_targeted_query(kernel_type: str, focus_terms: list[str], memory: dict
     )
 
 
-def _performance_queries(kernel_type: str, metrics: dict, root_cause: str, memory: dict) -> list[str]:
-    focus_terms = _bottleneck_focus_terms(metrics, root_cause)
+def _performance_queries(kernel_type: str, metrics: dict, leading_signals: list[str], memory: dict) -> list[str]:
+    focus_terms = _bottleneck_focus_terms(metrics, leading_signals)
     operation = _kernel_operation_phrase(kernel_type)
     queries = [_build_targeted_query(kernel_type, focus_terms, memory)]
 
@@ -301,39 +305,49 @@ def _performance_queries(kernel_type: str, metrics: dict, root_cause: str, memor
     if focus_terms:
         queries.append(f"{operation} {' '.join(focus_terms[:2])} CUDA source code")
 
-    cause = root_cause.lower()
-    if "memory traffic" in cause:
+    signal_set = set(leading_signals)
+    if "memory_traffic_high" in signal_set:
         queries.append(f"{operation} eliminate extra memory pass register reuse CUDA")
         queries.append(f"{operation} vectorized access coalesced memory CUDA")
-    if "register pressure" in cause:
+    if "occupancy_limited" in signal_set:
         queries.append(f"{operation} register pressure occupancy reduction CUDA")
-    if "arithmetic throughput" in cause:
+    if "compute_pressure_high" in signal_set:
         queries.append(f"{operation} hardware intrinsics hot path simplification CUDA")
-    if "latency" in cause:
+    if "low_occupancy" in signal_set:
         queries.append(f"{operation} latency hiding occupancy ilp CUDA")
 
     return _unique_queries(queries)
 
 
-def _performance_root_cause(metrics: dict) -> str:
+def _performance_signals(metrics: dict) -> tuple[list[str], str]:
     compiler = metrics.get("_compiler", {}) if metrics else {}
     spill_total = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
     regs = compiler.get("registers_per_thread", 0)
     occupancy = float(metrics.get("sm_occupancy", 0) or 0.0)
     mem_tput = float(metrics.get("mem_throughput_pct", 0) or 0.0)
     compute_tput = float(metrics.get("compute_throughput_pct", 0) or 0.0)
+    signals: list[str] = []
 
     if spill_total > 0:
-        return "Hypothesis: spills and local-memory traffic may be limiting performance."
+        signals.append("spills_present")
     if regs > 96 or (regs > 0 and occupancy < 75.0):
-        return "Hypothesis: register pressure may be limiting occupancy."
+        signals.append("occupancy_limited")
     if mem_tput >= max(compute_tput, 25.0):
-        return "Hypothesis: memory traffic is the main limiter."
+        signals.append("memory_traffic_high")
     if compute_tput >= max(mem_tput, 25.0):
-        return "Hypothesis: arithmetic throughput is the current limiter."
+        signals.append("compute_pressure_high")
     if occupancy > 0 and occupancy < 60.0:
-        return "Hypothesis: the kernel is latency-limited due to low occupancy."
-    return "Hypothesis: no single dominant bottleneck is confirmed yet."
+        signals.append("low_occupancy")
+
+    if not signals:
+        signals.append("no_clear_dominant_signal")
+
+    uncertainty = (
+        "Measured signals are mixed; trust runtime deltas and one-change experiments over any single label."
+        if signals == ["no_clear_dominant_signal"]
+        else "Signals are heuristic; confirm them with runtime deltas before treating them as causal."
+    )
+    return signals, uncertainty
 
 
 def _collect_performance_evidence(
@@ -420,8 +434,8 @@ def _build_observations(
     return observations
 
 
-def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metrics: dict | None) -> tuple[list[str], list[str]]:
-    cause = root_cause.lower()
+def _signal_metric_support(leading_signals: list[str], metrics: dict, prev_inner_metrics: dict | None) -> tuple[list[str], list[str]]:
+    signal_set = set(leading_signals)
     compiler = metrics.get("_compiler", {}) if metrics else {}
     prev_compiler = (prev_inner_metrics or {}).get("_compiler", {})
     evidence_for = []
@@ -446,7 +460,7 @@ def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metric
     before_compute = (prev_inner_metrics or {}).get("compute_throughput_pct")
     after_compute = metrics.get("compute_throughput_pct")
 
-    if "spill" in cause:
+    if "spills_present" in signal_set:
         before_spills = prev_compiler.get("spill_stores_bytes", 0) + prev_compiler.get("spill_loads_bytes", 0)
         after_spills = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
         if before_spills != after_spills:
@@ -455,7 +469,7 @@ def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metric
                 evidence_for.append(msg)
             else:
                 evidence_against.append(msg)
-    elif "register pressure" in cause:
+    elif "occupancy_limited" in signal_set:
         add_delta("registers_per_thread", better_when_smaller=True)
         if before_occ is not None and after_occ is not None and before_occ != after_occ:
             msg = f"sm_occupancy {before_occ} -> {after_occ}"
@@ -463,21 +477,21 @@ def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metric
                 evidence_for.append(msg)
             else:
                 evidence_against.append(msg)
-    elif "memory traffic" in cause:
+    elif "memory_traffic_high" in signal_set:
         if before_mem is not None and after_mem is not None and before_mem != after_mem:
             msg = f"mem_throughput_pct {before_mem} -> {after_mem}"
             if after_mem > before_mem:
                 evidence_for.append(msg)
             else:
                 evidence_against.append(msg)
-    elif "arithmetic throughput" in cause:
+    elif "compute_pressure_high" in signal_set:
         if before_compute is not None and after_compute is not None and before_compute != after_compute:
             msg = f"compute_throughput_pct {before_compute} -> {after_compute}"
             if after_compute > before_compute:
                 evidence_for.append(msg)
             else:
                 evidence_against.append(msg)
-    elif "latency" in cause and before_occ is not None and after_occ is not None and before_occ != after_occ:
+    elif "low_occupancy" in signal_set and before_occ is not None and after_occ is not None and before_occ != after_occ:
         msg = f"sm_occupancy {before_occ} -> {after_occ}"
         if after_occ > before_occ:
             evidence_for.append(msg)
@@ -489,7 +503,7 @@ def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metric
 
 def _hypothesis_test(
     *,
-    root_cause: str,
+    leading_signals: list[str],
     speedup: float,
     parent_speedup: float,
     metrics: dict,
@@ -500,7 +514,7 @@ def _hypothesis_test(
     error: str = "",
 ) -> dict:
     previous_hypothesis = _latest_experiment_label(candidate)
-    evidence_for, evidence_against = _root_cause_metric_support(root_cause, metrics, prev_inner_metrics)
+    evidence_for, evidence_against = _signal_metric_support(leading_signals, metrics, prev_inner_metrics)
 
     if not compile_ok:
         status = "inconclusive"
@@ -532,12 +546,12 @@ def _hypothesis_test(
 def _next_experiment_fields(
     *,
     status: str,
-    root_cause: str,
+    leading_signals: list[str],
     candidate: Any,
     speedup: float,
     parent_speedup: float,
 ) -> tuple[str, list[str], list[str], list[str], list[str], list[str], list[str]]:
-    cause = root_cause.lower()
+    signal_set = set(leading_signals)
     preserve = ["launch_signature", "correctness", "working_kernel_structure"]
     revert = []
     avoid = ["full_rewrite"]
@@ -552,7 +566,7 @@ def _next_experiment_fields(
         if label:
             revert.append(str(label))
 
-    if "memory traffic" in cause:
+    if "memory_traffic_high" in signal_set:
         instruction = "Keep the working math path. Change only one memory path or one extra pass through global memory."
         focus = ["pass elimination", "coalesced access", "vectorized access", "cache reuse"]
         success_criteria.extend([
@@ -563,7 +577,7 @@ def _next_experiment_fields(
             "registers_per_thread increases by more than 8 with <=1% speedup gain",
             "new spills appear without a compensating runtime win",
         ]
-    elif "spill" in cause:
+    elif "spills_present" in signal_set:
         instruction = "Keep the algorithm unchanged. Reduce spills by trimming live state or simplifying per-thread work."
         focus = ["spill elimination", "live-range trimming", "smaller per-thread state"]
         success_criteria.extend([
@@ -574,7 +588,7 @@ def _next_experiment_fields(
             "register count rises while spills remain",
             "the fix requires a launch-contract change",
         ]
-    elif "register pressure" in cause:
+    elif "occupancy_limited" in signal_set:
         instruction = "Keep the fastest path intact. Reduce live values or split work without changing the algorithm."
         focus = ["live-range trimming", "launch bounds", "smaller per-thread state"]
         success_criteria.extend([
@@ -585,7 +599,7 @@ def _next_experiment_fields(
             "spills appear",
             "occupancy falls without a meaningful runtime win",
         ]
-    elif "arithmetic throughput" in cause:
+    elif "compute_pressure_high" in signal_set:
         instruction = "Keep the current memory path. Simplify one arithmetic hot path or swap in one hardware intrinsic."
         focus = ["hot-path simplification", "hardware intrinsics", "branchless arithmetic"]
         success_criteria.extend([
@@ -596,7 +610,7 @@ def _next_experiment_fields(
             "instruction changes require a full rewrite",
             "register pressure rises without a runtime gain",
         ]
-    elif "latency" in cause:
+    elif "low_occupancy" in signal_set:
         instruction = "Preserve the working kernel structure. Add one localized change that improves occupancy or hides latency."
         focus = ["latency hiding", "occupancy tuning", "independent work per thread"]
         success_criteria.extend([
@@ -650,8 +664,9 @@ def build_sandbox_feedback(
     error = result.get("error", "") or ""
 
     if not compile_ok:
-        root_cause = _first_actionable_error(error)
-        memory = _candidate_memory(candidate, root_cause)
+        leading_signals = ["compile_error"]
+        uncertainty = "Compiler output is authoritative for this failure."
+        memory = _candidate_memory(candidate, leading_signals, uncertainty)
         observations = _build_observations(
             compile_ok=False,
             correct=False,
@@ -662,7 +677,7 @@ def build_sandbox_feedback(
             error=error,
         )
         hypothesis_test = _hypothesis_test(
-            root_cause=root_cause,
+            leading_signals=leading_signals,
             speedup=0.0,
             parent_speedup=parent_speedup,
             metrics=metrics,
@@ -680,12 +695,13 @@ def build_sandbox_feedback(
             confidence=0.98,
             speedup=0.0,
             parent_speedup=parent_speedup,
-            root_cause=root_cause,
+            leading_signals=leading_signals,
+            uncertainty=uncertainty,
             next_action=instruction,
             action_type="repair_compile",
             evidence=[
                 _metric_evidence("speedup", 0.0, unit="x"),
-                {"kind": "compiler_error", "name": "first_error", "value": root_cause},
+                {"kind": "compiler_error", "name": "first_error", "value": _first_actionable_error(error)},
             ],
             observations=observations,
             hypothesis_test=hypothesis_test,
@@ -702,8 +718,9 @@ def build_sandbox_feedback(
         )
 
     if not correct:
-        root_cause = error[:240] or "Output mismatch (atol=1e-2)"
-        memory = _candidate_memory(candidate, root_cause)
+        leading_signals = ["correctness_failure"]
+        uncertainty = "Correctness failures must be fixed before any performance diagnosis matters."
+        memory = _candidate_memory(candidate, leading_signals, uncertainty)
         observations = _build_observations(
             compile_ok=True,
             correct=False,
@@ -714,7 +731,7 @@ def build_sandbox_feedback(
             error=error,
         )
         hypothesis_test = _hypothesis_test(
-            root_cause=root_cause,
+            leading_signals=leading_signals,
             speedup=speedup,
             parent_speedup=parent_speedup,
             metrics=metrics,
@@ -731,7 +748,8 @@ def build_sandbox_feedback(
             confidence=0.95,
             speedup=speedup,
             parent_speedup=parent_speedup,
-            root_cause=root_cause,
+            leading_signals=leading_signals,
+            uncertainty=uncertainty,
             next_action="Repair correctness before making any new optimization change.",
             action_type="repair_correctness",
             evidence=_collect_performance_evidence(speedup, parent_speedup, metrics, prev_inner_metrics),
@@ -752,8 +770,8 @@ def build_sandbox_feedback(
             error=error,
         )
 
-    root_cause = _performance_root_cause(metrics)
-    memory = _candidate_memory(candidate, root_cause)
+    leading_signals, uncertainty = _performance_signals(metrics)
+    memory = _candidate_memory(candidate, leading_signals, uncertainty)
     observations = _build_observations(
         compile_ok=True,
         correct=True,
@@ -763,7 +781,7 @@ def build_sandbox_feedback(
         prev_inner_metrics=prev_inner_metrics,
     )
     hypothesis_test = _hypothesis_test(
-        root_cause=root_cause,
+        leading_signals=leading_signals,
         speedup=speedup,
         parent_speedup=parent_speedup,
         metrics=metrics,
@@ -773,10 +791,10 @@ def build_sandbox_feedback(
         correct=True,
     )
     evidence = _collect_performance_evidence(speedup, parent_speedup, metrics, prev_inner_metrics)
-    queries = _performance_queries(kernel_type, metrics, root_cause, memory)
+    queries = _performance_queries(kernel_type, metrics, leading_signals, memory)
     instruction, preserve, revert, avoid, focus, success_criteria, abort_if = _next_experiment_fields(
         status=hypothesis_test["status"],
-        root_cause=root_cause,
+        leading_signals=leading_signals,
         candidate=candidate,
         speedup=speedup,
         parent_speedup=parent_speedup,
@@ -790,7 +808,8 @@ def build_sandbox_feedback(
             confidence=0.88,
             speedup=speedup,
             parent_speedup=parent_speedup,
-            root_cause=root_cause,
+            leading_signals=leading_signals,
+            uncertainty=uncertainty,
             next_action=instruction,
             action_type="revise_bottleneck",
             evidence=evidence,
@@ -815,7 +834,8 @@ def build_sandbox_feedback(
             confidence=0.86,
             speedup=speedup,
             parent_speedup=parent_speedup,
-            root_cause=root_cause,
+            leading_signals=leading_signals,
+            uncertainty=uncertainty,
             next_action="Preserve the working structure and branch into one surgical follow-up experiment.",
             action_type="branch_tree",
             evidence=evidence,
@@ -839,7 +859,8 @@ def build_sandbox_feedback(
         confidence=0.82,
         speedup=speedup,
         parent_speedup=parent_speedup,
-        root_cause=root_cause,
+        leading_signals=leading_signals,
+        uncertainty=uncertainty,
         next_action=instruction,
         action_type="targeted_refine",
         evidence=evidence,

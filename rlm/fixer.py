@@ -34,7 +34,7 @@ def build_fixer_prompt(
         "- Use next_action.success_criteria and next_action.abort_if to bound the experiment.\n"
         "- Use memory.tried_and_failed to avoid repeating dead ends.\n"
         "- Use search_pinecone when you need implementation guidance from the knowledge index.\n"
-        "- Before submit_kernel, explain the root cause and the exact repair you are making.\n"
+        "- Before submit_kernel, explain the observed failure mode or leading signals and the exact repair you are making.\n"
         "- Then call submit_kernel with the complete .cu file."
     )
 
