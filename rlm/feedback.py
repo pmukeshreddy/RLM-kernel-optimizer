@@ -567,6 +567,8 @@ def build_sandbox_feedback(
     compile_ok = result.get("compile_ok", False)
     correct = result.get("correct", False)
     speedup = float(result.get("speedup", 0.0) or 0.0)
+    _binary = result.get("binary_speedup")
+    routing_speedup = max(speedup, float(_binary)) if _binary is not None else speedup
     metrics = result.get("metrics", {}) or {}
     error = result.get("error", "") or ""
 
@@ -703,7 +705,7 @@ def build_sandbox_feedback(
         parent_speedup=parent_speedup,
     )
 
-    if speedup < 1.0:
+    if routing_speedup < 1.0:
         return SandboxFeedback(
             status="below_baseline",
             stage="benchmark",
@@ -728,7 +730,7 @@ def build_sandbox_feedback(
             abort_if=abort_if,
         )
 
-    if speedup > parent_speedup + 0.02:
+    if routing_speedup > parent_speedup + 0.02:
         return SandboxFeedback(
             status="improved",
             stage="benchmark",

@@ -568,6 +568,7 @@ int main(int argc, char** argv) {{
                 "compile_ok": temp.compile_ok,
                 "correct": temp.correct,
                 "speedup": temp.speedup,
+                "binary_speedup": (temp.metrics or {}).get("binary_speedup"),
                 "metrics": temp.metrics,
                 "branch_family": temp.bottleneck,
                 "error": error,
