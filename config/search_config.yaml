@@ -67,6 +67,10 @@ rag:
     - "chunk_text"
     - "title"
     - "source"
+    - "source_code"
+    - "source_file"
+    - "optimization_pattern"
+    - "op_type"
 
 eval:
   correctness_atol: 1e-2

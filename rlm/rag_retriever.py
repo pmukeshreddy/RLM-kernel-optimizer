@@ -44,7 +44,20 @@ class PineconeRetriever:
         self.namespace = cfg.get("namespace") or os.getenv(
             cfg.get("namespace_env", "PINECONE_NAMESPACE")
         )
-        self.fields = list(cfg.get("fields", ["chunk_text", "title", "source"]))
+        self.fields = list(
+            cfg.get(
+                "fields",
+                [
+                    "chunk_text",
+                    "title",
+                    "source",
+                    "source_code",
+                    "source_file",
+                    "optimization_pattern",
+                    "op_type",
+                ],
+            )
+        )
         self.text_field = cfg.get("text_field", "chunk_text")
         self.title_field = cfg.get("title_field", "title")
         self.source_field = cfg.get("source_field", "source")
@@ -186,7 +199,7 @@ class PineconeRetriever:
         for hit in hits:
             fields = hit.get("fields", {}) or {}
             metadata = hit.get("metadata", {}) or {}
-            text = str(fields.get(self.text_field) or metadata.get(self.text_field) or "").strip()
+            text = self._extract_text(fields=fields, metadata=metadata)
             if not text:
                 continue
             matches.append(
@@ -194,18 +207,8 @@ class PineconeRetriever:
                     match_id=str(hit.get("_id") or hit.get("id") or "unknown"),
                     score=float(hit.get("_score") or hit.get("score") or 0.0),
                     text=text,
-                    title=str(
-                        fields.get(self.title_field)
-                        or metadata.get(self.title_field)
-                        or hit.get("_id")
-                        or hit.get("id")
-                        or ""
-                    ).strip(),
-                    source=str(
-                        fields.get(self.source_field)
-                        or metadata.get(self.source_field)
-                        or ""
-                    ).strip(),
+                    title=self._extract_title(fields=fields, metadata=metadata, hit=hit),
+                    source=self._extract_source(fields=fields, metadata=metadata),
                     metadata=metadata,
                 )
             )
@@ -296,9 +299,7 @@ class PineconeRetriever:
         matches = []
         for hit in hits:
             metadata = hit.get("metadata", {}) or {}
-            text = str(metadata.get(self.text_field) or "").strip()
-            if not text:
-                text = str(metadata.get("text") or metadata.get("content") or "").strip()
+            text = self._extract_text(fields={}, metadata=metadata)
             if not text:
                 continue
             matches.append(
@@ -306,22 +307,60 @@ class PineconeRetriever:
                     match_id=str(hit.get("_id") or hit.get("id") or "unknown"),
                     score=float(hit.get("_score") or hit.get("score") or 0.0),
                     text=text,
-                    title=str(
-                        metadata.get(self.title_field)
-                        or metadata.get("title")
-                        or hit.get("_id")
-                        or hit.get("id")
-                        or ""
-                    ).strip(),
-                    source=str(
-                        metadata.get(self.source_field)
-                        or metadata.get("source")
-                        or ""
-                    ).strip(),
+                    title=self._extract_title(fields={}, metadata=metadata, hit=hit),
+                    source=self._extract_source(fields={}, metadata=metadata),
                     metadata=metadata,
                 )
             )
         return matches
+
+    def _extract_text(self, fields: dict, metadata: dict) -> str:
+        for key in self._text_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _extract_title(self, fields: dict, metadata: dict, hit: dict) -> str:
+        for key in self._title_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return str(hit.get("_id") or hit.get("id") or "").strip()
+
+    def _extract_source(self, fields: dict, metadata: dict) -> str:
+        for key in self._source_candidates():
+            value = fields.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _text_candidates(self) -> list[str]:
+        return [
+            self.text_field,
+            "chunk_text",
+            "text",
+            "content",
+            "body",
+            "source_code",
+            "code",
+        ]
+
+    def _title_candidates(self) -> list[str]:
+        return [
+            self.title_field,
+            "title",
+            "source_file",
+            "op_type",
+            "optimization_pattern",
+        ]
+
+    def _source_candidates(self) -> list[str]:
+        return [
+            self.source_field,
+            "source",
+            "source_file",
+        ]
 
     def _extract_hits(self, response) -> list[dict]:
         if hasattr(response, "matches"):
