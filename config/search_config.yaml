@@ -60,6 +60,8 @@ rag:
   index_host_env: "PINECONE_INDEX_HOST"
   embed_provider_env: "PINECONE_EMBED_PROVIDER"
   embed_model_env: "PINECONE_EMBED_MODEL"
+  rerank_model_env: "PINECONE_RERANK_MODEL"
+  rerank_pool: 12
   text_field: "chunk_text"
   title_field: "title"
   source_field: "source"
@@ -69,6 +71,7 @@ rag:
     - "source"
     - "source_code"
     - "source_file"
+    - "hardware_target"
     - "optimization_pattern"
     - "op_type"
 

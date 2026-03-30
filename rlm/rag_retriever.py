@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 from .env_loader import load_project_env
@@ -14,6 +15,23 @@ try:
     from pinecone import Pinecone
 except ImportError:  # pragma: no cover - optional dependency
     Pinecone = None
+
+HARDWARE_ALIASES = {
+    "blackwell": ("blackwell", "b200", "sm100", "sm 100", "sm100a", "sm 100a"),
+}
+
+OP_ALIASES = {
+    "rmsnorm": ("add rmsnorm", "rmsnorm", "rms norm", "layernorm", "layer norm"),
+    "silu_mul": ("silu mul", "silu_mul", "swiglu", "gated silu"),
+    "quantize": ("nvfp4", "fp4", "quant", "quantize", "quantization"),
+}
+
+PATTERN_ALIASES = {
+    "vectorized_stores": ("vectorized stores", "vector stores", "uint4 stores", "stg 128", "stg128"),
+    "vectorized_loads": ("vectorized loads", "vector loads", "uint4 loads", "ldg 128", "ldg128"),
+    "register_pressure": ("register pressure", "registers", "occupancy"),
+    "warp_reduction": ("warp reduction", "warp reduce", "shuffle reduction"),
+}
 
 
 @dataclass
@@ -66,6 +84,7 @@ class PineconeRetriever:
         self.index_name_env = cfg.get("index_name_env", "PINECONE_INDEX_NAME")
         self.embed_provider_env = cfg.get("embed_provider_env", "PINECONE_EMBED_PROVIDER")
         self.embed_model_env = cfg.get("embed_model_env", "PINECONE_EMBED_MODEL")
+        self.rerank_model_env = cfg.get("rerank_model_env", "PINECONE_RERANK_MODEL")
         self.default_filter = cfg.get("metadata_filter") or None
         self.index_name = cfg.get("index_name") or os.getenv(self.index_name_env)
         self.embed_provider = cfg.get("embed_provider") or os.getenv(
@@ -74,6 +93,8 @@ class PineconeRetriever:
         self.embed_model = cfg.get("embed_model") or os.getenv(
             self.embed_model_env, "sentence-transformers/all-MiniLM-L6-v2"
         )
+        self.rerank_model = cfg.get("rerank_model") or os.getenv(self.rerank_model_env, "")
+        self.rerank_pool = int(cfg.get("rerank_pool", 12))
         self.last_query_mode = "uninitialized"
 
         self._client = None
@@ -213,7 +234,7 @@ class PineconeRetriever:
                 )
             )
 
-        return matches
+        return self._rerank_matches(query, matches, top_n=int(top_k or self.top_k))
 
     def search_many(
         self,
@@ -223,17 +244,25 @@ class PineconeRetriever:
         metadata_filter: dict | None = None,
     ) -> list[PineconeMatch]:
         deduped = {}
+        candidate_top_k = max(int(top_k or self.top_k), self.rerank_pool)
         for query in queries:
             for match in self.search(
                 query=query,
-                top_k=top_k,
+                top_k=candidate_top_k,
                 namespace=namespace,
                 metadata_filter=metadata_filter,
             ):
                 existing = deduped.get(match.match_id)
                 if existing is None or match.score > existing.score:
                     deduped[match.match_id] = match
-        return sorted(deduped.values(), key=lambda item: item.score, reverse=True)
+        if not deduped:
+            return []
+        combined_query = " ; ".join(str(query).strip() for query in queries if str(query).strip())
+        return self._rerank_matches(
+            combined_query,
+            list(deduped.values()),
+            top_n=int(top_k or self.top_k),
+        )
 
     def format_matches(self, matches: list[PineconeMatch], max_chars: int = 4000) -> str:
         if not matches:
@@ -246,7 +275,10 @@ class PineconeRetriever:
             if match.source:
                 header += f" | {match.source}"
 
+            tags = self._format_metadata_tags(match.metadata or {})
             prefix = f"{header}\nScore: {match.score:.3f}\n"
+            if tags:
+                prefix += f"Tags: {tags}\n"
             remaining = max_chars - total_chars
             if remaining <= len(prefix):
                 break
@@ -319,7 +351,7 @@ class PineconeRetriever:
                     metadata=metadata,
                 )
             )
-        return matches
+        return self._rerank_matches(query, matches, top_n=int(top_k or self.top_k))
 
     def _extract_text(self, fields: dict, metadata: dict) -> str:
         for key in self._text_candidates():
@@ -369,6 +401,14 @@ class PineconeRetriever:
             "source_file",
         ]
 
+    def _format_metadata_tags(self, metadata: dict) -> str:
+        tags = []
+        for key in ("hardware_target", "op_type", "optimization_pattern"):
+            value = metadata.get(key)
+            if value:
+                tags.append(f"{key}={value}")
+        return ", ".join(tags[:3])
+
     def _truncate_text(self, text: str, max_len: int) -> str:
         if max_len <= 0:
             return ""
@@ -377,6 +417,155 @@ class PineconeRetriever:
         if max_len <= 3:
             return text[:max_len]
         return text[: max_len - 3].rstrip() + "..."
+
+    def _rerank_matches(
+        self,
+        query: str,
+        matches: list[PineconeMatch],
+        top_n: int,
+    ) -> list[PineconeMatch]:
+        if not matches:
+            return []
+
+        reranked = self._pinecone_rerank(query, matches, top_n=top_n)
+        if reranked is not None:
+            return reranked
+
+        scored = sorted(
+            matches,
+            key=lambda match: self._heuristic_rank_score(query, match),
+            reverse=True,
+        )
+        if self.last_query_mode != "uninitialized" and "+heuristic" not in self.last_query_mode:
+            self.last_query_mode = f"{self.last_query_mode}+heuristic"
+        return scored[:top_n]
+
+    def _pinecone_rerank(
+        self,
+        query: str,
+        matches: list[PineconeMatch],
+        top_n: int,
+    ) -> list[PineconeMatch] | None:
+        if not self.rerank_model or self._client is None:
+            return None
+        inference = getattr(self._client, "inference", None)
+        if inference is None or not hasattr(inference, "rerank"):
+            return None
+
+        documents = []
+        pool = matches[: max(top_n, self.rerank_pool)]
+        for match in pool:
+            metadata = match.metadata or {}
+            documents.append(
+                {
+                    "id": match.match_id,
+                    "text": match.text,
+                    "title": match.title,
+                    "source": match.source,
+                    "hardware_target": str(metadata.get("hardware_target") or ""),
+                    "op_type": str(metadata.get("op_type") or ""),
+                    "optimization_pattern": str(metadata.get("optimization_pattern") or ""),
+                }
+            )
+
+        try:
+            result = inference.rerank(
+                model=self.rerank_model,
+                query=query,
+                documents=documents,
+                top_n=min(top_n, len(documents)),
+                return_documents=True,
+                rank_fields=["text", "title", "op_type", "optimization_pattern", "hardware_target"],
+                parameters={"truncate": "END"},
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime behavior
+            logger.warning("Pinecone rerank failed for query %r: %s", query, exc)
+            return None
+
+        data = getattr(result, "data", None)
+        if data is None and hasattr(result, "to_dict"):
+            try:
+                data = result.to_dict().get("data")
+            except Exception:
+                data = None
+        if not data:
+            return None
+
+        ranked = []
+        for item in data:
+            if not isinstance(item, dict) and hasattr(item, "to_dict"):
+                item = item.to_dict()
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index")
+            if index is None or index >= len(pool):
+                continue
+            base = pool[index]
+            ranked.append(
+                PineconeMatch(
+                    match_id=base.match_id,
+                    score=float(item.get("score") or base.score),
+                    text=base.text,
+                    title=base.title,
+                    source=base.source,
+                    metadata=base.metadata,
+                )
+            )
+
+        if ranked and self.last_query_mode != "uninitialized":
+            self.last_query_mode = f"{self.last_query_mode}+rerank:{self.rerank_model}"
+        return ranked or None
+
+    def _heuristic_rank_score(self, query: str, match: PineconeMatch) -> float:
+        metadata = match.metadata or {}
+        query_norm = self._normalize_text(query)
+        candidate_text = self._candidate_text(match)
+        score = float(match.score)
+
+        tokens = [token for token in query_norm.split() if len(token) >= 3 or token in {"fp4", "bf16"}]
+        token_hits = sum(1 for token in tokens if token in candidate_text)
+        score += min(token_hits, 10) * 0.025
+
+        for alias_group in HARDWARE_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(
+                alias in candidate_text for alias in alias_group
+            ):
+                score += 0.18
+
+        for alias_group in OP_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(
+                alias in candidate_text for alias in alias_group
+            ):
+                score += 0.16
+
+        for alias_group in PATTERN_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(
+                alias in candidate_text for alias in alias_group
+            ):
+                score += 0.12
+
+        source_file = self._normalize_text(str(metadata.get("source_file") or ""))
+        if source_file:
+            score += sum(1 for token in tokens if token in source_file) * 0.04
+
+        return score
+
+    def _candidate_text(self, match: PineconeMatch) -> str:
+        metadata = match.metadata or {}
+        parts = [
+            match.title,
+            match.source,
+            metadata.get("source_file", ""),
+            metadata.get("hardware_target", ""),
+            metadata.get("op_type", ""),
+            metadata.get("optimization_pattern", ""),
+            match.text[:1600],
+        ]
+        return self._normalize_text(" ".join(str(part) for part in parts if part))
+
+    def _normalize_text(self, text: str) -> str:
+        text = str(text).lower().replace("_", " ").replace("-", " ")
+        return re.sub(r"[^a-z0-9+]+", " ", text)
 
     def _extract_hits(self, response) -> list[dict]:
         if hasattr(response, "matches"):
