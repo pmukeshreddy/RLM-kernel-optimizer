@@ -367,6 +367,12 @@ int main(int argc, char** argv) {{
             logger.warning("Graph benchmark failed for %s: %s", self.env.kernel_type, exc)
             return None
 
+    @staticmethod
+    def _timing_delta_pct(graph_timing_us: Optional[float], binary_timing_us: Optional[float]) -> Optional[float]:
+        if graph_timing_us is None or binary_timing_us is None or binary_timing_us <= 0:
+            return None
+        return ((graph_timing_us - binary_timing_us) / binary_timing_us) * 100.0
+
     def _profile_candidate(
         self,
         candidate: KernelCandidate,
@@ -421,13 +427,29 @@ int main(int argc, char** argv) {{
                 with self._env_lock:
                     self.env.correctness_passes += 1
                 candidate.correct = True
-                timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
+                graph_timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
+                binary_timing_us = self.profiler.benchmark_timing(binary)
+                timing_delta_pct = self._timing_delta_pct(graph_timing_us, binary_timing_us)
+
+                if graph_timing_us is not None or binary_timing_us is not None:
+                    graph_str = f"{graph_timing_us:.3f}" if graph_timing_us is not None else "n/a"
+                    binary_str = f"{binary_timing_us:.3f}" if binary_timing_us is not None else "n/a"
+                    delta_str = f"{timing_delta_pct:+.1f}%" if timing_delta_pct is not None else "n/a"
+                    logger.info(
+                        "  Timing AB [%s]: graph=%sus binary=%sus delta=%s",
+                        candidate.strategy,
+                        graph_str,
+                        binary_str,
+                        delta_str,
+                    )
+
+                timing_us = graph_timing_us
                 if timing_us is None:
                     logger.warning(
                         "Graph benchmark failed for [%s]; falling back to binary event timing",
                         candidate.strategy,
                     )
-                    timing_us = self.profiler.benchmark_timing(binary)
+                    timing_us = binary_timing_us
                 if timing_us is not None:
                     speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
                     metrics = self.profiler.profile(
@@ -442,6 +464,9 @@ int main(int argc, char** argv) {{
                     if metrics:
                         metrics.duration_us = timing_us
                         metrics.speedup = speedup
+                        metrics.graph_timing_us = graph_timing_us or 0.0
+                        metrics.binary_timing_us = binary_timing_us or 0.0
+                        metrics.timing_delta_pct = timing_delta_pct or 0.0
                         logger.info("  Profiler: occ=%.1f%% timing=%.1fus speedup=%.3fx",
                                     metrics.sm_occupancy, metrics.duration_us, metrics.speedup)
                     else:

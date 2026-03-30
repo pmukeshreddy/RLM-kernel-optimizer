@@ -34,6 +34,9 @@ class KernelMetrics:
     elapsed_cycles:         float = 0.0
     active_cycles:          float = 0.0
     duration_us:            float = 0.0
+    graph_timing_us:        float = 0.0
+    binary_timing_us:       float = 0.0
+    timing_delta_pct:       float = 0.0
     speedup:                float = 1.0
 
     def to_dict(self) -> dict:
