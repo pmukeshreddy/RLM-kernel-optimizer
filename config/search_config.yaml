@@ -58,6 +58,8 @@ rag:
   api_key_env: "PINECONE_API_KEY"
   index_name_env: "PINECONE_INDEX_NAME"
   index_host_env: "PINECONE_INDEX_HOST"
+  embed_provider_env: "PINECONE_EMBED_PROVIDER"
+  embed_model_env: "PINECONE_EMBED_MODEL"
   text_field: "chunk_text"
   title_field: "title"
   source_field: "source"

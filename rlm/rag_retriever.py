@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 
 from .env_loader import load_project_env
+from .query_embedder import embed_query
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,17 @@ class PineconeRetriever:
         self.api_key_env = cfg.get("api_key_env", "PINECONE_API_KEY")
         self.index_host_env = cfg.get("index_host_env", "PINECONE_INDEX_HOST")
         self.index_name_env = cfg.get("index_name_env", "PINECONE_INDEX_NAME")
+        self.embed_provider_env = cfg.get("embed_provider_env", "PINECONE_EMBED_PROVIDER")
+        self.embed_model_env = cfg.get("embed_model_env", "PINECONE_EMBED_MODEL")
         self.default_filter = cfg.get("metadata_filter") or None
         self.index_name = cfg.get("index_name") or os.getenv(self.index_name_env)
+        self.embed_provider = cfg.get("embed_provider") or os.getenv(
+            self.embed_provider_env, "sentence-transformers"
+        )
+        self.embed_model = cfg.get("embed_model") or os.getenv(
+            self.embed_model_env, "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        self.last_query_mode = "uninitialized"
 
         self._client = None
         self._index = None
@@ -153,8 +163,22 @@ class PineconeRetriever:
                 query=search_query,
                 fields=self.fields,
             )
+            self.last_query_mode = "text"
         except Exception as exc:  # pragma: no cover - network runtime
+            if self._is_integrated_inference_error(exc):
+                logger.info(
+                    "Pinecone text search unavailable for %r; falling back to vector query using %s",
+                    query,
+                    self.embed_model,
+                )
+                return self._search_by_vector(
+                    query=query,
+                    top_k=top_k,
+                    namespace=namespace,
+                    metadata_filter=metadata_filter,
+                )
             logger.warning("Pinecone search failed for query %r: %s", query, exc)
+            self.last_query_mode = "text_error"
             return []
 
         hits = self._extract_hits(response)
@@ -231,14 +255,85 @@ class PineconeRetriever:
     def get_top_k(self, query: str, k: int = 1):
         return [match.to_legacy_dict() for match in self.search(query, top_k=k)]
 
+    def _search_by_vector(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        metadata_filter: dict | None = None,
+    ) -> list[PineconeMatch]:
+        index = self._ensure_index()
+        if index is None:
+            return []
+
+        try:
+            vector = embed_query(
+                text=query.strip(),
+                provider=self.embed_provider,
+                model_name=self.embed_model,
+            )
+        except Exception as exc:  # pragma: no cover - optional dependency/runtime
+            logger.warning("Query embedding failed for %r: %s", query, exc)
+            self.last_query_mode = "vector_error"
+            return []
+
+        try:
+            response = index.query(
+                vector=vector,
+                top_k=int(top_k or self.top_k),
+                namespace=namespace or self.namespace,
+                include_metadata=True,
+                include_values=False,
+                filter=metadata_filter if metadata_filter is not None else self.default_filter,
+            )
+            self.last_query_mode = f"vector:{self.embed_model}"
+        except Exception as exc:  # pragma: no cover - network runtime
+            logger.warning("Pinecone vector query failed for %r: %s", query, exc)
+            self.last_query_mode = "vector_error"
+            return []
+
+        hits = self._extract_hits(response)
+        matches = []
+        for hit in hits:
+            metadata = hit.get("metadata", {}) or {}
+            text = str(metadata.get(self.text_field) or "").strip()
+            if not text:
+                text = str(metadata.get("text") or metadata.get("content") or "").strip()
+            if not text:
+                continue
+            matches.append(
+                PineconeMatch(
+                    match_id=str(hit.get("_id") or hit.get("id") or "unknown"),
+                    score=float(hit.get("_score") or hit.get("score") or 0.0),
+                    text=text,
+                    title=str(
+                        metadata.get(self.title_field)
+                        or metadata.get("title")
+                        or hit.get("_id")
+                        or hit.get("id")
+                        or ""
+                    ).strip(),
+                    source=str(
+                        metadata.get(self.source_field)
+                        or metadata.get("source")
+                        or ""
+                    ).strip(),
+                    metadata=metadata,
+                )
+            )
+        return matches
+
     def _extract_hits(self, response) -> list[dict]:
+        if hasattr(response, "matches"):
+            hits = getattr(response, "matches", [])
+            return [self._normalize_hit(hit) for hit in hits]
         if isinstance(response, dict):
             result = response.get("result", response)
-            hits = result.get("hits", [])
+            hits = result.get("hits", result.get("matches", []))
             return [self._normalize_hit(hit) for hit in hits]
 
         result = getattr(response, "result", response)
-        hits = getattr(result, "hits", [])
+        hits = getattr(result, "hits", getattr(result, "matches", []))
         return [self._normalize_hit(hit) for hit in hits]
 
     def _normalize_hit(self, hit) -> dict:
@@ -256,6 +351,9 @@ class PineconeRetriever:
             except Exception:
                 pass
         return output
+
+    def _is_integrated_inference_error(self, exc: Exception) -> bool:
+        return "integrated inference is not configured for this index" in str(exc).lower()
 
 
 def init_knowledge_base(config: dict | None = None) -> PineconeRetriever:

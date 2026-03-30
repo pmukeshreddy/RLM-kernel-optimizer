@@ -35,6 +35,7 @@ def main() -> int:
         "query": args.query,
         "top_k": args.top_k,
         "indexes": retriever.list_indexes(),
+        "query_mode": retriever.last_query_mode,
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -42,6 +43,7 @@ def main() -> int:
         return 1
 
     matches = retriever.search_many([args.query], top_k=args.top_k)
+    print(json.dumps({"query_mode": retriever.last_query_mode}, indent=2, sort_keys=True))
     print()
     print(retriever.format_matches(matches))
     return 0
