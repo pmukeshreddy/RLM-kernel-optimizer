@@ -17,6 +17,7 @@ from rlm.environment import RLMEnvironment, KernelCandidate
 from profiler.kernel_profiler import KernelProfiler
 from profiler.metrics import KernelMetrics, metrics_from_dict
 from search.diversity_selector import DiversitySelector
+from eval.benchmark import Benchmarker
 from eval.hack_detector import is_clean
 from eval.runtime_checks import run_runtime_checks
 from eval.correctness import CorrectnessChecker
@@ -43,6 +44,7 @@ class BeamSearch:
         self.env      = env
         self.engine   = RLMEngine(env)
         self.profiler = KernelProfiler(env.search_config, hw_spec=env.hw_spec)
+        self.benchmarker = Benchmarker(env.search_config, kernel_type=env.kernel_type)
         self.selector = DiversitySelector(env.search_config)
         self.checker  = CorrectnessChecker(env.search_config)
         self.beam_w   = env.search_config["beam"]["width"]
@@ -348,12 +350,22 @@ int main(int argc, char** argv) {{
         if not ok:
             logger.warning("Baseline compilation failed: %s", err[:200])
             return None, None
-        timing = self.profiler.benchmark_timing(binary)
+        timing = self._benchmark_with_graphs(self.env.kernel_src_raw, problem_shape)
+        if timing is None:
+            logger.warning("Graph benchmark baseline failed; falling back to binary event timing")
+            timing = self.profiler.benchmark_timing(binary)
         if timing:
             logger.info("Search baseline (with L2 cycling): %.3f us", timing)
         self.env.baseline_naive_us = timing
         self.env.baseline_compiler_metrics = baseline_cm
         return timing, baseline_cm
+
+    def _benchmark_with_graphs(self, kernel_src: str, problem_shape: tuple) -> Optional[float]:
+        try:
+            return self.benchmarker._compile_and_time(kernel_src, problem_shape)
+        except Exception as exc:
+            logger.warning("Graph benchmark failed for %s: %s", self.env.kernel_type, exc)
+            return None
 
     def _profile_candidate(
         self,
@@ -409,7 +421,13 @@ int main(int argc, char** argv) {{
                 with self._env_lock:
                     self.env.correctness_passes += 1
                 candidate.correct = True
-                timing_us = self.profiler.benchmark_timing(binary)
+                timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
+                if timing_us is None:
+                    logger.warning(
+                        "Graph benchmark failed for [%s]; falling back to binary event timing",
+                        candidate.strategy,
+                    )
+                    timing_us = self.profiler.benchmark_timing(binary)
                 if timing_us is not None:
                     speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
                     metrics = self.profiler.profile(

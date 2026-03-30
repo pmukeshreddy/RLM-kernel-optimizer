@@ -30,6 +30,9 @@ import time
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
+DEBUG_BENCHMARK_KERNEL_SRC = os.getenv("RLM_DEBUG_BENCHMARK_KERNEL_SRC", "").strip().lower() in {
+    "1", "true", "yes",
+}
 
 # Maximum input buffer copies for L2 cache cycling (KernelArena methodology)
 _MAX_L2_CYCLE_BUFS = 256
@@ -130,11 +133,12 @@ class Benchmarker:
         src_hash = hashlib.md5(cuda_src.encode()).hexdigest()[:12]
         mod_name = f"bench_{self.kernel_type}_{src_hash}"
 
-        print("\n" + "="*80)
-        print(f"DEBUG: Printing generated kernel source for shape {shape}")
-        print("="*80)
-        print(kernel_src)
-        print("="*80 + "\n")
+        if DEBUG_BENCHMARK_KERNEL_SRC:
+            print("\n" + "=" * 80)
+            print(f"DEBUG: Printing generated kernel source for shape {shape}")
+            print("=" * 80)
+            print(kernel_src)
+            print("=" * 80 + "\n")
 
         module = load_inline(
             name=mod_name,
