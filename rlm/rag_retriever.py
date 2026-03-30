@@ -800,8 +800,17 @@ class PineconeRetriever:
             hits = result.get("hits") or result.get("matches") or []
             return [self._normalize_hit(hit) for hit in hits]
 
-        result = getattr(response, "result", response)
-        hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
+        # Integrated inference response: try response.result.hits first,
+        # then response.hits directly as a fallback
+        result = getattr(response, "result", None)
+        if result is not None:
+            hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
+        else:
+            hits = getattr(response, "hits", None) or getattr(response, "matches", None) or []
+        if not hits:
+            logger.debug("_extract_hits: empty hits. response type=%s attrs=%s",
+                         type(response).__name__,
+                         [a for a in dir(response) if not a.startswith("__")])
         return [self._normalize_hit(hit) for hit in hits]
 
     def _normalize_hit(self, hit) -> dict:
