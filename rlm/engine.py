@@ -334,7 +334,9 @@ class RLMEngine:
         missing = env.detect_missing_optimizations()
         analysis = (
             f"  Source signals: loads={ops['loads']} stores={ops['stores']} "
-            f"float4={ops['float4']} tma={ops['tma']} syncthreads={ops['syncthreads']} shfl={ops['shfl']}\n"
+            f"float4={ops['float4']} tma={ops['tma']} "
+            f"syncthreads~={ops['syncthreads']} (src={ops['syncthreads_source']}) "
+            f"shfl={ops['shfl']}\n"
             f"  Preferred search surfaces: {', '.join(missing[:5]) if missing else 'none singled out from source analysis'}\n"
         )
         if env.baseline_naive_us and env.baseline_us_reported:

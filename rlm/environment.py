@@ -191,16 +191,171 @@ class RLMEnvironment:
     def get_kernel_slice(self, start: int, end: int) -> str:
         return self.kernel_src[start:end]
 
+    def _strip_comments(self, src: str) -> str:
+        src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+        src = re.sub(r"//.*", "", src)
+        return src
+
+    def _extract_int_constants(self, src: str) -> dict[str, int]:
+        constants: dict[str, int] = {}
+        for name, expr in re.findall(r"^\s*#define\s+([A-Za-z_]\w*)\s+([^\n]+)$", src, flags=re.M):
+            value = self._eval_int_expr(expr.strip(), constants)
+            if value is not None:
+                constants[name] = value
+        if "BLOCK_THREADS" in constants:
+            constants["blockDim.x"] = constants["BLOCK_THREADS"]
+        return constants
+
+    def _eval_int_expr(self, expr: str, constants: dict[str, int]) -> Optional[int]:
+        expr = expr.strip()
+        if not expr:
+            return None
+        for name, value in sorted(constants.items(), key=lambda item: -len(item[0])):
+            expr = expr.replace(name, str(value))
+        expr = re.sub(r"\b(static_cast|reinterpret_cast|const)\b", "", expr)
+        expr = re.sub(r"\((?:int|unsigned|size_t|long|short)\)", "", expr)
+        if re.search(r"[A-Za-z_]", expr):
+            return None
+        if not re.fullmatch(r"[0-9xXa-fA-F+\-*/%<>&|() \t]+", expr):
+            return None
+        try:
+            value = eval(expr, {"__builtins__": {}}, {})
+        except Exception:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        return None
+
+    def _find_matching_delim(self, text: str, start: int, open_ch: str, close_ch: str) -> int:
+        depth = 0
+        for idx in range(start, len(text)):
+            if text[idx] == open_ch:
+                depth += 1
+            elif text[idx] == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return -1
+
+    def _estimate_for_loop_iterations(self, header: str, constants: dict[str, int]) -> Optional[int]:
+        parts = [part.strip() for part in header.split(";")]
+        if len(parts) != 3:
+            return None
+        init, cond, update = parts
+        init_match = re.search(r"([A-Za-z_]\w*)\s*=\s*(.+)$", init)
+        if not init_match:
+            return None
+        var = init_match.group(1)
+        start = self._eval_int_expr(init_match.group(2), constants)
+        if start is None:
+            return None
+
+        if re.fullmatch(rf"{re.escape(var)}\s*>>=\s*1", update) or re.fullmatch(
+            rf"{re.escape(var)}\s*=\s*{re.escape(var)}\s*>>\s*1", update
+        ):
+            if re.search(rf"\b{re.escape(var)}\b\s*>\s*0", cond):
+                count = 0
+                value = start
+                while value > 0:
+                    count += 1
+                    value >>= 1
+                return count
+
+        if re.fullmatch(rf"{re.escape(var)}\s*/=\s*2", update) or re.fullmatch(
+            rf"{re.escape(var)}\s*=\s*{re.escape(var)}\s*/\s*2", update
+        ):
+            if re.search(rf"\b{re.escape(var)}\b\s*>\s*0", cond):
+                count = 0
+                value = start
+                while value > 0:
+                    count += 1
+                    value //= 2
+                return count
+
+        step = None
+        if re.fullmatch(rf"(?:\+\+{re.escape(var)}|{re.escape(var)}\+\+)", update):
+            step = 1
+        else:
+            step_match = re.fullmatch(rf"{re.escape(var)}\s*\+=\s*(.+)", update)
+            if step_match:
+                step = self._eval_int_expr(step_match.group(1), constants)
+        if step is not None and step > 0:
+            cond_match = re.search(rf"\b{re.escape(var)}\b\s*(<|<=)\s*(.+)$", cond)
+            if cond_match:
+                end = self._eval_int_expr(cond_match.group(2), constants)
+                if end is not None:
+                    if cond_match.group(1) == "<=":
+                        end += 1
+                    if start < end:
+                        return max(0, (end - start + step - 1) // step)
+        return None
+
+    def _count_runtime_syncs(self, src: str, constants: dict[str, int]) -> int:
+        total = 0
+        cursor = 0
+        while cursor < len(src):
+            sync_idx = src.find("__syncthreads", cursor)
+            for_match = re.search(r"\bfor\s*\(", src[cursor:])
+            for_idx = cursor + for_match.start() if for_match else -1
+
+            if sync_idx == -1 and for_idx == -1:
+                break
+            if sync_idx != -1 and (for_idx == -1 or sync_idx < for_idx):
+                total += 1
+                cursor = sync_idx + len("__syncthreads")
+                continue
+
+            header_open = src.find("(", for_idx)
+            header_close = self._find_matching_delim(src, header_open, "(", ")")
+            if header_open == -1 or header_close == -1:
+                cursor = for_idx + 3
+                continue
+            header = src[header_open + 1:header_close]
+            body_start = header_close + 1
+            while body_start < len(src) and src[body_start].isspace():
+                body_start += 1
+
+            if body_start < len(src) and src[body_start] == "{":
+                body_end = self._find_matching_delim(src, body_start, "{", "}")
+                if body_end == -1:
+                    cursor = body_start + 1
+                    continue
+                body = src[body_start + 1:body_end]
+                cursor = body_end + 1
+            else:
+                stmt_end = src.find(";", body_start)
+                if stmt_end == -1:
+                    cursor = body_start + 1
+                    continue
+                body = src[body_start:stmt_end + 1]
+                cursor = stmt_end + 1
+
+            body_syncs = self._count_runtime_syncs(body, constants)
+            iterations = self._estimate_for_loop_iterations(header, constants)
+            total += body_syncs * max(iterations or 1, 1)
+        return total
+
+    def estimate_runtime_syncthreads(self) -> tuple[int, int]:
+        src = self._strip_comments(self.kernel_src_raw)
+        constants = self._extract_int_constants(src)
+        source_occurrences = src.count("__syncthreads")
+        runtime_estimate = self._count_runtime_syncs(src, constants)
+        return source_occurrences, max(runtime_estimate, source_occurrences)
+
     def count_memory_ops(self) -> dict:
         # Use raw source (without expanded includes) to analyze the actual kernel code
-        src = self.kernel_src_raw
+        src = self._strip_comments(self.kernel_src_raw)
+        syncthreads_source, syncthreads_runtime = self.estimate_runtime_syncthreads()
         return {
             "loads":       len(re.findall(r"\b(?:__ldg|ld\.global|tex1Dfetch)\b", src)),
             "stores":      len(re.findall(r"\b(?:__stg|st\.global|atomicAdd)\b", src)),
             "float4":      src.count("float4"),
             "cp_async":    src.count("cp.async"),
             "tma":         src.count("tma_load") + src.count("tcgen05"),
-            "syncthreads": src.count("__syncthreads"),
+            "syncthreads": syncthreads_runtime,
+            "syncthreads_source": syncthreads_source,
             "shfl":        src.count("__shfl"),
         }
 
@@ -301,7 +456,8 @@ class RLMEnvironment:
             f"${self.search_config['cost_control']['max_total_api_cost_usd']:.2f}\n"
             f"Memory ops:    loads={ops['loads']} stores={ops['stores']} "
             f"float4={ops['float4']} tma={ops['tma']}\n"
-            f"Sync ops:      syncthreads={ops['syncthreads']} shfl={ops['shfl']}\n"
+            f"Sync ops:      syncthreads~={ops['syncthreads']} "
+            f"(src={ops['syncthreads_source']}) shfl={ops['shfl']}\n"
             f"Missing opts:  {', '.join(missing) or 'none detected'}\n"
             f"Strategies tried: {', '.join(self.optimization_history.strategies_tried()) or 'none'}\n"
             f"History:\n{self.optimization_history.to_summary_str()}\n"
