@@ -54,6 +54,7 @@ target:
 rag:
   provider: "pinecone"
   top_k: 4
+  candidate_pool_multiplier: 3
   namespace_env: "PINECONE_NAMESPACE"
   api_key_env: "PINECONE_API_KEY"
   index_name_env: "PINECONE_INDEX_NAME"
@@ -62,14 +63,17 @@ rag:
   embed_model_env: "PINECONE_EMBED_MODEL"
   rerank_model_env: "PINECONE_RERANK_MODEL"
   rerank_pool: 12
-  text_field: "chunk_text"
+  source_cap: 2
+  format_max_chars: 16000
+  match_max_chars: 4000
+  text_field: "source_code"
   title_field: "title"
   source_field: "source"
   fields:
+    - "source_code"
     - "chunk_text"
     - "title"
     - "source"
-    - "source_code"
     - "source_file"
     - "hardware_target"
     - "optimization_pattern"

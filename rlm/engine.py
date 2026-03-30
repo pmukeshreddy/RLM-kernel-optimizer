@@ -16,6 +16,7 @@ from anthropic import AsyncAnthropic
 from .coder import build_coder_prompt
 from .environment import RLMEnvironment, KernelCandidate
 from .feedback import build_sandbox_feedback
+from .feedback import _kernel_aliases, _kernel_operation_phrase
 from .fixer import build_fixer_prompt
 from .planner import (
     build_initial_plan_prompt,
@@ -409,10 +410,15 @@ class RLMEngine:
     def _initial_plan_queries(self) -> list[str]:
         env = self.env
         shape = "x".join(str(dim) for dim in env.problem_shapes[0])
+        operation = _kernel_operation_phrase(env.kernel_type)
+        aliases = ", ".join(_kernel_aliases(env.kernel_type)[:4])
         return [
-            f"{env.kernel_type} Blackwell CUDA optimization {shape}",
-            f"{env.kernel_type} FlashInfer baseline bottleneck",
-            f"{env.kernel_type} vectorized loads stores bf16 fp4",
+            (
+                f"Operation: {operation}. Hardware: Blackwell B200 sm100a. "
+                f"Shape: {shape}. Aliases: {aliases}. Need: production CUDA kernel source_code."
+            ),
+            f"{operation} Blackwell B200 FlashInfer bottleneck CUDA",
+            f"{operation} Blackwell B200 vectorized loads stores bf16 fp4 CUDA",
         ]
 
     def _expand_tree_plans(self, parent: KernelCandidate) -> list[dict]:

@@ -3,6 +3,21 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+KERNEL_QUERY_CONTEXT = {
+    "add_rmsnorm": {
+        "operation": "fused add rmsnorm fp4 quantization",
+        "aliases": ["rmsnorm", "residual add", "fp4 quantization", "layernorm"],
+    },
+    "silu_mul": {
+        "operation": "fused silu mul fp4 quantization",
+        "aliases": ["silu", "swiglu", "gated silu", "fp4 quantization"],
+    },
+    "nvfp4_quantize": {
+        "operation": "nvfp4 block quantization",
+        "aliases": ["fp4 quantization", "nvfp4", "bf16 to fp4", "packing"],
+    },
+}
+
 
 @dataclass
 class SandboxFeedback:
@@ -102,36 +117,108 @@ def _delta_evidence(name: str, before, after, unit: str | None = None) -> dict:
 
 def _compiler_queries(kernel_type: str, error: str) -> list[str]:
     first = _first_actionable_error(error)
+    operation = _kernel_operation_phrase(kernel_type)
     queries = [
-        f"{kernel_type} CUDA compile fix {first}",
-        f"{kernel_type} launch signature compile error",
+        f"Operation: {operation}. Hardware: Blackwell B200 sm100a. Problem: CUDA compile error. Signature: {first}",
+        f"{operation} launch signature compile error CUDA",
     ]
     if "__syncthreads" in error:
-        queries.append(f"{kernel_type} __syncthreads divergent branch fix")
+        queries.append(f"{operation} __syncthreads divergent branch fix CUDA")
     if "undefined reference" in error.lower():
-        queries.append(f"{kernel_type} launch wrapper signature linker error")
-    return queries
+        queries.append(f"{operation} launch wrapper signature linker error CUDA")
+    return _unique_queries(queries)
+
+
+def _kernel_operation_phrase(kernel_type: str) -> str:
+    context = KERNEL_QUERY_CONTEXT.get(kernel_type, {})
+    return context.get("operation", kernel_type.replace("_", " "))
+
+
+def _kernel_aliases(kernel_type: str) -> list[str]:
+    context = KERNEL_QUERY_CONTEXT.get(kernel_type, {})
+    aliases = list(context.get("aliases", []))
+    aliases.append(kernel_type.replace("_", " "))
+    return [alias for alias in aliases if alias]
+
+
+def _unique_queries(queries: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for query in queries:
+        cleaned = " ".join(str(query).split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(cleaned)
+    return ordered
+
+
+def _bottleneck_focus_terms(metrics: dict) -> list[str]:
+    compiler = metrics.get("_compiler", {}) if metrics else {}
+    focus = []
+
+    if compiler.get("registers_per_thread", 0) > 96:
+        focus.extend(["register pressure", "occupancy tuning", "launch bounds"])
+    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0):
+        focus.append("spill elimination")
+    if compiler.get("sass_stg_32", 0) > 1:
+        focus.extend(["vectorized stores", "uint4 store packing", "store alignment"])
+    if compiler.get("sass_ldg_32", 0) > 2:
+        focus.extend(["vectorized loads", "uint4 load alignment", "coalesced loads"])
+    if compiler.get("sass_bra", 0) > 3:
+        focus.extend(["warp shuffle reduction", "branchless reduction", "predicate reduction"])
+    if compiler.get("sass_fadd", 0) + compiler.get("sass_fmul", 0) > compiler.get("sass_ffma", 0):
+        focus.extend(["ffma fusion", "bf16 pair math", "fmaf"])
+
+    mem_tput = metrics.get("mem_throughput_pct", 0)
+    compute_tput = metrics.get("compute_throughput_pct", 0)
+    if mem_tput > compute_tput and mem_tput > 0:
+        focus.extend(["memory bandwidth", "coalesced memory path"])
+    elif compute_tput > 0:
+        focus.extend(["instruction mix", "compute efficiency"])
+
+    return _unique_queries(focus)
+
+
+def _build_targeted_query(kernel_type: str, metrics: dict, focus_terms: list[str]) -> str:
+    operation = _kernel_operation_phrase(kernel_type)
+    aliases = ", ".join(_kernel_aliases(kernel_type)[:4])
+    optimizations = ", ".join(focus_terms[:4]) or "instruction mix"
+    return (
+        f"Operation: {operation}. Hardware: Blackwell B200 sm100a. "
+        f"Aliases: {aliases}. Optimizations: {optimizations}. "
+        f"Need: production CUDA kernel source_code."
+    )
 
 
 def _performance_queries(kernel_type: str, metrics: dict) -> list[str]:
-    queries = []
+    operation = _kernel_operation_phrase(kernel_type)
+    focus_terms = _bottleneck_focus_terms(metrics)
+    queries = [_build_targeted_query(kernel_type, metrics, focus_terms)]
+
+    if focus_terms:
+        primary = " ".join(focus_terms[:2])
+        queries.append(f"{operation} Blackwell B200 {primary} CUDA source")
+
     compiler = metrics.get("_compiler", {}) if metrics else {}
-
-    if compiler.get("registers_per_thread", 0) > 96:
-        queries.append(f"{kernel_type} reduce registers occupancy CUDA")
-    if compiler.get("sass_stg_32", 0) > 1:
-        queries.append(f"{kernel_type} vectorized stores uint4 CUDA")
-    if compiler.get("sass_ldg_32", 0) > 2:
-        queries.append(f"{kernel_type} vectorized loads uint4 CUDA")
     if compiler.get("sass_bra", 0) > 3:
-        queries.append(f"{kernel_type} branchless CUDA kernel optimization")
+        queries.append(f"{operation} B200 warp shuffle reduction branchless CUDA")
+    if compiler.get("sass_stg_32", 0) > 1:
+        queries.append(f"{operation} B200 vectorized stores uint4 store packing CUDA")
+    if compiler.get("sass_ldg_32", 0) > 2:
+        queries.append(f"{operation} B200 vectorized loads uint4 alignment CUDA")
+    if compiler.get("registers_per_thread", 0) > 96:
+        queries.append(f"{operation} B200 register pressure occupancy reduction CUDA")
     if compiler.get("sass_fadd", 0) + compiler.get("sass_fmul", 0) > compiler.get("sass_ffma", 0):
-        queries.append(f"{kernel_type} FFMA fusion bf16 CUDA")
+        queries.append(f"{operation} B200 bf16 ffma fusion CUDA")
 
-    if not queries:
-        queries.append(f"{kernel_type} Blackwell CUDA optimization")
+    if len(queries) == 1:
+        queries.append(f"{operation} Blackwell B200 production CUDA optimization")
 
-    return queries
+    return _unique_queries(queries)
 
 
 def _performance_root_cause(metrics: dict) -> str:

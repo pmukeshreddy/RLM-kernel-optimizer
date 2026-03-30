@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -31,6 +32,16 @@ PATTERN_ALIASES = {
     "vectorized_loads": ("vectorized loads", "vector loads", "uint4 loads", "ldg 128", "ldg128"),
     "register_pressure": ("register pressure", "registers", "occupancy"),
     "warp_reduction": ("warp reduction", "warp reduce", "shuffle reduction"),
+}
+
+SOURCE_QUALITY_WEIGHTS = {
+    "flashinfer": 1.0,
+    "vllm": 1.0,
+    "cutlass": 0.95,
+    "triton": 0.95,
+    "pytorch": 0.9,
+    "apex": 0.9,
+    "sakana": 0.65,
 }
 
 
@@ -95,6 +106,10 @@ class PineconeRetriever:
         )
         self.rerank_model = cfg.get("rerank_model") or os.getenv(self.rerank_model_env, "")
         self.rerank_pool = int(cfg.get("rerank_pool", 12))
+        self.candidate_pool_multiplier = int(cfg.get("candidate_pool_multiplier", 3))
+        self.source_cap = int(cfg.get("source_cap", 2))
+        self.format_max_chars = int(cfg.get("format_max_chars", 16000))
+        self.match_max_chars = int(cfg.get("match_max_chars", 4000))
         self.last_query_mode = "uninitialized"
 
         self._client = None
@@ -244,7 +259,10 @@ class PineconeRetriever:
         metadata_filter: dict | None = None,
     ) -> list[PineconeMatch]:
         deduped = {}
-        candidate_top_k = max(int(top_k or self.top_k), self.rerank_pool)
+        candidate_top_k = max(
+            int(top_k or self.top_k) * self.candidate_pool_multiplier,
+            self.rerank_pool,
+        )
         for query in queries:
             for match in self.search(
                 query=query,
@@ -264,10 +282,11 @@ class PineconeRetriever:
             top_n=int(top_k or self.top_k),
         )
 
-    def format_matches(self, matches: list[PineconeMatch], max_chars: int = 4000) -> str:
+    def format_matches(self, matches: list[PineconeMatch], max_chars: int | None = None) -> str:
         if not matches:
             return f"No Pinecone matches. Retriever status: {self.status()}"
 
+        max_chars = int(max_chars or self.format_max_chars)
         parts = []
         total_chars = 0
         for idx, match in enumerate(matches, start=1):
@@ -283,12 +302,12 @@ class PineconeRetriever:
             if remaining <= len(prefix):
                 break
 
-            body_budget = remaining - len(prefix)
+            body_budget = min(remaining - len(prefix), self.match_max_chars)
             body = self._truncate_text(match.text.strip().replace("\r", ""), body_budget)
             if not body:
                 continue
 
-            block = f"{prefix}{body}"
+            block = f"{prefix}```cuda\n{body}\n```"
             parts.append(block)
             total_chars += len(block)
 
@@ -377,11 +396,11 @@ class PineconeRetriever:
     def _text_candidates(self) -> list[str]:
         return [
             self.text_field,
+            "source_code",
             "chunk_text",
             "text",
             "content",
             "body",
-            "source_code",
             "code",
         ]
 
@@ -436,8 +455,9 @@ class PineconeRetriever:
             key=lambda match: self._heuristic_rank_score(query, match),
             reverse=True,
         )
+        scored = self._diversify_matches(scored, top_n=top_n)
         if self.last_query_mode != "uninitialized" and "+heuristic" not in self.last_query_mode:
-            self.last_query_mode = f"{self.last_query_mode}+heuristic"
+            self.last_query_mode = f"{self.last_query_mode}+heuristic+diverse"
         return scored[:top_n]
 
     def _pinecone_rerank(
@@ -512,9 +532,12 @@ class PineconeRetriever:
                 )
             )
 
+        if not ranked:
+            return None
+        ranked = self._diversify_matches(ranked, top_n=top_n)
         if ranked and self.last_query_mode != "uninitialized":
-            self.last_query_mode = f"{self.last_query_mode}+rerank:{self.rerank_model}"
-        return ranked or None
+            self.last_query_mode = f"{self.last_query_mode}+rerank:{self.rerank_model}+diverse"
+        return ranked
 
     def _heuristic_rank_score(self, query: str, match: PineconeMatch) -> float:
         metadata = match.metadata or {}
@@ -548,7 +571,68 @@ class PineconeRetriever:
         if source_file:
             score += sum(1 for token in tokens if token in source_file) * 0.04
 
+        score += self._source_weight_bonus(match.source)
+
         return score
+
+    def _diversify_matches(self, matches: list[PineconeMatch], top_n: int) -> list[PineconeMatch]:
+        selected = []
+        seen_prefixes = set()
+        source_counts = {}
+
+        for match in matches:
+            prefix_key = self._code_prefix_hash(match)
+            if prefix_key and prefix_key in seen_prefixes:
+                continue
+
+            source_key = self._normalize_text(match.source or "unknown").strip() or "unknown"
+            if source_counts.get(source_key, 0) >= self.source_cap:
+                continue
+
+            selected.append(match)
+            if prefix_key:
+                seen_prefixes.add(prefix_key)
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
+            if len(selected) >= top_n:
+                return selected
+
+        if len(selected) >= top_n:
+            return selected
+
+        selected_ids = {item.match_id for item in selected}
+        for match in matches:
+            if match.match_id in selected_ids:
+                continue
+            prefix_key = self._code_prefix_hash(match)
+            if prefix_key and prefix_key in seen_prefixes:
+                continue
+            selected.append(match)
+            if prefix_key:
+                seen_prefixes.add(prefix_key)
+            if len(selected) >= top_n:
+                break
+        return selected
+
+    def _code_prefix_hash(self, match: PineconeMatch) -> str:
+        body = self._strip_comments(match.text)
+        if not body:
+            return ""
+        prefix = body[:200].strip()
+        if not prefix:
+            return ""
+        return hashlib.sha1(prefix.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _strip_comments(self, text: str) -> str:
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        text = re.sub(r"//.*", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _source_weight_bonus(self, source: str) -> float:
+        key = self._normalize_text(source).strip()
+        if not key:
+            return 0.0
+        weight = SOURCE_QUALITY_WEIGHTS.get(key, 0.8)
+        return (weight - 0.8) * 0.35
 
     def _candidate_text(self, match: PineconeMatch) -> str:
         metadata = match.metadata or {}
