@@ -180,7 +180,12 @@ Rules:
 - Do not use torch headers (torch/extension.h, ATen, c10).
 """
 
-def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> str:
+def _build_refine_system_prompt(
+    speedup: float,
+    prev_metrics: dict = None,
+    kernel_type: str = "",
+    problem_shape: tuple | None = None,
+) -> str:
     """Build REFINE_SYSTEM_PROMPT with constraints from measured runtime data."""
     if speedup >= 1.0 and prev_metrics:
         cm = prev_metrics.get("_compiler", {})
@@ -188,7 +193,16 @@ def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> st
         hints = []
         if cm.get("spill_stores_bytes", 0) or cm.get("spill_loads_bytes", 0):
             hints.append("spills are present, so reduce live state before adding more work per thread")
-        if cm.get("registers_per_thread", 0) >= 96 or occupancy < 75.0:
+        regs = int(cm.get("registers_per_thread", 0) or 0)
+        reg_limit = 96
+        occ_limit = 75.0
+        if kernel_type == "add_rmsnorm" and tuple(problem_shape or ()) == (128, 2048):
+            reg_limit = 33
+            occ_limit = 99.0
+        elif kernel_type == "add_rmsnorm":
+            reg_limit = 40
+            occ_limit = 90.0
+        if regs >= reg_limit or occupancy < occ_limit:
             hints.append("register pressure or occupancy is already tight")
 
         constraint = f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical follow-up changes over structural rewrites."
@@ -512,7 +526,12 @@ class RLMEngine:
             if submit_count >= MAX_INNER_TURNS:
                 break
 
-            system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
+            system_prompt = _build_refine_system_prompt(
+                best_speedup,
+                prev_inner_metrics,
+                kernel_type=self.env.kernel_type,
+                problem_shape=self.env.problem_shapes[0],
+            )
             try:
                 response = await self._call_llm_with_tools_async(
                     messages=messages,

@@ -1,6 +1,22 @@
 from __future__ import annotations
 
 
+def _infer_kernel_type(launch_signature: str, kernel_code: str) -> str:
+    haystack = f"{launch_signature}\n{kernel_code}"
+    if "launch_fused_add_rmsnorm_nvfp4" in haystack:
+        return "add_rmsnorm"
+    if "launch_silu_mul_fp4quant" in haystack:
+        return "silu_mul"
+    if "launch_nvfp4_quantize_bf16" in haystack:
+        return "nvfp4_quantize"
+    return "unknown"
+
+
+def _branch_mentions(text: str, *terms: str) -> bool:
+    norm = text.lower()
+    return any(term in norm for term in terms)
+
+
 def build_coder_prompt(
     plan_branch: dict,
     kernel_code: str,
@@ -17,6 +33,20 @@ def build_coder_prompt(
     rationale = plan_branch.get("rationale", "")
     risk = plan_branch.get("risk", "")
     evidence = plan_branch.get("evidence", []) or []
+    kernel_type = _infer_kernel_type(launch_signature, kernel_code)
+    branch_text = " ".join(
+        str(item)
+        for item in (
+            name,
+            goal,
+            change_summary,
+            planner_notes,
+            rationale,
+            risk,
+            " ".join(str(item) for item in evidence),
+        )
+        if item
+    ).lower()
 
     parts = [
         f"You are the coder agent for branch \"{name}\".",
@@ -42,10 +72,36 @@ def build_coder_prompt(
     parts.append(f"Pinecone RAG context:\n{rag_context or 'No Pinecone context returned.'}")
     parts.append(f"Base kernel:\n```cuda\n{kernel_code}\n```")
     parts.append(launch_signature)
+
+    kernel_specific_rules = []
+    if kernel_type == "add_rmsnorm":
+        kernel_specific_rules.extend([
+            "For add+rmsnorm+fp4 on shape 128x2048, treat the Phase-2 residual_out reread as a primary cost center.",
+            "Prefer project helpers from kernels/common/nvfp4_utils.cuh (for example pack_fp4_pair / quantize_block_nvfp4) over re-implementing a scalar branch chain.",
+            "Preserve the working occupancy regime. If your change pushes registers materially above the current working branch, it must deliver a clear runtime win.",
+        ])
+        if not _branch_mentions(branch_text, "warp", "shuffle", "reduction", "shfl", "syncthreads"):
+            kernel_specific_rules.append(
+                "This branch is NOT a reduction branch. Preserve the existing reduction structure instead of sneaking in warp-reduction changes."
+            )
+        if _branch_mentions(branch_text, "fuse", "single pass", "single-pass", "reread", "re-read", "smem cache"):
+            kernel_specific_rules.extend([
+                "This branch should eliminate the second global-memory read of residual_out.",
+                "Carry the 8 per-thread values across the reduction using registers or tightly scoped shared memory, but do not sacrifice occupancy without a measured win.",
+            ])
+        if _branch_mentions(branch_text, "fp4", "intrinsic", "pack", "quant"):
+            kernel_specific_rules.append(
+                "Do not leave the scalar float_to_nvfp4 if/else chain as the hot-path encoder if a project helper or hardware intrinsic path can replace it."
+            )
+
+    if kernel_specific_rules:
+        parts.append("Kernel-specific rules:\n- " + "\n- ".join(kernel_specific_rules))
+
     parts.append(
         "Rules:\n"
         "- Implement this branch only.\n"
         "- Planner owns strategy selection. Do not change branch family, optimization surface, or overall direction.\n"
+        "- Do not silently add a second optimization surface. If the branch is about vectorized loads, do not also change reduction or quantization strategy unless the branch explicitly says so.\n"
         "- Preserve correctness and the launch signature.\n"
         "- submit_kernel returns evaluator JSON, not prose. Use observations, hypothesis_test, next_action, memory, uncertainty, and rag.\n"
         "- Use the attached Pinecone RAG context as the planner-approved reference set. Do not start a new Pinecone search or invent a new strategy.\n"

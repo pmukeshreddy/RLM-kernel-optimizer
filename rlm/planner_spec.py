@@ -59,6 +59,19 @@ def build_root_planner_spec(
     rag_context: str,
     branch_count: int,
 ) -> PlannerSpec:
+    constraints = [
+        "Use Pinecone RAG context when naming the concrete technique to test.",
+        "Prefer production-style CUDA implementation patterns over vague advice.",
+        "Prefer exact operation matches over kernels that only share datatype or hardware family.",
+        "Do not propose full rewrites in every branch; vary the plan surface.",
+    ]
+    if kernel_type == "add_rmsnorm":
+        constraints.extend([
+            "For fused add+rmsnorm+fp4, prioritize eliminating the Phase-2 residual_out reread before minor local tweaks.",
+            "Prioritize replacing scalar/branchy FP4 packing with hardware FP4 intrinsics or existing project helpers before cosmetic cleanup.",
+            "Do not spend multiple root branches on reduction-only ideas; treat warp-reduction-only branches as secondary unless paired with a larger memory-path improvement.",
+            "Favor branches likely to preserve ~32 registers/thread and full occupancy on the 128x2048 shape.",
+        ])
     return PlannerSpec(
         mode="root",
         kernel_type=kernel_type,
@@ -75,12 +88,7 @@ def build_root_planner_spec(
             "Each branch is testable in one sandbox iteration.",
             "The set of branches is diverse, not repeated variations.",
         ],
-        constraints=[
-            "Use Pinecone RAG context when naming the concrete technique to test.",
-            "Prefer production-style CUDA implementation patterns over vague advice.",
-            "Prefer exact operation matches over kernels that only share datatype or hardware family.",
-            "Do not propose full rewrites in every branch; vary the plan surface.",
-        ],
+        constraints=constraints,
     )
 
 
@@ -97,6 +105,17 @@ def build_tree_planner_spec(
     parent_strategy: str,
     parent_speedup: float,
 ) -> PlannerSpec:
+    constraints = [
+        "Use the sandbox feedback and Pinecone RAG context directly.",
+        "Prefer child branches that preserve the closest retrieved source pattern from the working family.",
+        "Do not repeat the parent plan with different wording.",
+        "Avoid full rewrites and avoid stacking multiple risky changes into one child.",
+    ]
+    if kernel_type == "add_rmsnorm":
+        constraints.extend([
+            "For add+rmsnorm+fp4, prefer child branches that remove the second global-memory pass or improve FP4 packing over reduction-only tweaks.",
+            "Treat register growth above the current working regime as a risk; preserve occupancy unless the runtime gain is clearly worth it.",
+        ])
     return PlannerSpec(
         mode="tree",
         kernel_type=kernel_type,
@@ -115,10 +134,5 @@ def build_tree_planner_spec(
             "Children preserve the parent's working structure.",
             "Children are small enough to validate in one sandbox turn.",
         ],
-        constraints=[
-            "Use the sandbox feedback and Pinecone RAG context directly.",
-            "Prefer child branches that preserve the closest retrieved source pattern from the working family.",
-            "Do not repeat the parent plan with different wording.",
-            "Avoid full rewrites and avoid stacking multiple risky changes into one child.",
-        ],
+        constraints=constraints,
     )

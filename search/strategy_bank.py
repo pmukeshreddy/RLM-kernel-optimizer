@@ -191,12 +191,13 @@ STRATEGY_BANK: dict = {
 
 KERNEL_IDEAL_STRATEGIES: dict = {
     "add_rmsnorm": [
-        "shape_specialized_unroll",   # #1 advantage over FlashInfer
-        "launch_bounds_low_regs",     # maximize occupancy for memory-bound
-        "cache_streaming_stores",     # bypass L2 write cache thrashing
-        "fuse_passes",                # eliminate redundant global mem round-trip
-        "multi_row_processing",       # amortize weight loads across rows
+        "fuse_passes",                # eliminate residual_out reread first
+        "hardware_fp4_intrinsics",    # replace scalar FP4 branch chain
         "vectorize_loads",            # 128-bit coalesced bf16 loads
+        "launch_bounds_low_regs",     # preserve 32-reg / 100% occ regime
+        "shape_specialized_unroll",   # exploit fixed 128x2048 shape
+        "multi_row_processing",       # only after the main structure is fixed
+        "warp_reduction",             # secondary unless paired with bigger changes
     ],
     "silu_mul": [
         "shape_specialized_unroll",   # hard-code B, M, K dimensions

@@ -257,10 +257,10 @@ def _experiment_focus_terms(metrics: dict, memory: dict) -> list[str]:
 
     if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0):
         focus.append("spill elimination")
-    if compiler.get("registers_per_thread", 0) > 96:
+    if compiler.get("registers_per_thread", 0) > 40:
         focus.extend(["register pressure", "occupancy tuning", "launch bounds"])
     occupancy = metrics.get("sm_occupancy", 0)
-    if occupancy and occupancy < 75.0:
+    if occupancy and occupancy < 90.0:
         focus.extend(["latency hiding", "occupancy tuning", "independent work per thread"])
 
     family = memory.get("branch_family", "")
@@ -304,9 +304,14 @@ def _performance_queries(kernel_type: str, metrics: dict, memory: dict) -> list[
     spill_total = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
     regs = compiler.get("registers_per_thread", 0)
     occupancy = float(metrics.get("sm_occupancy", 0) or 0.0)
+    reg_limit = 96
+    occ_limit = 75.0
+    if kernel_type == "add_rmsnorm":
+        reg_limit = 40
+        occ_limit = 90.0
     if spill_total > 0:
         queries.append(f"{operation} reduce register spills live range CUDA")
-    elif regs > 96 or (regs > 0 and occupancy < 75.0):
+    elif regs > reg_limit or (regs > 0 and occupancy < occ_limit):
         queries.append(f"{operation} lower register pressure occupancy CUDA")
     else:
         queries.append(f"{operation} minimal adaptation best production kernel CUDA")
@@ -511,7 +516,7 @@ def _next_experiment_fields(
             "register count rises while spills remain.",
             "the fix requires a launch-contract change.",
         ]
-    elif regs > 96 or (regs > 0 and occupancy < 75.0):
+    elif regs > 40 or (regs > 0 and occupancy < 90.0):
         instruction = "Keep the fastest path intact. Reduce register pressure or recover occupancy with one local change."
         focus = ["register pressure reduction", "occupancy preservation", "launch bounds"]
         success_criteria.extend([
