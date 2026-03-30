@@ -363,6 +363,11 @@ class RLMEngine:
         matches = self.rag.search_many(clean_queries[:4], top_k=top_k)
         return self.rag.format_matches(matches)
 
+    def _log_planner_block(self, title: str, content: str) -> None:
+        text = content.strip() if content else "(empty)"
+        logger.info("\n%s\n%s\n%s", "=" * 80, title, "=" * 80)
+        logger.info("%s", text)
+
     def _initial_plan_queries(self) -> list[str]:
         env = self.env
         shape = "x".join(str(dim) for dim in env.problem_shapes[0])
@@ -383,10 +388,11 @@ class RLMEngine:
 
     def _expand_tree_plans(self, parent: KernelCandidate, branch_count: int | None = None) -> list[dict]:
         branch_count = int(branch_count or self.tree_branching_factor)
-        rag_context = self._search_pinecone_context(
+        planner_queries = (
             parent.plan_branch.get("rag_queries")
             or [f"{self.env.kernel_type} {parent.strategy} next optimization"]
         )
+        rag_context = self._search_pinecone_context(planner_queries)
         feedback = build_sandbox_feedback(
             {
                 "compile_ok": parent.compile_ok,
@@ -399,6 +405,10 @@ class RLMEngine:
             prev_inner_metrics=parent.prev_metrics,
             kernel_type=self.env.kernel_type,
             candidate=parent,
+        )
+        self._log_planner_block(
+            f"PLANNER RAG CONTEXT [tree parent={parent.strategy}] queries={planner_queries}",
+            rag_context,
         )
         prompt = build_tree_plan_prompt(
             kernel_type=self.env.kernel_type,
@@ -413,19 +423,33 @@ class RLMEngine:
             branch_count=branch_count,
         )
         response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
-        return parse_plan_response(
+        self._log_planner_block(
+            f"PLANNER RAW OUTPUT [tree parent={parent.strategy}]",
+            response,
+        )
+        branches = parse_plan_response(
             response,
             count=branch_count,
             prefix=f"{parent.strategy}_child",
             parent_strategy=parent.strategy,
         )
+        self._log_planner_block(
+            f"PLANNER PARSED BRANCHES [tree parent={parent.strategy}]",
+            json.dumps(branches, indent=2, sort_keys=True),
+        )
+        return branches
 
     # ── Round 0: Decomposition ────────────────────────────────────────────────
 
     def decompose(self) -> list:
         env = self.env
         num_strategies = self.beam_width * 2
-        rag_context = self._search_pinecone_context(self._initial_plan_queries())
+        planner_queries = self._initial_plan_queries()
+        rag_context = self._search_pinecone_context(planner_queries)
+        self._log_planner_block(
+            f"PLANNER RAG CONTEXT [root] queries={planner_queries}",
+            rag_context,
+        )
         prompt = build_initial_plan_prompt(
             kernel_type=env.kernel_type,
             operation=_kernel_operation_phrase(env.kernel_type),
@@ -439,10 +463,15 @@ class RLMEngine:
 
         logger.info("Planner: generating %d root branches for %s", num_strategies, env.kernel_type)
         response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
+        self._log_planner_block("PLANNER RAW OUTPUT [root]", response)
         strategies = parse_plan_response(
             response,
             count=num_strategies,
             prefix="root_plan",
+        )
+        self._log_planner_block(
+            "PLANNER PARSED BRANCHES [root]",
+            json.dumps(strategies, indent=2, sort_keys=True),
         )
         if strategies:
             logger.info("Planner produced %d branches", len(strategies))
