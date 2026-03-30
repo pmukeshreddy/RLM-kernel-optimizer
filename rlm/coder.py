@@ -13,6 +13,10 @@ def build_coder_prompt(
     change_summary = plan_branch.get("change_summary") or plan_branch.get("what") or goal
     expected_signal = plan_branch.get("expected_signal", "")
     planner_notes = plan_branch.get("planner_notes", "")
+    bottleneck = plan_branch.get("bottleneck", "")
+    rationale = plan_branch.get("rationale", "")
+    risk = plan_branch.get("risk", "")
+    evidence = plan_branch.get("evidence", []) or []
 
     parts = [
         f"You are the coder agent for branch \"{name}\".",
@@ -20,10 +24,18 @@ def build_coder_prompt(
         f"Required change: {change_summary}",
     ]
 
+    if bottleneck:
+        parts.append(f"Target bottleneck: {bottleneck}")
     if expected_signal:
         parts.append(f"Expected sandbox signal: {expected_signal}")
     if planner_notes:
         parts.append(f"Planner notes: {planner_notes}")
+    if rationale:
+        parts.append(f"Planner rationale: {rationale}")
+    if risk:
+        parts.append(f"Primary risk: {risk}")
+    if evidence:
+        parts.append("Planner evidence:\n- " + "\n- ".join(str(item) for item in evidence[:4]))
     if current_profile:
         parts.append(f"Current sandbox snapshot:\n{current_profile}")
 

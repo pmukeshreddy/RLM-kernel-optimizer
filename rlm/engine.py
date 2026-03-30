@@ -440,6 +440,8 @@ class RLMEngine:
         )
         prompt = build_tree_plan_prompt(
             kernel_type=self.env.kernel_type,
+            operation=_kernel_operation_phrase(self.env.kernel_type),
+            aliases=_kernel_aliases(self.env.kernel_type),
             problem_shape=self.env.problem_shapes[0],
             parent_strategy=parent.strategy,
             parent_speedup=parent.speedup,
@@ -464,6 +466,8 @@ class RLMEngine:
         rag_context = self._search_pinecone_context(self._initial_plan_queries())
         prompt = build_initial_plan_prompt(
             kernel_type=env.kernel_type,
+            operation=_kernel_operation_phrase(env.kernel_type),
+            aliases=_kernel_aliases(env.kernel_type),
             problem_shape=env.problem_shapes[0],
             kernel_src=env.kernel_src,
             baseline_context=self._planner_baseline_context(),

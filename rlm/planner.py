@@ -4,6 +4,12 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from .planner_spec import (
+    PlannerSpec,
+    build_root_planner_spec,
+    build_tree_planner_spec,
+)
+
 
 @dataclass
 class PlanBranch:
@@ -11,8 +17,12 @@ class PlanBranch:
     goal: str
     change_summary: str
     expected_signal: str
+    bottleneck: str = ""
     rag_queries: list[str] = field(default_factory=list)
     planner_notes: str = ""
+    rationale: str = ""
+    risk: str = ""
+    evidence: list[str] = field(default_factory=list)
     parent_strategy: str = ""
     tree_ready: bool = False
 
@@ -20,11 +30,15 @@ class PlanBranch:
         return {
             "name": self.name,
             "goal": self.goal,
+            "bottleneck": self.bottleneck,
             "what": self.change_summary,
             "change_summary": self.change_summary,
             "expected_signal": self.expected_signal,
             "rag_queries": list(self.rag_queries),
             "planner_notes": self.planner_notes,
+            "rationale": self.rationale,
+            "risk": self.risk,
+            "evidence": list(self.evidence),
             "parent_strategy": self.parent_strategy,
             "tree_ready": self.tree_ready,
         }
@@ -49,10 +63,14 @@ def fallback_branches(
             PlanBranch(
                 name=f"{prefix}_{idx + 1}",
                 goal="Make one measurable CUDA optimization change.",
+                bottleneck="unknown",
                 change_summary="Implement one targeted optimization and preserve correctness.",
                 expected_signal="Compiler succeeds and sandbox metrics improve.",
                 rag_queries=[],
                 planner_notes="Fallback plan because the planner output could not be parsed.",
+                rationale="Fallback branch used because the planner response was invalid.",
+                risk="Low confidence: planner output was missing or malformed.",
+                evidence=[],
                 parent_strategy=parent_strategy,
                 tree_ready=bool(parent_strategy),
             ).to_dict()
@@ -90,6 +108,7 @@ def parse_plan_response(
             PlanBranch(
                 name=name,
                 goal=str(item.get("goal") or change_summary).strip(),
+                bottleneck=str(item.get("bottleneck") or "").strip(),
                 change_summary=change_summary,
                 expected_signal=str(
                     item.get("expected_signal")
@@ -99,6 +118,9 @@ def parse_plan_response(
                 planner_notes=str(
                     item.get("planner_notes") or item.get("notes") or ""
                 ).strip(),
+                rationale=str(item.get("rationale") or "").strip(),
+                risk=str(item.get("risk") or "").strip(),
+                evidence=_coerce_string_list(item.get("evidence")),
                 parent_strategy=str(
                     item.get("parent_strategy") or parent_strategy
                 ).strip(),
@@ -112,56 +134,98 @@ def parse_plan_response(
     return branches[:count]
 
 
+def _render_planner_prompt(spec: PlannerSpec) -> str:
+    branch_example = {
+        "name": "short_branch_name",
+        "goal": "what this branch is trying to prove",
+        "bottleneck": "the main bottleneck this branch attacks",
+        "change_summary": "the concrete change for the coder agent",
+        "expected_signal": "which sandbox result would validate the branch",
+        "rag_queries": ["query 1", "query 2"],
+        "planner_notes": "short constraint or preserve rule",
+        "rationale": "why this branch is worth trying now",
+        "risk": "main failure mode to avoid",
+        "evidence": ["one short clue from spec or RAG"],
+        "tree_ready": spec.mode == "tree",
+    }
+    if spec.parent_strategy:
+        branch_example["parent_strategy"] = spec.parent_strategy
+
+    mode_rules = [
+        "Use the INPUT_SPEC as the source of truth for the task and constraints.",
+        "Use the Pinecone RAG context to name concrete implementation patterns or reference kernels.",
+        "Each branch must be distinct and testable in one sandbox iteration.",
+        "Do not write CUDA code.",
+        "No prose outside the JSON array.",
+    ]
+    if spec.mode == "tree":
+        mode_rules.extend(
+            [
+                "Do not propose full rewrites.",
+                "Preserve the parent branch's working structure.",
+                "Each child branch must attack a different remaining bottleneck.",
+            ]
+        )
+    else:
+        mode_rules.extend(
+            [
+                "Prefer measurable first-step branches over sweeping redesigns.",
+                "Spread branches across different optimization surfaces when possible.",
+            ]
+        )
+
+    return f"""\
+You are the planner agent for a CUDA kernel optimizer.
+Produce execution branches only.
+
+INPUT_SPEC (JSON):
+{spec.to_prompt_json()}
+
+Pinecone RAG context:
+{spec.rag_context or "No Pinecone context returned."}
+
+Reference kernel:
+```cuda
+{spec.kernel_src}
+```
+
+Return ONLY a JSON array with exactly {spec.branch_count} objects in this schema:
+[
+  {json.dumps(branch_example, indent=2)}
+]
+
+Rules:
+- {"\n- ".join(mode_rules)}
+"""
+
+
 def build_initial_plan_prompt(
     kernel_type: str,
+    operation: str,
+    aliases: list[str],
     problem_shape: tuple,
     kernel_src: str,
     baseline_context: str,
     rag_context: str,
     branch_count: int,
 ) -> str:
-    return f"""\
-You are the planner agent for a CUDA kernel optimizer.
-Do not write CUDA code. Produce the execution plan only.
-
-Task:
-- Kernel type: {kernel_type}
-- Fixed shape: {problem_shape}
-- Produce exactly {branch_count} root branches.
-
-Baseline and profiler context:
-{baseline_context}
-
-Pinecone RAG context:
-{rag_context or "No Pinecone context returned."}
-
-Reference kernel:
-```cuda
-{kernel_src}
-```
-
-Return ONLY a JSON array with exactly {branch_count} objects:
-[
-  {{
-    "name": "short_branch_name",
-    "goal": "what this branch is trying to prove",
-    "change_summary": "the concrete change for the coder agent",
-    "expected_signal": "which sandbox result would validate the branch",
-    "rag_queries": ["query 1", "query 2"],
-    "planner_notes": "short warning or constraint",
-    "tree_ready": false
-  }}
-]
-
-Rules:
-- Be concrete and branch-diverse.
-- Prefer changes the sandbox can validate in one iteration.
-- No prose outside the JSON array.
-"""
+    spec = build_root_planner_spec(
+        kernel_type=kernel_type,
+        operation=operation,
+        aliases=aliases,
+        problem_shape=problem_shape,
+        kernel_src=kernel_src,
+        baseline_context=baseline_context,
+        rag_context=rag_context,
+        branch_count=branch_count,
+    )
+    return _render_planner_prompt(spec)
 
 
 def build_tree_plan_prompt(
     kernel_type: str,
+    operation: str,
+    aliases: list[str],
     problem_shape: tuple,
     parent_strategy: str,
     parent_speedup: float,
@@ -170,45 +234,16 @@ def build_tree_plan_prompt(
     rag_context: str,
     branch_count: int,
 ) -> str:
-    return f"""\
-You are the planner agent expanding a successful CUDA branch into a small search tree.
-Do not write CUDA code. Produce child branches only.
-
-Task:
-- Kernel type: {kernel_type}
-- Fixed shape: {problem_shape}
-- Parent branch: {parent_strategy}
-- Current sandbox speedup: {parent_speedup:.3f}x
-- Produce exactly {branch_count} child branches.
-
-Current sandbox assessment JSON:
-{feedback_summary}
-
-Pinecone RAG context:
-{rag_context or "No Pinecone context returned."}
-
-Current best kernel:
-```cuda
-{kernel_src}
-```
-
-Return ONLY a JSON array with exactly {branch_count} objects:
-[
-  {{
-    "name": "child_branch_name",
-    "goal": "the next hypothesis to test",
-    "change_summary": "a surgical change that keeps the working structure",
-    "expected_signal": "which profiler or speedup change should happen",
-    "rag_queries": ["query 1", "query 2"],
-    "planner_notes": "what to preserve while editing",
-    "parent_strategy": "{parent_strategy}",
-    "tree_ready": true
-  }}
-]
-
-Rules:
-- Do not propose full rewrites.
-- Each child branch must attack a different remaining bottleneck.
-- Keep the parent's working structure intact.
-- No prose outside the JSON array.
-"""
+    spec = build_tree_planner_spec(
+        kernel_type=kernel_type,
+        operation=operation,
+        aliases=aliases,
+        problem_shape=problem_shape,
+        kernel_src=kernel_src,
+        feedback_summary=feedback_summary,
+        rag_context=rag_context,
+        branch_count=branch_count,
+        parent_strategy=parent_strategy,
+        parent_speedup=parent_speedup,
+    )
+    return _render_planner_prompt(spec)
