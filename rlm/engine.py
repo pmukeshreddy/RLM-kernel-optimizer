@@ -5,6 +5,7 @@ Orchestrates root LLM decomposition, parallel sub-LLM beam generation, and refin
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
