@@ -78,6 +78,7 @@ def build_root_planner_spec(
         constraints=[
             "Use Pinecone RAG context when naming the concrete technique to test.",
             "Prefer production-style CUDA implementation patterns over vague advice.",
+            "Prefer exact operation matches over kernels that only share datatype or hardware family.",
             "Do not propose full rewrites in every branch; vary the plan surface.",
         ],
     )
@@ -116,6 +117,7 @@ def build_tree_planner_spec(
         ],
         constraints=[
             "Use the sandbox feedback and Pinecone RAG context directly.",
+            "Prefer child branches that preserve the closest retrieved source pattern from the working family.",
             "Do not repeat the parent plan with different wording.",
             "Avoid full rewrites and avoid stacking multiple risky changes into one child.",
         ],

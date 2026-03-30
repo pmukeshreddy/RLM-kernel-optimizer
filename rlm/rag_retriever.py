@@ -27,6 +27,17 @@ OP_ALIASES = {
     "quantize": ("nvfp4", "fp4", "quant", "quantize", "quantization"),
 }
 
+EXACT_OP_PATTERNS = {
+    "add_rmsnorm_fp4": (
+        "add rmsnorm",
+        "residual add",
+        "rmsnorm",
+        "fp4",
+        "nvfp4",
+        "quant",
+    ),
+}
+
 PATTERN_ALIASES = {
     "vectorized_stores": ("vectorized stores", "vector stores", "uint4 stores", "stg 128", "stg128"),
     "vectorized_loads": ("vectorized loads", "vector loads", "uint4 loads", "ldg 128", "ldg128"),
@@ -589,6 +600,9 @@ class PineconeRetriever:
             score += sum(1 for token in tokens if token in source_file) * 0.04
 
         score += self._exact_metadata_bonus(query_norm, metadata)
+        score += self._exact_operation_bonus(query_norm, candidate_text, metadata)
+        score += self._source_file_bonus(query_norm, source_file)
+        score += self._mismatch_penalty(query_norm, candidate_text, metadata)
         score += self._source_weight_bonus(match.source)
 
         return score
@@ -641,6 +655,64 @@ class PineconeRetriever:
                 break
 
         return score
+
+    def _exact_operation_bonus(self, query_norm: str, candidate_text: str, metadata: dict) -> float:
+        op_type = self._normalize_text(str(metadata.get("op_type") or ""))
+        score = 0.0
+
+        if self._looks_like_add_rmsnorm_fp4_query(query_norm):
+            has_rmsnorm = any(term in candidate_text for term in ("rmsnorm", "rms norm"))
+            if has_rmsnorm and "fp4" in candidate_text:
+                score += 0.22
+            if any(term in candidate_text for term in ("add rmsnorm", "residual add")):
+                score += 0.14
+            if any(term in op_type for term in ("rmsnorm", "rms norm")) and any(term in op_type for term in ("quant", "fp4", "quantize")):
+                score += 0.18
+
+        for pattern_terms in EXACT_OP_PATTERNS.values():
+            hits = sum(1 for term in pattern_terms if term in query_norm and term in candidate_text)
+            if hits >= 3:
+                score += min(hits, 6) * 0.05
+
+        return score
+
+    def _source_file_bonus(self, query_norm: str, source_file: str) -> float:
+        if not source_file:
+            return 0.0
+        score = 0.0
+        if self._looks_like_add_rmsnorm_fp4_query(query_norm):
+            if "rmsnorm" in source_file:
+                score += 0.12
+            if "add" in source_file:
+                score += 0.05
+            if "quant" in source_file or "fp4" in source_file:
+                score += 0.06
+        return score
+
+    def _mismatch_penalty(self, query_norm: str, candidate_text: str, metadata: dict) -> float:
+        op_type = self._normalize_text(str(metadata.get("op_type") or ""))
+        score = 0.0
+        query_has_gemm = any(term in query_norm for term in ("gemm", "matmul", "mma"))
+        candidate_has_gemm = any(term in candidate_text for term in ("gemm", "matmul", "mma"))
+
+        if not query_has_gemm and candidate_has_gemm:
+            score -= 0.22
+        if self._looks_like_add_rmsnorm_fp4_query(query_norm):
+            has_rmsnorm = any(term in candidate_text for term in ("rmsnorm", "rms norm"))
+            if candidate_has_gemm and not has_rmsnorm:
+                score -= 0.16
+            if op_type and not any(term in op_type for term in ("rmsnorm", "rms norm")) and ("matmul" in op_type or "gemm" in op_type):
+                score -= 0.14
+            if not has_rmsnorm:
+                score -= 0.08
+        return score
+
+    def _looks_like_add_rmsnorm_fp4_query(self, query_norm: str) -> bool:
+        return (
+            any(term in query_norm for term in ("rmsnorm", "rms norm"))
+            and any(term in query_norm for term in ("fp4", "nvfp4", "quant", "quantize"))
+            and any(term in query_norm for term in ("add", "residual"))
+        )
 
     def _diversify_matches(self, matches: list[PineconeMatch], top_n: int) -> list[PineconeMatch]:
         selected = []

@@ -357,11 +357,12 @@ class RLMEngine:
             f"{analysis}"
         )
 
-    def _search_pinecone_context(self, queries: list[str], top_k: int = 3) -> str:
+    def _search_pinecone_context(self, queries: list[str], top_k: int | None = None) -> str:
         clean_queries = [q.strip() for q in queries if q and q.strip()]
         if not clean_queries:
             return "No Pinecone query provided."
-        matches = self.rag.search_many(clean_queries[:4], top_k=top_k)
+        effective_top_k = int(top_k or getattr(self.rag, "top_k", 4))
+        matches = self.rag.search_many(clean_queries[:4], top_k=effective_top_k)
         return self.rag.format_matches(matches)
 
     def _log_planner_block(self, title: str, content: str) -> None:

@@ -155,9 +155,11 @@ def _render_planner_prompt(spec: PlannerSpec) -> str:
         "Use the INPUT_SPEC as the source of truth for the task and constraints.",
         "Use the Pinecone RAG context to name concrete implementation patterns or reference kernels.",
         "Prefer branches that adapt retrieved production code over branches that speculate about bottlenecks.",
+        "At least one root branch must be a closest-source adaptation branch that copies the most relevant retrieved kernel structure as faithfully as possible.",
         "If the RAG context already contains a strong production pattern, branch around minimal adaptations of that pattern.",
         "Assume the coder will only implement the branch you output; make the adaptation scope explicit and narrow.",
         "Each branch must be distinct and testable in one sandbox iteration.",
+        "Do not let GEMM or matmul kernels dominate planning for fused add/rmsnorm/quantize tasks unless the retrieved code clearly matches the target operation.",
         "Do not write CUDA code.",
         "No prose outside the JSON array.",
     ]
