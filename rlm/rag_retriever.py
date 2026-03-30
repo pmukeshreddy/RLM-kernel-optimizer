@@ -246,12 +246,19 @@ class PineconeRetriever:
             if match.source:
                 header += f" | {match.source}"
 
-            body = match.text.strip().replace("\r", "")
-            block = f"{header}\nScore: {match.score:.3f}\n{body}"
-            total_chars += len(block)
-            if total_chars > max_chars:
+            prefix = f"{header}\nScore: {match.score:.3f}\n"
+            remaining = max_chars - total_chars
+            if remaining <= len(prefix):
                 break
+
+            body_budget = remaining - len(prefix)
+            body = self._truncate_text(match.text.strip().replace("\r", ""), body_budget)
+            if not body:
+                continue
+
+            block = f"{prefix}{body}"
             parts.append(block)
+            total_chars += len(block)
 
         return "\n\n".join(parts)
 
@@ -361,6 +368,15 @@ class PineconeRetriever:
             "source",
             "source_file",
         ]
+
+    def _truncate_text(self, text: str, max_len: int) -> str:
+        if max_len <= 0:
+            return ""
+        if len(text) <= max_len:
+            return text
+        if max_len <= 3:
+            return text[:max_len]
+        return text[: max_len - 3].rstrip() + "..."
 
     def _extract_hits(self, response) -> list[dict]:
         if hasattr(response, "matches"):
