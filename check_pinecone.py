@@ -4,8 +4,27 @@ import argparse
 import json
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 from rlm.env_loader import load_project_env
 from rlm.rag_retriever import init_knowledge_base
+
+
+def _load_rag_config(project_root: Path) -> dict:
+    if yaml is None:
+        return {}
+    config_path = project_root / "config" / "search_config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+        return data.get("rag", {})
+    except Exception:
+        return {}
 
 
 def main() -> int:
@@ -26,8 +45,9 @@ def main() -> int:
 
     project_root = Path(__file__).resolve().parent
     env_path = load_project_env(project_root)
+    rag_config = _load_rag_config(project_root)
 
-    retriever = init_knowledge_base()
+    retriever = init_knowledge_base(rag_config)
     status = retriever.status()
     payload = {
         "env_loaded": str(env_path) if env_path else None,
