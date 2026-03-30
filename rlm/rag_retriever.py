@@ -220,7 +220,7 @@ class PineconeRetriever:
 
         try:
             response = index.search(
-                namespace=namespace or self.namespace,
+                namespace=namespace or self.namespace or "__default__",
                 query=search_query,
                 fields=self.fields,
             )
@@ -355,7 +355,7 @@ class PineconeRetriever:
             response = index.query(
                 vector=vector,
                 top_k=int(top_k or self.top_k),
-                namespace=namespace or self.namespace,
+                namespace=namespace or self.namespace or "__default__",
                 include_metadata=True,
                 include_values=False,
                 filter=metadata_filter if metadata_filter is not None else self.default_filter,
