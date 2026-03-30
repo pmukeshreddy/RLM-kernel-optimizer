@@ -118,6 +118,14 @@ def measure_baseline(kernel_type: str, shape: tuple) -> Optional[float]:
         return None
 
 
+def measure_baseline_with_source(kernel_type: str, shape: tuple) -> tuple[Optional[float], str]:
+    """Measure the official baseline and report where it came from."""
+    baseline = measure_baseline(kernel_type, shape)
+    if baseline is not None:
+        return baseline, "flashinfer"
+    return None, "unavailable"
+
+
 def generate_reference(kernel_type: str, shape: tuple, seed: int = 42) -> Optional[dict]:
     """Generate reference output tensors using FlashInfer.
 

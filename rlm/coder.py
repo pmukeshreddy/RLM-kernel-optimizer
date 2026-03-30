@@ -25,7 +25,7 @@ def build_coder_prompt(
     ]
 
     if bottleneck:
-        parts.append(f"Target bottleneck: {bottleneck}")
+        parts.append(f"Observed concern: {bottleneck}")
     if expected_signal:
         parts.append(f"Expected sandbox signal: {expected_signal}")
     if planner_notes:
@@ -46,11 +46,12 @@ def build_coder_prompt(
         "Rules:\n"
         "- Implement this branch only.\n"
         "- Preserve correctness and the launch signature.\n"
-        "- submit_kernel returns evaluator JSON, not prose. Use observations, hypothesis_test, next_action, memory, and rag.\n"
+        "- submit_kernel returns evaluator JSON, not prose. Use observations, hypothesis_test, next_action, memory, uncertainty, and rag.\n"
         "- Use search_pinecone when the attached RAG context is not enough.\n"
         "- Treat observations as ground truth. Treat hypothesis_test.status as the verdict on your last idea.\n"
+        "- If the RAG context already shows a strong production pattern, prefer adapting that pattern over inventing a new theory.\n"
         "- Make one local experiment at a time. Follow next_action.success_criteria and next_action.abort_if.\n"
-        "- Before submit_kernel, explain the bottleneck and the exact code change.\n"
+        "- Before submit_kernel, explain what the latest result confirmed or left uncertain and the exact code change.\n"
         "- Then call submit_kernel with the complete .cu file."
     )
 

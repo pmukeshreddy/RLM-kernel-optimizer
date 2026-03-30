@@ -6,7 +6,7 @@ Real data sources:
   2. CUDA Occupancy API  -> sm_occupancy (compiled query program)
   3. Theoretical occupancy fallback (from register count + block size + shared mem)
   4. Compiler metrics     -> registers, spills, smem (from nvcc -Xptxas -v)
-  5. Roofline math        -> mem_throughput_pct (from timing + transfer bytes)
+  5. Estimated roofline math -> mem_throughput_pct (from timing + transfer bytes; diagnostic only)
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class HybridProfiler:
     """
     Computes kernel metrics from real data sources.
 
-    Returns: timing, speedup, SM occupancy, mem_throughput_pct, and compiler metrics.
+    Returns: timing, speedup, SM occupancy, an estimated memory-throughput percentage, and compiler metrics.
     """
 
     def __init__(self, config: dict, hw_spec: dict):
@@ -109,7 +109,7 @@ class HybridProfiler:
         # ── 2. Speedup ───────────────────────────────────────────────────
         speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 1.0
 
-        # ── 3. Compute mem_throughput_pct from roofline math ────────────
+        # ── 3. Compute estimated mem_throughput_pct from roofline math ───
         mem_throughput_pct = 0.0
         peak_bw_tbs = self.hw_spec.get("memory", {}).get("hbm_bandwidth_tbs", 8.0)
         total_bytes = self._estimate_transfer_bytes(kernel_type, problem_shape)
@@ -134,7 +134,7 @@ class HybridProfiler:
             f"occ={gpu_occupancy:.1f}%",
             f"timing={timing_us:.1f}us",
             f"speedup={speedup:.3f}x",
-            f"mem_bw={mem_throughput_pct:.1f}%",
+            f"est_mem_bw={mem_throughput_pct:.1f}%",
         ]
         if cm.registers_per_thread > 0:
             log_parts.append(f"regs={cm.registers_per_thread}")

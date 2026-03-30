@@ -55,23 +55,28 @@ def _find_kernel(kernel_name: str) -> dict:
     raise SystemExit(f"Unknown kernel: {kernel_name}\nAvailable: {available}")
 
 
-def _measure_baseline(kernel_def: dict, config: dict) -> float:
+def _measure_baseline(kernel_def: dict, config: dict, allow_reference_baseline: bool) -> tuple[float, str, bool]:
     kernel_type = kernel_def["kernel_type"]
     shape = tuple(kernel_def["shape"])
     src_path = PROJECT_ROOT / kernel_def["src"]
 
-    baseline = flashinfer_ref.measure_baseline(kernel_type, shape)
+    baseline, baseline_source = flashinfer_ref.measure_baseline_with_source(kernel_type, shape)
     if baseline is not None:
         logger.info("FlashInfer baseline for %s: %.2f us", kernel_def["name"], baseline)
-        return baseline
+        return baseline, baseline_source, True
 
-    logger.info("FlashInfer unavailable; measuring reference kernel baseline")
+    if not allow_reference_baseline:
+        raise RuntimeError(
+            "FlashInfer baseline unavailable. Re-run with --allow-reference-baseline only for unofficial debugging."
+        )
+
+    logger.warning("FlashInfer unavailable; measuring reference kernel baseline (UNOFFICIAL)")
     benchmarker = Benchmarker(config, kernel_type=kernel_type)
     baseline = benchmarker._compile_and_time(src_path.read_text(), shape)
     if baseline is None:
         raise RuntimeError(f"Could not measure baseline for {kernel_def['name']}")
     logger.info("Reference baseline for %s: %.2f us", kernel_def["name"], baseline)
-    return baseline
+    return baseline, "reference_fallback", False
 
 
 def _pick_branch(plans: list[dict], branch_index: int, branch_name: str | None) -> tuple[int, dict]:
@@ -99,6 +104,8 @@ def main() -> int:
     parser.add_argument("--branch-name", type=str, default=None)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default="outputs/coder_sandbox")
+    parser.add_argument("--allow-reference-baseline", action="store_true",
+                        help="Allow unofficial fallback to the local reference-kernel baseline.")
     parser.add_argument("--skip-gpu-warmup", action="store_true")
     parser.add_argument("--skip-planner", action="store_true", help="Use a synthetic branch instead of planner output.")
     parser.add_argument("--branch-json", type=str, default=None, help="Path to a branch JSON file to run directly.")
@@ -119,7 +126,9 @@ def main() -> int:
     config = yaml.safe_load(config_path.read_text())
     config.setdefault("_overrides", {})
 
-    baseline = _measure_baseline(kernel_def, config)
+    baseline, baseline_source, official_baseline = _measure_baseline(
+        kernel_def, config, allow_reference_baseline=args.allow_reference_baseline
+    )
     src_path = PROJECT_ROOT / kernel_def["src"]
     env = RLMEnvironment(
         kernel_name=kernel_def["name"],
@@ -129,6 +138,8 @@ def main() -> int:
         config_path=str(config_path),
     )
     env.baseline_us_reported = baseline
+    env.baseline_source = baseline_source
+    env.official_baseline = official_baseline
 
     output_root = Path(args.output_dir)
     run_dir = output_root / f"{kernel_def['name']}_{time.strftime('%Y%m%d-%H%M%S')}"
@@ -144,7 +155,7 @@ def main() -> int:
             plans = [{
                 "name": "manual_branch",
                 "goal": "Run a direct coder sandbox check.",
-                "bottleneck": "manual",
+                "bottleneck": "",
                 "change_summary": "Implement one targeted optimization and preserve correctness.",
                 "expected_signal": "Compiler succeeds and sandbox metrics improve.",
                 "rag_queries": [],
@@ -182,10 +193,12 @@ def main() -> int:
             "branch_index": None if selected_idx is None else selected_idx + 1,
             "branch_name": branch.get("name"),
             "baseline_us": baseline,
+            "baseline_source": baseline_source,
+            "official_baseline": official_baseline,
             "compile_ok": candidate.compile_ok,
             "correct": candidate.correct,
             "speedup": candidate.speedup,
-            "bottleneck": candidate.bottleneck,
+            "branch_family": candidate.branch_family or candidate.bottleneck,
             "feedback_route": candidate.feedback_route,
             "compile_error": candidate.compile_error,
             "metrics": candidate.metrics,

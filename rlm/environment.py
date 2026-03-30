@@ -46,7 +46,7 @@ class KernelCandidate:
         return (
             f"[{self.strategy}] round={self.round_num} "
             f"speedup={self.speedup:.3f}x "
-            f"bottleneck={self.bottleneck} "
+            f"family={self.bottleneck} "
             f"compile={'ok' if self.compile_ok else 'FAIL'} "
             f"correct={'yes' if self.correct else 'NO'}"
         )
@@ -63,7 +63,7 @@ class OptimizationHistory:
             "strategy": candidate.strategy,
             "round": candidate.round_num,
             "speedup": candidate.speedup,
-            "bottleneck": candidate.bottleneck,
+            "family": candidate.bottleneck,
             "compile_ok": candidate.compile_ok,
             "correct": candidate.correct,
             "notes": notes,
@@ -119,6 +119,8 @@ class RLMEnvironment:
         self.profile_report: Optional[dict] = None
         self.baseline_us: Optional[float] = None
         self.baseline_us_reported: float = 12.4
+        self.baseline_source: str = "unknown"
+        self.official_baseline: bool = False
         self.baseline_naive_us: Optional[float] = None
         self.baseline_compiler_metrics = None  # CompilerMetrics from reference kernel
 

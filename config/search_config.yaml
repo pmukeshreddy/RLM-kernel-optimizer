@@ -13,7 +13,7 @@ beam:
   refine_rounds: 4            # profiler feedback iterations
   max_sub_calls_per_round: 2  # cap recursive depth
   combine_top_k: 2            # merge top-K into final
-  diversity_mode: "bottleneck_cluster"  # cluster-based pruning
+  diversity_mode: "family_diverse"  # preserve distinct strategy families
   tree_speedup_threshold: 1.0 # once a branch clears baseline, expand it via planner tree
   tree_branching_factor: 2    # child branches created from above-baseline parents
   family_retire_gap: 0.25     # retire plateaued families if they trail the leader by this much
@@ -38,12 +38,6 @@ profiler:
   tool: "hybrid"
   warmup_iters: 3
   profile_iters: 10
-
-bottleneck:
-  memory_bound_threshold_pct: 70
-  compute_bound_threshold_pct: 60
-  sync_bound_threshold_pct: 30
-  latency_bound_threshold_pct: 40
 
 cost_control:
   max_tokens_per_sub_call: 8192
@@ -82,6 +76,7 @@ rag:
     - "op_type"
 
 eval:
+  require_flashinfer_baseline: true
   correctness_atol: 1e-2
   correctness_rtol: 1e-3
   benchmark_warmup: 500

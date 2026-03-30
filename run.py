@@ -92,6 +92,7 @@ def optimize_kernel(
     config: dict,
     dry_run: bool = False,
     output_dir: Path = None,
+    allow_reference_baseline: bool = False,
 ) -> dict:
     name        = kernel_def["name"]
     src_path    = PROJECT_ROOT / kernel_def["src"]
@@ -104,23 +105,37 @@ def optimize_kernel(
         logger.error("Kernel source not found: %s", src_path)
         return {}
 
-    # Measure baseline from FlashInfer (production reference)
-    baseline = flashinfer_ref.measure_baseline(kernel_type, shape)
-    if baseline is not None:
+    require_flashinfer = bool(config.get("eval", {}).get("require_flashinfer_baseline", True))
+    baseline, baseline_source = flashinfer_ref.measure_baseline_with_source(kernel_type, shape)
+    official_baseline = baseline_source == "flashinfer"
+    if official_baseline:
         logger.info("FlashInfer baseline for %s: %.2f us", name, baseline)
     else:
-        # Fallback: measure reference kernel on current hardware
-        logger.info("FlashInfer unavailable — measuring reference kernel baseline")
+        if require_flashinfer and not allow_reference_baseline:
+            logger.error(
+                "FlashInfer baseline is required for %s but unavailable. "
+                "Re-run with --allow-reference-baseline only for unofficial debugging.",
+                name,
+            )
+            return {
+                "kernel_name": name,
+                "status": "flashinfer_baseline_required",
+                "metadata": {"official_baseline": False, "baseline_source": "unavailable"},
+            }
+        logger.warning("FlashInfer unavailable — using reference kernel baseline (UNOFFICIAL)")
         benchmarker_tmp = Benchmarker(config, kernel_type=kernel_type)
         baseline = benchmarker_tmp._compile_and_time(src_path.read_text(), shape)
         if baseline is None:
             logger.error("Cannot measure baseline for %s", name)
-            baseline = 1.0  # prevent division by zero
+            baseline = 1.0
+        baseline_source = "reference_fallback"
         logger.info("Reference kernel baseline for %s: %.2f us", name, baseline)
 
     env = RLMEnvironment(kernel_name=name, kernel_src_path=str(src_path),
                          kernel_type=kernel_type, problem_shape=shape)
     env.baseline_us_reported = baseline
+    env.baseline_source = baseline_source
+    env.official_baseline = official_baseline
 
     overrides = config.get("_overrides", {})
     if "beam_width" in overrides:
@@ -172,6 +187,8 @@ def optimize_kernel(
         metadata={
             "strategy":         best.strategy,
             "bottleneck":       best.bottleneck,
+            "baseline_source":  env.baseline_source,
+            "official_baseline": env.official_baseline,
             "search_rounds":    env.current_round,
             "api_cost_usd":     env.total_api_cost_usd,
             "elapsed_seconds":  elapsed,
@@ -234,6 +251,8 @@ def main():
     parser.add_argument("--config",     type=str, default=None)
     parser.add_argument("--log-level",  type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--allow-reference-baseline", action="store_true",
+                        help="Allow unofficial fallback to the local reference-kernel baseline.")
     args = parser.parse_args()
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
@@ -283,6 +302,7 @@ def main():
             config=config,
             dry_run=args.dry_run,
             output_dir=output_dir,
+            allow_reference_baseline=args.allow_reference_baseline,
         )
         all_results.append(result)
         total_cost += result.get("metadata", {}).get("api_cost_usd", 0.0)

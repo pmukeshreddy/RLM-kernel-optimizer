@@ -71,7 +71,7 @@ def build_root_planner_spec(
         objective="Generate root branches that each test one distinct optimization hypothesis.",
         baseline_context=baseline_context,
         success_criteria=[
-            "Each branch targets one bottleneck only.",
+            "Each branch should make one focused adaptation only.",
             "Each branch is testable in one sandbox iteration.",
             "The set of branches is diverse, not repeated variations.",
         ],
@@ -110,7 +110,7 @@ def build_tree_planner_spec(
         parent_strategy=parent_strategy,
         parent_speedup=parent_speedup,
         success_criteria=[
-            "Each child branch attacks a different remaining bottleneck.",
+            "Each child branch should try a different minimal follow-up adaptation.",
             "Children preserve the parent's working structure.",
             "Children are small enough to validate in one sandbox turn.",
         ],

@@ -12,7 +12,7 @@ def vectorize_loads_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
             f"  DRAM stall rate: {current_metrics.get('stall_memory', 'N/A')}%\n"
             f"  L2 hit rate: {current_metrics.get('l2_hit_rate', 'N/A')}%\n"
         )
@@ -45,7 +45,7 @@ def tma_prefetch_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict 
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
             f"  Long scoreboard stalls: {current_metrics.get('stall_memory', 'N/A')}%\n"
         )
     return f"""\
@@ -114,7 +114,7 @@ def fuse_passes_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict =
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
             f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
     return f"""\
@@ -146,7 +146,7 @@ def register_tiling_prompt(kernel_slice: str, hw_spec: dict, current_metrics: di
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
             f"  Achieved occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
     return f"""\
@@ -179,7 +179,7 @@ def async_pipeline_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
             f"  Long scoreboard stalls: {current_metrics.get('stall_memory', 'N/A')}%\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
         )
     return f"""\
 ## Optimization Task: Async Software Pipeline (cp.async)
@@ -212,8 +212,8 @@ def fp4_lut_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict = Non
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
         )
     return f"""\
 ## Optimization Task: FP4 Quantization Lookup Table
@@ -259,7 +259,7 @@ def fast_math_expf_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dic
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
             f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
         )
     return f"""\
@@ -299,8 +299,8 @@ def thread_coarsening_prompt(kernel_slice: str, hw_spec: dict, current_metrics: 
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
             f"  SM occupancy: {current_metrics.get('sm_occupancy', 'N/A')}%\n"
-            f"  Compute throughput: {current_metrics.get('compute_throughput_pct', 'N/A')}%\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
         )
     return f"""\
 ## Optimization Task: Thread Coarsening
@@ -341,7 +341,7 @@ def ldg_readonly_prompt(kernel_slice: str, hw_spec: dict, current_metrics: dict 
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
             f"  L2 hit rate: {current_metrics.get('l2_hit_rate', 'N/A')}%\n"
             f"  DRAM stall rate: {current_metrics.get('stall_memory', 'N/A')}%\n"
         )
@@ -382,8 +382,8 @@ def vectorized_stores_prompt(kernel_slice: str, hw_spec: dict, current_metrics: 
     if current_metrics:
         metrics_str = (
             f"\nCurrent profiler metrics:\n"
-            f"  Memory throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
-            f"  Store throughput: {current_metrics.get('mem_throughput_pct', 'N/A')}%\n"
+            f"  Kernel timing: {current_metrics.get('duration_us', 'N/A')} us\n"
+            f"  Registers/thread: {current_metrics.get('_compiler', {}).get('registers_per_thread', 'N/A')}\n"
         )
     return f"""\
 ## Optimization Task: Vectorized Stores for Packed Output

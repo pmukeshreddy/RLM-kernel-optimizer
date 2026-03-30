@@ -264,15 +264,16 @@ class PineconeRetriever:
             self.rerank_pool,
         )
         for query in queries:
-            for match in self.search(
-                query=query,
-                top_k=candidate_top_k,
-                namespace=namespace,
-                metadata_filter=metadata_filter,
-            ):
-                existing = deduped.get(match.match_id)
-                if existing is None or match.score > existing.score:
-                    deduped[match.match_id] = match
+            for variant in self._expand_query_variants(query):
+                for match in self.search(
+                    query=variant,
+                    top_k=candidate_top_k,
+                    namespace=namespace,
+                    metadata_filter=metadata_filter,
+                ):
+                    existing = deduped.get(match.match_id)
+                    if existing is None or match.score > existing.score:
+                        deduped[match.match_id] = match
         if not deduped:
             return []
         combined_query = " ; ".join(str(query).strip() for query in queries if str(query).strip())
@@ -587,7 +588,57 @@ class PineconeRetriever:
         if source_file:
             score += sum(1 for token in tokens if token in source_file) * 0.04
 
+        score += self._exact_metadata_bonus(query_norm, metadata)
         score += self._source_weight_bonus(match.source)
+
+        return score
+
+    def _expand_query_variants(self, query: str) -> list[str]:
+        base = " ".join(str(query).split())
+        if not base:
+            return []
+        variants = [base]
+        query_norm = self._normalize_text(base)
+
+        for canonical, alias_group in HARDWARE_ALIASES.items():
+            if any(alias in query_norm for alias in alias_group):
+                variants.append(f"{base} {' '.join(alias_group[:3])}")
+                variants.append(f"{base} {canonical} source code")
+
+        for canonical, alias_group in OP_ALIASES.items():
+            if any(alias in query_norm for alias in alias_group):
+                variants.append(f"{base} {' '.join(alias_group[:3])}")
+                variants.append(f"{canonical} production source code")
+
+        for canonical, alias_group in PATTERN_ALIASES.items():
+            if any(alias in query_norm for alias in alias_group):
+                variants.append(f"{base} {' '.join(alias_group[:3])}")
+                variants.append(f"{canonical} production cuda source code")
+
+        variants.append(f"{base} production cuda source code")
+        variants.append(f"{base} exact source code")
+        return _dedupe_preserve_order(variants)
+
+    def _exact_metadata_bonus(self, query_norm: str, metadata: dict) -> float:
+        score = 0.0
+        hardware_target = self._normalize_text(str(metadata.get("hardware_target") or ""))
+        op_type = self._normalize_text(str(metadata.get("op_type") or ""))
+        pattern = self._normalize_text(str(metadata.get("optimization_pattern") or ""))
+
+        for alias_group in HARDWARE_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(alias in hardware_target for alias in alias_group):
+                score += 0.28
+                break
+
+        for alias_group in OP_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(alias in op_type for alias in alias_group):
+                score += 0.24
+                break
+
+        for alias_group in PATTERN_ALIASES.values():
+            if any(alias in query_norm for alias in alias_group) and any(alias in pattern for alias in alias_group):
+                score += 0.16
+                break
 
         return score
 
@@ -648,7 +699,7 @@ class PineconeRetriever:
         if not key:
             return 0.0
         weight = SOURCE_QUALITY_WEIGHTS.get(key, 0.8)
-        return (weight - 0.8) * 0.35
+        return (weight - 0.8) * 0.75
 
     def _candidate_text(self, match: PineconeMatch) -> str:
         metadata = match.metadata or {}
@@ -702,6 +753,21 @@ class PineconeRetriever:
 
 def init_knowledge_base(config: dict | None = None) -> PineconeRetriever:
     return PineconeRetriever(config=config)
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    output = []
+    for item in items:
+        cleaned = " ".join(str(item).split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(cleaned)
+    return output
 
 
 if __name__ == "__main__":

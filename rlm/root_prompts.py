@@ -43,7 +43,7 @@ Hot loop section to optimize:
 Missing optimizations detected: {', '.join(missing_opts)}
 
 Steps:
-1. Analyze the hot loop — identify the dominant bottleneck
+1. Analyze the hot loop and retrieved production patterns
 2. Select exactly 4 strategies from the missing optimizations list
 3. For each strategy, extract the minimal relevant kernel section
 4. Spawn 4 sub_llm() calls using sub_prompts.get_prompt_for_strategy()
@@ -62,7 +62,7 @@ def refine_prompt(
     return f"""\
 ## Task: Round {round_num} Refinement
 
-Bottleneck: {bottleneck.upper()}
+Observed concern: {bottleneck.upper()}
 
 Key metrics:
 {metric_str}
@@ -74,7 +74,7 @@ Current hot loop:
 
 Strategies already tried: {', '.join(strategies_tried)}
 
-Based on the bottleneck and profiler metrics, identify the most impactful optimization.
+Based on the latest measured result and profiler metrics, identify the most impactful optimization.
 
 Spawn 1-2 targeted sub_llm() refinement calls.
 """

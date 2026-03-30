@@ -15,7 +15,6 @@ from typing import Optional
 from rlm.engine import RLMEngine
 from rlm.environment import RLMEnvironment, KernelCandidate
 from profiler.kernel_profiler import KernelProfiler
-from profiler.bottleneck_classifier import BottleneckClassifier
 from profiler.metrics import KernelMetrics, metrics_from_dict
 from search.diversity_selector import DiversitySelector
 from eval.hack_detector import is_clean
@@ -33,8 +32,8 @@ class BeamSearch:
       0. Root LLM decomposes → selects strategies
       1. Generate N beams in parallel (sub-LLMs)
       2. Compile + profile each beam
-      3. Classify bottleneck per beam
-      4. Select diverse survivors (1 per bottleneck cluster)
+      3. Label branch family per beam
+      4. Select diverse survivors (1 per strategy family)
       5. Refine each survivor with targeted sub-LLM
       6. Repeat rounds 2-5 until budget or round limit
       7. Combine top-2 survivors → final kernel
@@ -45,7 +44,6 @@ class BeamSearch:
         self.engine   = RLMEngine(env)
         self.profiler = KernelProfiler(env.search_config, hw_spec=env.hw_spec)
         self.selector = DiversitySelector(env.search_config)
-        self.clf      = BottleneckClassifier(env.search_config)
         self.checker  = CorrectnessChecker(env.search_config)
         self.beam_w   = env.search_config["beam"]["width"]
         self.rounds   = env.search_config["beam"]["refine_rounds"]
@@ -369,7 +367,7 @@ int main(int argc, char** argv) {{
                                candidate.strategy, rt_hack)
                 candidate.compile_ok = False
                 candidate.speedup    = 0.0
-                candidate.bottleneck = "unknown"
+                candidate.bottleneck = "rejected"
                 with self._env_lock:
                     self.env.hack_rejections.append(
                         {"strategy": candidate.strategy, "hack_type": f"runtime:{rt_hack}",
@@ -381,7 +379,7 @@ int main(int argc, char** argv) {{
         candidate.speedup = speedup
         if metrics:
             candidate.metrics    = metrics.to_dict()
-            candidate.bottleneck = self.clf.classify(metrics).value
+            candidate.bottleneck = self._branch_family(candidate) or "unlabeled"
         if candidate.compile_ok and candidate.correct:
             candidate.feedback_route = (
                 "planner_tree" if candidate.speedup >= 1.0 else "fixer_with_rag"
@@ -408,7 +406,7 @@ int main(int argc, char** argv) {{
                 "correct": temp.correct,
                 "speedup": temp.speedup,
                 "metrics": temp.metrics,
-                "bottleneck": temp.bottleneck,
+                "branch_family": temp.bottleneck,
                 "error": error,
             }
         return fn
@@ -448,14 +446,17 @@ int main(int argc, char** argv) {{
         env           = self.env
         problem_shape = env.problem_shapes[0]
 
-        # KernelArena scores speedup vs FlashInfer (production reference), not vs the
-        # naive starting kernel.  Always use FlashInfer as the denominator.
-        # Log naive-kernel timing for diagnostics (shows how much room there is).
         baseline_us = env.baseline_us_reported
         search_naive_us, baseline_cm = self.measure_search_baseline(problem_shape)
         if search_naive_us:
             logger.info("Naive reference kernel (harness): %.3f us", search_naive_us)
-        logger.info("FlashInfer baseline (speedup denominator): %.3f us", baseline_us)
+        if env.official_baseline:
+            logger.info("FlashInfer baseline (speedup denominator): %.3f us", baseline_us)
+        else:
+            logger.warning(
+                "Reference fallback baseline (UNOFFICIAL denominator): %.3f us",
+                baseline_us,
+            )
 
         logger.info("="*60)
         logger.info("Beam search: kernel=%s beam_width=%d rounds=%d",

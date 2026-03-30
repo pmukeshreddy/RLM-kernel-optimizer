@@ -49,7 +49,7 @@ SUBMIT_KERNEL_TOOL = {
         "- CORRECTNESS FAILURE: max error magnitude and which check failed\n"
         "- Result verdict (IMPROVED / REGRESSION / NO CHANGE) with:\n"
         "  timing_us, speedup vs baseline, SM occupancy,\n"
-        "  memory/compute throughput, compiler resource usage, register spills,\n"
+        "  compiler resource usage, register spills,\n"
         "  delta from your previous submission,\n"
         "  remaining optimization suggestions from profiler data"
     ),
@@ -165,7 +165,7 @@ Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - Use read_file to check available hardware intrinsics in the project headers
 
 Before EVERY submit_kernel call, explain in 2-3 sentences:
-1. What the profiler data tells you is the current bottleneck
+1. What the latest measured result confirms or leaves uncertain
 2. What specific code change you will make and why you expect it to help
 
 Rules:
@@ -181,18 +181,12 @@ def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> st
     """Build REFINE_SYSTEM_PROMPT with constraints from measured runtime data."""
     if speedup >= 1.0 and prev_metrics:
         cm = prev_metrics.get("_compiler", {})
-        mem_tput = float(prev_metrics.get("mem_throughput_pct", 0) or 0.0)
-        compute_tput = float(prev_metrics.get("compute_throughput_pct", 0) or 0.0)
         occupancy = float(prev_metrics.get("sm_occupancy", 0) or 0.0)
         hints = []
         if cm.get("spill_stores_bytes", 0) or cm.get("spill_loads_bytes", 0):
             hints.append("spills are present, so reduce live state before adding more work per thread")
         if cm.get("registers_per_thread", 0) >= 96 or occupancy < 75.0:
             hints.append("register pressure or occupancy is already tight")
-        if mem_tput >= max(compute_tput, 25.0):
-            hints.append("memory throughput is the stronger signal, so preserve the working math path and change one memory path at a time")
-        elif compute_tput > 0:
-            hints.append("runtime gains will come from a smaller hot path, not a structural rewrite")
 
         constraint = f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical follow-up changes over structural rewrites."
         if hints:
@@ -335,15 +329,16 @@ class RLMEngine:
             sm_count = env.hw_spec.get("sm", {}).get("count", 148)
             cm = env.baseline_compiler_metrics
             cm_str = cm.summary_str() if cm else "unavailable"
+            baseline_label = "FlashInfer timing" if env.official_baseline else "Reference fallback timing (UNOFFICIAL)"
             return (
                 f"BASELINE PROFILER DATA (reference kernel):\n"
                 f"  Naive kernel timing: {env.baseline_naive_us:.3f} us\n"
-                f"  FlashInfer timing:   {env.baseline_us_reported:.3f} us\n"
+                f"  {baseline_label}:   {env.baseline_us_reported:.3f} us\n"
                 f"  Compiler: {cm_str}\n"
                 f"  Grid: {rows} blocks launched on {sm_count} SMs"
                 f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
             )
-        return "BASELINE PROFILER DATA: unavailable — analyze kernel source to infer bottleneck type.\n"
+        return "BASELINE PROFILER DATA: unavailable — analyze kernel source and retrieved production patterns.\n"
 
     def _search_pinecone_context(self, queries: list[str], top_k: int = 3) -> str:
         clean_queries = [q.strip() for q in queries if q and q.strip()]
@@ -362,7 +357,8 @@ class RLMEngine:
                 f"Operation: {operation}. "
                 f"Shape: {shape}. Aliases: {aliases}. Need: production CUDA kernel source_code."
             ),
-            f"{operation} FlashInfer bottleneck CUDA source code",
+            f"{operation} FlashInfer production kernel source code",
+            f"{operation} best production kernel B200 bf16 fp4 source code",
             f"{operation} vectorized loads stores bf16 fp4 CUDA source code",
         ]
 
@@ -521,7 +517,7 @@ class RLMEngine:
                     "speedup": 0.0,
                     "metrics": {},
                     "error": "No profiler available",
-                    "bottleneck": "unknown",
+                    "branch_family": "unknown",
                 }
 
             feedback = build_sandbox_feedback(
@@ -565,7 +561,7 @@ class RLMEngine:
                         correct=True,
                         speedup=result["speedup"],
                         metrics=result.get("metrics", {}),
-                        bottleneck=result.get("bottleneck", "unknown"),
+                        bottleneck=result.get("branch_family") or result.get("bottleneck", "unknown"),
                         prev_metrics=parent_candidate.metrics if parent_candidate else None,
                         parent_strategy=(
                             parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
@@ -583,7 +579,7 @@ class RLMEngine:
                     best.best_speedup = result["speedup"]
                     best_speedup = result["speedup"]
             else:
-                last_error = result.get("error", "") or "; ".join(feedback.leading_signals) or feedback.uncertainty
+                last_error = result.get("error", "") or feedback.uncertainty
 
         if best:
             return best
@@ -792,7 +788,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     "goal": "Repair the failing or below-baseline branch.",
                     "what": feedback.next_action,
                     "change_summary": feedback.next_action,
-                    "bottleneck": "; ".join(feedback.leading_signals) or feedback.uncertainty,
+                    "bottleneck": "",
                     "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
                     "rag_queries": feedback.rag_queries,
                     "planner_notes": feedback.planner_summary(),

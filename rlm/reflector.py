@@ -151,16 +151,12 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
     lines.append(f"Speedup vs FlashInfer:         {speedup:.3f}x")
     lines.append(f"SM occupancy:                  {occupancy:.1f}%")
 
-    mem_tput = metrics.get("mem_throughput_pct", 0)
-    compute_tput = metrics.get("compute_throughput_pct", 0)
     stall_mem = metrics.get("stall_memory", 0)
     dram_bw = metrics.get("dram_read_bw_gbps", 0)
     l2_hit = metrics.get("l2_hit_rate", 0)
 
-    if mem_tput > 0 or compute_tput > 0:
+    if stall_mem > 0 or dram_bw > 0 or l2_hit > 0:
         lines.append("")
-        lines.append(f"Memory throughput:             {mem_tput:.1f}% of peak")
-        lines.append(f"Compute throughput:            {compute_tput:.1f}% of peak")
         if stall_mem > 0:
             lines.append(f"Warp stalls (memory):          {stall_mem:.1f}%")
         if dram_bw > 0:
@@ -230,8 +226,6 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
     cm = metrics.get("_compiler", {})
 
     hints: list[str] = []
-    mem_tput = metrics.get("mem_throughput_pct", 0)
-    compute_tput = metrics.get("compute_throughput_pct", 0)
     occupancy = metrics.get("sm_occupancy", 0)
 
     spill_total = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
@@ -248,15 +242,6 @@ def _format_suggestions_section(metrics: dict, ineffective: set = None,
         hints.append(
             f"Low SM occupancy ({occupancy:.1f}%) — prefer smaller localized changes that preserve occupancy"
         )
-    if mem_tput >= max(compute_tput, 25.0):
-        hints.append(
-            f"Memory throughput is the stronger signal ({mem_tput:.1f}% vs compute {compute_tput:.1f}%) — remove extra passes or improve memory access locality"
-        )
-    elif compute_tput > 25.0:
-        hints.append(
-            f"Compute throughput is the stronger signal ({compute_tput:.1f}% of peak) — simplify one arithmetic hot path or use a hardware intrinsic"
-        )
-
     if not hints:
         return ""
 

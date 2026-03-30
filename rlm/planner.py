@@ -63,7 +63,7 @@ def fallback_branches(
             PlanBranch(
                 name=f"{prefix}_{idx + 1}",
                 goal="Make one measurable CUDA optimization change.",
-                bottleneck="unknown",
+                bottleneck="",
                 change_summary="Implement one targeted optimization and preserve correctness.",
                 expected_signal="Compiler succeeds and sandbox metrics improve.",
                 rag_queries=[],
@@ -137,10 +137,10 @@ def parse_plan_response(
 def _render_planner_prompt(spec: PlannerSpec) -> str:
     branch_example = {
         "name": "short_branch_name",
-        "goal": "what this branch is trying to prove",
-        "bottleneck": "the main bottleneck this branch attacks",
-        "change_summary": "the concrete change for the coder agent",
-        "expected_signal": "which sandbox result would validate the branch",
+        "goal": "what retrieved code pattern this branch is trying to adapt",
+        "bottleneck": "optional short observed concern only if strongly evidenced",
+        "change_summary": "the concrete retrieved pattern or local adaptation for the coder agent",
+        "expected_signal": "which sandbox result would validate the adaptation",
         "rag_queries": ["query 1", "query 2"],
         "planner_notes": "short constraint or preserve rule",
         "rationale": "why this branch is worth trying now",
@@ -154,6 +154,8 @@ def _render_planner_prompt(spec: PlannerSpec) -> str:
     mode_rules = [
         "Use the INPUT_SPEC as the source of truth for the task and constraints.",
         "Use the Pinecone RAG context to name concrete implementation patterns or reference kernels.",
+        "Prefer branches that adapt retrieved production code over branches that speculate about bottlenecks.",
+        "If the RAG context already contains a strong production pattern, branch around minimal adaptations of that pattern.",
         "Each branch must be distinct and testable in one sandbox iteration.",
         "Do not write CUDA code.",
         "No prose outside the JSON array.",
@@ -163,7 +165,7 @@ def _render_planner_prompt(spec: PlannerSpec) -> str:
             [
                 "Do not propose full rewrites.",
                 "Preserve the parent branch's working structure.",
-                "Each child branch must attack a different remaining bottleneck.",
+                "Each child branch must be a different minimal follow-up adaptation of the best working family.",
             ]
         )
     else:
