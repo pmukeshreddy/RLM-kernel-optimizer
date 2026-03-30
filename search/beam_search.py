@@ -409,6 +409,7 @@ int main(int argc, char** argv) {{
         ok = False
         metrics = None
         speedup = 0.0
+        binary_speedup = None  # set inside timing block; used for routing at end
         with self._env_lock:
             self.env.total_attempts += 1
 
@@ -534,8 +535,17 @@ int main(int argc, char** argv) {{
             candidate.metrics = metrics_dict
             candidate.bottleneck = self._branch_family(candidate) or "unlabeled"
         if candidate.compile_ok and candidate.correct:
-            candidate.feedback_route = (
-                "planner_tree" if candidate.speedup >= 1.0 else "fixer_with_rag"
+            # Use binary speedup for routing when available: graph timing is symmetric
+            # with the FlashInfer baseline but both are inflated ~3-8% by the stream-s
+            # pre-capture step, compressing ratios toward 1.0x. Binary timing is ground
+            # truth. A kernel is "above baseline" if either measure says so.
+            routing_speedup = max(speedup, binary_speedup if binary_speedup is not None else 0.0)
+            route = "planner_tree" if routing_speedup >= 1.0 else "fixer_with_rag"
+            candidate.feedback_route = route
+            logger.info(
+                "  route=%s graph=%.3fx binary=%s",
+                route, speedup,
+                f"{binary_speedup:.3f}x" if binary_speedup is not None else "n/a",
             )
         return metrics
 
