@@ -5,6 +5,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from .env_loader import load_project_env
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -34,6 +36,7 @@ class PineconeMatch:
 
 class PineconeRetriever:
     def __init__(self, config: dict | None = None):
+        load_project_env()
         cfg = config or {}
         self.enabled = str(cfg.get("provider", "pinecone")).lower() == "pinecone"
         self.top_k = int(cfg.get("top_k", 4))

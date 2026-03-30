@@ -21,12 +21,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from rlm.env_loader import load_project_env
 from rlm.environment import RLMEnvironment
 from search.beam_search import BeamSearch
 from eval.correctness import CorrectnessChecker
 from eval.benchmark import Benchmarker, geometric_mean
 from eval.waferbench_format import format_submission, save_submission, print_submission_summary
 from eval import flashinfer_ref
+
+load_project_env(PROJECT_ROOT)
 
 logging.basicConfig(
     level=logging.INFO,
