@@ -533,6 +533,10 @@ int main(int argc, char** argv) {{
 
             # Refined candidates are already profiled by the inner loop.
             # Fresh beams may be pre-profiled (tool loop) or need profiling (one-shot).
+            refined_metrics = [
+                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
+                for c in refined
+            ]
             fresh_pre_profiled = [c for c in fresh if c.metrics]
             fresh_need_profiling = [c for c in fresh if not c.metrics]
             if fresh_need_profiling:
@@ -542,10 +546,7 @@ int main(int argc, char** argv) {{
                 fresh_metrics = []
 
             # Combine: refined (already profiled) + fresh pre-profiled + fresh just-profiled
-            new_metrics = [
-                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
-                for c in refined
-            ] + [
+            new_metrics = refined_metrics + [
                 (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
                 for c in fresh_pre_profiled
             ] + fresh_metrics
@@ -554,73 +555,98 @@ int main(int argc, char** argv) {{
                 env.optimization_history.record(c)
                 logger.info("  New: %s", c.summary())
 
-            # Track refinement outcomes on parent survivors + build history
-            for i, (refined_c, _) in enumerate(new_metrics):
-                if i < len(to_refine):
-                    parent = to_refine[i]
-                    entry = {"round": round_num, "strategy": refined_c.strategy,
-                             "speedup": refined_c.speedup,
-                             "strategy_desc": getattr(refined_c, 'strategy_desc', '')}
+            # Track refinement outcomes on parent survivors + build history.
+            # A parent may now produce multiple child branches once it crosses 1.0x.
+            parent_map = {parent.strategy: parent for parent in to_refine}
+            refined_groups = {}
+            for refined_c, metrics in refined_metrics:
+                refined_groups.setdefault(refined_c.parent_strategy or "", []).append((refined_c, metrics))
 
-                    if not refined_c.compile_ok:
+            for parent in to_refine:
+                children = refined_groups.get(parent.strategy, [])
+                if not children:
+                    continue
+
+                best_child, _ = max(
+                    children,
+                    key=lambda item: (
+                        int(item[0].compile_ok and item[0].correct),
+                        item[0].speedup,
+                    ),
+                )
+
+                for child, _ in children:
+                    entry = {
+                        "round": round_num,
+                        "strategy": child.strategy,
+                        "speedup": child.speedup,
+                        "strategy_desc": getattr(child, "strategy_desc", ""),
+                        "branch": (child.plan_branch or {}).get("name", ""),
+                    }
+                    if not child.compile_ok:
                         entry["outcome"] = "compile_fail"
-                        parent.last_refine_error = refined_c.compile_error or "Compile failure"
-                        parent.refine_attempts += 1
-                    elif not refined_c.correct:
+                    elif not child.correct:
                         entry["outcome"] = "correctness_fail"
-                        parent.last_refine_error = refined_c.compile_error or "Correctness failure (output mismatch or kernel hung)"
-                        parent.refine_attempts += 1
-                    elif refined_c.speedup < parent.speedup - 0.001:
+                    elif child.speedup < parent.speedup - 0.001:
                         entry["outcome"] = "regression"
-                        parent.refine_attempts += 1
-                        msg = f"Your refinement was SLOWER: {refined_c.speedup:.3f}x vs {parent.speedup:.3f}x."
-                        rm = refined_c.metrics or {}
-                        rc = rm.get("_compiler", {})
-                        pm = parent.metrics or {}
-                        pc = pm.get("_compiler", {})
-                        if rc and pc:
-                            r_regs = rc.get("registers_per_thread", 0)
-                            p_regs = pc.get("registers_per_thread", 0)
-                            r_occ = rm.get("sm_occupancy", 0)
-                            p_occ = pm.get("sm_occupancy", 0)
-                            if r_regs != p_regs or r_occ != p_occ:
-                                msg += f" Registers: {p_regs}->{r_regs}, Occupancy: {p_occ:.0f}%->{r_occ:.0f}%."
-                        parent.last_refine_error = msg
-                    elif refined_c.speedup > parent.speedup + 0.02:
+                    elif child.speedup > parent.speedup + 0.02:
                         entry["outcome"] = "improved"
-                        parent.last_refine_error = ""
-                        parent.refine_attempts = 0  # reset on real improvement
-                        # Update best-known code for this beam lineage
-                        if refined_c.speedup > (parent.best_speedup or 0):
-                            refined_c.best_code = refined_c.code
-                            refined_c.best_speedup = refined_c.speedup
                     else:
                         entry["outcome"] = "stagnant"
-                        parent.refine_attempts += 1
-                        parent.last_refine_error = (
-                            f"Refinement produced same speedup ({refined_c.speedup:.3f}x vs "
-                            f"{parent.speedup:.3f}x). Review the metrics to see if your change actually affected hardware execution."
-                        )
-
-                    # Update prev_metrics so the delta section shows what the
-                    # failed refinement changed — closes the feedback loop
-                    if refined_c.metrics:
-                        parent.prev_metrics = refined_c.metrics
-
                     parent.refinement_history.append(entry)
-                    refined_c.refinement_history = list(parent.refinement_history)
+                    child.refinement_history = list(parent.refinement_history)
+
+                if not best_child.compile_ok:
+                    parent.last_refine_error = best_child.compile_error or "Compile failure"
+                    parent.refine_attempts += 1
+                elif not best_child.correct:
+                    parent.last_refine_error = (
+                        best_child.compile_error
+                        or "Correctness failure (output mismatch or kernel hung)"
+                    )
+                    parent.refine_attempts += 1
+                elif best_child.speedup < parent.speedup - 0.001:
+                    msg = f"Your refinement was SLOWER: {best_child.speedup:.3f}x vs {parent.speedup:.3f}x."
+                    rm = best_child.metrics or {}
+                    rc = rm.get("_compiler", {})
+                    pm = parent.metrics or {}
+                    pc = pm.get("_compiler", {})
+                    if rc and pc:
+                        r_regs = rc.get("registers_per_thread", 0)
+                        p_regs = pc.get("registers_per_thread", 0)
+                        r_occ = rm.get("sm_occupancy", 0)
+                        p_occ = pm.get("sm_occupancy", 0)
+                        if r_regs != p_regs or r_occ != p_occ:
+                            msg += f" Registers: {p_regs}->{r_regs}, Occupancy: {p_occ:.0f}%->{r_occ:.0f}%."
+                    parent.last_refine_error = msg
+                    parent.refine_attempts += 1
+                elif best_child.speedup > parent.speedup + 0.02:
+                    parent.last_refine_error = ""
+                    parent.refine_attempts = 0
+                    if best_child.speedup > (parent.best_speedup or 0):
+                        best_child.best_code = best_child.code
+                        best_child.best_speedup = best_child.speedup
+                else:
+                    parent.last_refine_error = (
+                        f"Refinement produced same speedup ({best_child.speedup:.3f}x vs "
+                        f"{parent.speedup:.3f}x). Review the metrics to see if your change actually affected hardware execution."
+                    )
+                    parent.refine_attempts += 1
+
+                if best_child.metrics:
+                    parent.prev_metrics = best_child.metrics
 
             # Problem 2: only promote refinements that actually improved
             improved_new = []
-            for i, (refined_c, m) in enumerate(new_metrics):
-                if i < len(to_refine):
-                    parent = to_refine[i]
-                    if refined_c.speedup > parent.speedup:
-                        improved_new.append((refined_c, m))
-                    # else: regressed/stagnant — don't pollute the beam
-                else:
-                    # Fresh beams always enter the pool
+            for refined_c, m in refined_metrics:
+                parent = parent_map.get(refined_c.parent_strategy)
+                if parent and refined_c.speedup > parent.speedup:
                     improved_new.append((refined_c, m))
+            for fresh_c, m in [
+                (c, metrics_from_dict(c.metrics) if c.metrics else KernelMetrics())
+                for c in fresh_pre_profiled
+            ] + fresh_metrics:
+                improved_new.append((fresh_c, m))
 
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())

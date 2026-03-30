@@ -9,18 +9,25 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 import anthropic
 from anthropic import AsyncAnthropic
 
+from .coder import build_coder_prompt
 from .environment import RLMEnvironment, KernelCandidate
+from .feedback import build_sandbox_feedback
+from .fixer import build_fixer_prompt
+from .planner import (
+    build_initial_plan_prompt,
+    build_tree_plan_prompt,
+    fallback_branches,
+    parse_plan_response,
+)
+from .rag_retriever import init_knowledge_base
 from .root_prompts import SYSTEM_PROMPT, combine_prompt
 from .reflector import (
-    _get_launch_signature, _format_profile_section,
-    _format_suggestions_section, _format_react_trace,
-    _format_last_error_section, _format_delta_section,
-    _compute_proven_ineffective,
+    _get_launch_signature,
+    _format_profile_section,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,7 +135,37 @@ SEARCH_DOCS_TOOL = {
     },
 }
 
-ALL_TOOLS = [SUBMIT_KERNEL_TOOL, INSPECT_SASS_TOOL, READ_FILE_TOOL, SEARCH_DOCS_TOOL]
+SEARCH_PINECONE_TOOL = {
+    "name": "search_pinecone",
+    "description": (
+        "Search the Pinecone knowledge index for CUDA optimization notes, prior "
+        "experiments, compiler pitfalls, and kernel-specific guidance that the user "
+        "already stored there. Use this when the local docs are not enough. "
+        "Costs no submit_kernel turn."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Semantic search query to run against Pinecone.",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Optional number of matches to return.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+ALL_TOOLS = [
+    SUBMIT_KERNEL_TOOL,
+    INSPECT_SASS_TOOL,
+    READ_FILE_TOOL,
+    SEARCH_DOCS_TOOL,
+    SEARCH_PINECONE_TOOL,
+]
 
 REFINE_SYSTEM_PROMPT = f"""\
 You are a CUDA kernel optimization agent. You have {{turns}} submit_kernel calls.
@@ -141,6 +178,7 @@ Available tools (only submit_kernel counts toward your turn limit):
 - inspect_sass: compile code and see the raw SASS assembly (instruction-level view)
 - read_file: read project header files (nvfp4_utils.cuh, b200_intrinsics.cuh) or reference kernels
 - search_docs: look up CUDA intrinsic signatures and usage (fp4, fp8, warp, fast math, memory)
+- search_pinecone: query the user's Pinecone knowledge index for project-specific guidance
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
@@ -235,13 +273,17 @@ class RLMEngine:
         self._api_semaphore = asyncio.Semaphore(2)
         self._loop = None  # persistent event loop for async calls
 
-        self.root_model    = cfg["models"]["root_model"]
-        self.sub_model     = cfg["models"]["sub_model"]
+        self.root_model    = cfg["models"].get("planner_model", cfg["models"]["root_model"])
+        self.sub_model     = cfg["models"].get("coder_model", cfg["models"]["sub_model"])
+        self.fixer_model   = cfg["models"].get("fixer_model", cfg["models"]["sub_model"])
         self.combine_model = cfg["models"]["combine_model"]
         self.beam_width    = cfg["beam"]["width"]
         self.refine_rounds = cfg["beam"]["refine_rounds"]
         self.combine_top_k = cfg["beam"]["combine_top_k"]
+        self.tree_speedup_threshold = float(cfg["beam"].get("tree_speedup_threshold", 1.0))
+        self.tree_branching_factor = int(cfg["beam"].get("tree_branching_factor", 2))
         self.max_tokens    = cfg["cost_control"]["max_tokens_per_sub_call"]
+        self.rag = init_knowledge_base(cfg.get("rag", {}))
 
     # ── Low-level LLM call ────────────────────────────────────────────────────
 
@@ -340,27 +382,14 @@ class RLMEngine:
         )
         return response
 
-    # ── Round 0: Decomposition ────────────────────────────────────────────────
-
-    def decompose(self) -> list:
-        """Freeform strategy selection — LLM proposes optimizations from scratch.
-
-        No predefined menu. The LLM analyzes the kernel and picks the best
-        strategies on its own. Returns list of {name, what} dicts for codegen.
-        Falls back to kernel-aware defaults if parsing fails.
-        """
-        import json
+    def _planner_baseline_context(self) -> str:
         env = self.env
-        kernel_src = env.kernel_src  # expanded includes
-
-        # Build baseline profiler context for strategy selection
-        baseline_context = ""
         if env.baseline_naive_us and env.baseline_us_reported:
             rows = env.problem_shapes[0][0]
             sm_count = env.hw_spec.get("sm", {}).get("count", 148)
             cm = env.baseline_compiler_metrics
             cm_str = cm.summary_str() if cm else "unavailable"
-            baseline_context = (
+            return (
                 f"BASELINE PROFILER DATA (reference kernel):\n"
                 f"  Naive kernel timing: {env.baseline_naive_us:.3f} us\n"
                 f"  FlashInfer timing:   {env.baseline_us_reported:.3f} us\n"
@@ -368,72 +397,250 @@ class RLMEngine:
                 f"  Grid: {rows} blocks launched on {sm_count} SMs"
                 f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
             )
-        if not baseline_context:
-            baseline_context = "BASELINE PROFILER DATA: unavailable — analyze kernel source to infer bottleneck type.\n"
+        return "BASELINE PROFILER DATA: unavailable — analyze kernel source to infer bottleneck type.\n"
 
-        num_strategies = self.beam_width * 2  # extra strategies held in reserve
-        example_lines = "\n".join(
-            f'  {{"name": "short_name", "what": "one line description of the concrete change"}},'
-            for _ in range(num_strategies)
-        )
-        prompt = f"""\
-You are a CUDA optimization expert. Analyze this kernel and propose exactly {num_strategies}
-DIVERSE optimization techniques that would give the biggest speedup.
+    def _search_pinecone_context(self, queries: list[str], top_k: int = 3) -> str:
+        clean_queries = [q.strip() for q in queries if q and q.strip()]
+        if not clean_queries:
+            return "No Pinecone query provided."
+        matches = self.rag.search_many(clean_queries[:4], top_k=top_k)
+        return self.rag.format_matches(matches)
 
-Speedup is measured against FlashInfer, a production GPU library.
-You target ONE GPU (B200, sm_100a) and ONE shape ({env.problem_shapes[0]}).
-
-{baseline_context}
-
-Kernel type: {env.kernel_type}
-Problem shape: {env.problem_shapes[0]}
-Target: NVIDIA B200 (Blackwell, sm_100a, 8 TB/s HBM3e, 126 MB L2, 148 SMs, 228KB smem/SM)
-
-```cuda
-{kernel_src}
-```
-
-Analyze the profiler data and kernel source. Propose {num_strategies} diverse optimizations,
-most impactful first. Each should be a concrete, actionable change.
-
-Return as a JSON array of objects:
-[
-{example_lines}
-]
-
-Respond with ONLY the JSON array, nothing else."""
-
-        logger.info("Round 0: freeform strategy selection for kernel_type=%s",
-                     env.kernel_type)
-        response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
-        logger.debug("Freeform response: %s", response[:300])
-
-        # Parse JSON response
-        strategies = []
-        json_match = re.search(r'\[.*?\]', response, re.DOTALL)
-        if json_match:
-            try:
-                raw = json.loads(json_match.group())
-                strategies = [s for s in raw if isinstance(s, dict) and "name" in s]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        if strategies:
-            names = [s["name"] for s in strategies]
-            logger.info("LLM-proposed strategies (%d): %s", len(names), names)
-            return strategies  # return ALL — caller splits active vs reserve
-
-        # Fallback: generic strategies if LLM response couldn't be parsed
-        logger.warning("Could not parse LLM strategy response, using generic fallback")
-        generic = [
-            {"name": "optimization_a", "what": "Analyze kernel and apply the most impactful optimization"},
-            {"name": "optimization_b", "what": "Try a different optimization approach than beam A"},
-            {"name": "optimization_c", "what": "Try a third independent optimization approach"},
-            {"name": "optimization_d", "what": "Try a fourth independent optimization approach"},
+    def _initial_plan_queries(self) -> list[str]:
+        env = self.env
+        shape = "x".join(str(dim) for dim in env.problem_shapes[0])
+        return [
+            f"{env.kernel_type} Blackwell CUDA optimization {shape}",
+            f"{env.kernel_type} FlashInfer baseline bottleneck",
+            f"{env.kernel_type} vectorized loads stores bf16 fp4",
         ]
-        return generic[:num_strategies]
+
+    def _expand_tree_plans(self, parent: KernelCandidate) -> list[dict]:
+        rag_context = self._search_pinecone_context(
+            parent.plan_branch.get("rag_queries")
+            or [f"{self.env.kernel_type} {parent.strategy} next optimization"]
+        )
+        feedback = build_sandbox_feedback(
+            {
+                "compile_ok": parent.compile_ok,
+                "correct": parent.correct,
+                "speedup": parent.speedup,
+                "metrics": parent.metrics,
+                "error": parent.compile_error,
+            },
+            parent_speedup=parent.speedup,
+            prev_inner_metrics=parent.prev_metrics,
+            kernel_type=self.env.kernel_type,
+        )
+        prompt = build_tree_plan_prompt(
+            kernel_type=self.env.kernel_type,
+            problem_shape=self.env.problem_shapes[0],
+            parent_strategy=parent.strategy,
+            parent_speedup=parent.speedup,
+            kernel_src=parent.best_code or parent.code,
+            feedback_summary=feedback.planner_summary(),
+            rag_context=rag_context,
+            branch_count=self.tree_branching_factor,
+        )
+        response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
+        return parse_plan_response(
+            response,
+            count=self.tree_branching_factor,
+            prefix=f"{parent.strategy}_child",
+            parent_strategy=parent.strategy,
+        )
+
+    # ── Round 0: Decomposition ────────────────────────────────────────────────
+
+    def decompose(self) -> list:
+        env = self.env
+        num_strategies = self.beam_width * 2
+        rag_context = self._search_pinecone_context(self._initial_plan_queries())
+        prompt = build_initial_plan_prompt(
+            kernel_type=env.kernel_type,
+            problem_shape=env.problem_shapes[0],
+            kernel_src=env.kernel_src,
+            baseline_context=self._planner_baseline_context(),
+            rag_context=rag_context,
+            branch_count=num_strategies,
+        )
+
+        logger.info("Planner: generating %d root branches for %s", num_strategies, env.kernel_type)
+        response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
+        strategies = parse_plan_response(
+            response,
+            count=num_strategies,
+            prefix="root_plan",
+        )
+        if strategies:
+            logger.info("Planner produced %d branches", len(strategies))
+            return strategies
+
+        logger.warning("Planner returned no usable branches, using fallback plans")
+        return fallback_branches(num_strategies, prefix="root_plan")
 
     # ── Sub-LLM beam generation (parallel) ───────────────────────────────────
+
+    async def _run_agent_loop(
+        self,
+        initial_prompt: str,
+        strategy_name: str,
+        round_num: int,
+        profile_fn,
+        model_id: str,
+        comparison_speedup: float = 0.0,
+        prev_inner_metrics: dict | None = None,
+        strategy_context: str = "",
+        plan_branch: dict | None = None,
+        parent_candidate: KernelCandidate | None = None,
+    ) -> KernelCandidate:
+        messages = [{"role": "user", "content": initial_prompt}]
+        best = None
+        last_error = ""
+        feedback_route = ""
+        submit_count = 0
+        max_api_turns = MAX_INNER_TURNS + 4
+        best_speedup = comparison_speedup
+        plan_branch = dict(plan_branch or {})
+
+        for turn in range(max_api_turns):
+            if submit_count >= MAX_INNER_TURNS:
+                break
+
+            system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
+            try:
+                response = await self._call_llm_with_tools_async(
+                    messages=messages,
+                    tools=ALL_TOOLS,
+                    model=model_id,
+                    system=system_prompt,
+                    temperature=0.4,
+                )
+            except RuntimeError as exc:
+                logger.error("Budget exceeded for %s turn %d: %s", strategy_name, turn, exc)
+                break
+
+            text_blocks = [
+                block.text for block in response.content
+                if hasattr(block, "text") and block.text.strip()
+            ]
+            if text_blocks:
+                logger.info(
+                    "\nAGENT [%s turn %d]:\n%s\n",
+                    strategy_name,
+                    turn,
+                    "\n".join(text_blocks),
+                )
+
+            messages.append({"role": "assistant", "content": response.content})
+
+            submit_code, submit_block_id, aux_results = self._handle_tool_calls(
+                response, messages, profile_fn, strategy_name, round_num,
+                max(best_speedup, comparison_speedup), prev_inner_metrics,
+            )
+
+            if submit_code is None and not submit_block_id:
+                has_any_tool = any(block.type == "tool_use" for block in response.content)
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
+                    continue
+                if not has_any_tool:
+                    break
+                continue
+
+            if submit_code is None:
+                if aux_results:
+                    messages.append({"role": "user", "content": aux_results})
+                continue
+
+            submit_count += 1
+            if profile_fn:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, profile_fn, submit_code, strategy_name, round_num
+                )
+            else:
+                result = {
+                    "compile_ok": False,
+                    "correct": False,
+                    "speedup": 0.0,
+                    "metrics": {},
+                    "error": "No profiler available",
+                    "bottleneck": "unknown",
+                }
+
+            feedback = build_sandbox_feedback(
+                result=result,
+                parent_speedup=max(best_speedup, comparison_speedup),
+                prev_inner_metrics=prev_inner_metrics,
+                kernel_type=self.env.kernel_type,
+            )
+            feedback_route = feedback.route
+
+            if result["compile_ok"] and result["correct"] and result.get("metrics"):
+                prev_inner_metrics = result["metrics"]
+
+            all_results = list(aux_results) + [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": submit_block_id,
+                    "content": feedback.to_tool_result_json(),
+                }
+            ]
+            messages.append({"role": "user", "content": all_results})
+
+            logger.info(
+                "SANDBOX [%s submit %d]: route=%s speedup=%.3fx compile=%s correct=%s",
+                strategy_name,
+                submit_count,
+                feedback.route,
+                result.get("speedup", 0.0),
+                result.get("compile_ok"),
+                result.get("correct"),
+            )
+
+            if result["compile_ok"] and result["correct"]:
+                if best is None or result["speedup"] > best.speedup:
+                    best = KernelCandidate(
+                        code=submit_code,
+                        strategy=strategy_name,
+                        round_num=round_num,
+                        compile_ok=True,
+                        correct=True,
+                        speedup=result["speedup"],
+                        metrics=result.get("metrics", {}),
+                        bottleneck=result.get("bottleneck", "unknown"),
+                        prev_metrics=parent_candidate.metrics if parent_candidate else None,
+                        parent_strategy=(
+                            parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
+                        ),
+                        plan_branch=dict(plan_branch),
+                        feedback_route=feedback.route,
+                    )
+                    best.strategy_context = strategy_context
+                    best.best_code = submit_code
+                    best.best_speedup = result["speedup"]
+                    best_speedup = result["speedup"]
+            else:
+                last_error = result.get("error", "") or feedback.root_cause
+
+        if best:
+            return best
+
+        failed = KernelCandidate(
+            code="",
+            strategy=strategy_name,
+            round_num=round_num,
+            compile_ok=False,
+            prev_metrics=parent_candidate.metrics if parent_candidate else None,
+            parent_strategy=(
+                parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
+            ),
+            plan_branch=dict(plan_branch),
+            feedback_route=feedback_route,
+        )
+        failed.compile_error = last_error or "All inner refinement attempts failed"
+        failed.strategy_context = strategy_context
+        return failed
 
     async def _generate_single_beam(
         self,
@@ -443,155 +650,55 @@ Respond with ONLY the JSON array, nothing else."""
         round_num: int = 0,
         profile_fn=None,
     ) -> KernelCandidate:
-        # Support both freeform dicts {name, what} and plain strategy name strings
         if isinstance(strategy, dict):
-            strat_name = strategy.get("name", "unknown")
-            strat_desc = strategy.get("what", "")
+            plan_branch = dict(strategy)
+            strat_name = plan_branch.get("name", "unknown")
+            strat_desc = plan_branch.get("change_summary") or plan_branch.get("what", "")
         else:
-            strat_name = strategy
+            strat_name = str(strategy)
             strat_desc = ""
+            plan_branch = {
+                "name": strat_name,
+                "goal": strat_name,
+                "what": strat_desc,
+                "change_summary": strat_desc,
+                "expected_signal": "Sandbox output improves.",
+                "rag_queries": [],
+            }
 
         launch_sig = _get_launch_signature(self.env.kernel_type)
 
-        # ── Tool-use path: compile/test/iterate like refinement ──────────
         if profile_fn and strat_desc:
-            shape_str = str(self.env.problem_shapes[0])
-            
-            prompt_parts = [
-                f"You are beam \"{strat_name}\" — generate an optimized CUDA kernel.",
-                f"Direction: {strat_desc}",
-                f"\nProblem shape: {shape_str} (FIXED — you may hard-code dimensions as compile-time constants).",
-                "\nSpeedup is measured against FlashInfer, a production GPU library. "
-                "You target ONE GPU (B200, sm_100a) and ONE shape.",
-            ]
-            
-            prompt_parts.extend([
-                f"\n## Naive reference kernel (starting point):\n"
-                f"```cuda\n{kernel_slice}\n```",
-                f"\n{launch_sig}",
-                "\nBefore calling submit_kernel, explain in 2-3 sentences:\n"
-                "1. What your planned change is\n"
-                "2. Why it addresses the specific performance metrics without breaking correctness\n\n"
-                "Then call submit_kernel with your complete .cu file.",
-            ])
-            initial_prompt = "\n\n".join(prompt_parts)
-
-            messages = [{"role": "user", "content": initial_prompt}]
-            best = None
-            best_speedup = 0.0
-            prev_inner_metrics = None
-            submit_count = 0
-            max_api_turns = MAX_INNER_TURNS + 4  # extra turns for non-submit tools
-
-            for turn in range(max_api_turns):
-                if submit_count >= MAX_INNER_TURNS:
-                    break
-                # Rebuild system prompt each turn — once model beats baseline,
-                # switch from "structural changes allowed" to "surgical only"
-                system_prompt = _build_refine_system_prompt(best_speedup, prev_inner_metrics)
-                constraint_mode = "SURGICAL" if best_speedup >= 1.0 else "OPEN"
-                has_compiler = bool(prev_inner_metrics and prev_inner_metrics.get("_compiler"))
-                logger.info("GEN [%s] turn %d: best_speedup=%.3f constraint=%s has_compiler=%s sys_prompt_len=%d",
-                            strat_name, turn, best_speedup, constraint_mode, has_compiler, len(system_prompt))
-                try:
-                    response = await self._call_llm_with_tools_async(
-                        messages=messages,
-                        tools=ALL_TOOLS,
-                        model=self.sub_model,
-                        system=system_prompt,
-                        temperature=0.5,
-                    )
-                except RuntimeError as e:
-                    logger.error("Budget exceeded gen %s turn %d: %s",
-                                 strat_name, turn, e)
-                    break
-
-                # Log model's reasoning
-                text_blocks = [b.text for b in response.content if hasattr(b, 'text') and b.text.strip()]
-                if text_blocks:
-                    reasoning = "\n".join(text_blocks)
-                    logger.info("\n🧠 GEN MODEL THOUGHTS [%s turn %d]:\n%s\n", strat_name, turn, reasoning)
-
-                messages.append({"role": "assistant", "content": response.content})
-
-                # Handle all tool calls
-                submit_code, submit_block_id, aux_results = self._handle_tool_calls(
-                    response, messages, profile_fn, strat_name, round_num,
-                    max(best_speedup, 1.0), prev_inner_metrics)
-
-                # If only auxiliary tools were called, send results and continue
-                if submit_code is None and not submit_block_id:
-                    if not aux_results:
-                        has_any_tool = any(b.type == "tool_use" for b in response.content)
-                        if not has_any_tool:
-                            logger.info("GEN [%s] turn %d: no tool call", strat_name, turn)
-                            break
-                    # Send aux-only results as one message
-                    if aux_results:
-                        messages.append({"role": "user", "content": aux_results})
-                    continue
-
-                if submit_code is None:
-                    # submit_kernel with empty code — error in aux_results
-                    if aux_results:
-                        messages.append({"role": "user", "content": aux_results})
-                    continue
-
-                submit_count += 1
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, profile_fn, submit_code, strat_name, round_num)
-
-                tool_result_text = self._format_tool_result(
-                    result, best_speedup, prev_inner_metrics)
-                if result["compile_ok"] and result["correct"] and result.get("metrics"):
-                    prev_inner_metrics = result["metrics"]
-                    cm_keys = list(prev_inner_metrics.get("_compiler", {}).keys())[:5]
-                    logger.info("GEN [%s] prev_inner_metrics updated: speedup=%.3f _compiler_keys=%s",
-                                strat_name, prev_inner_metrics.get("speedup", 0), cm_keys)
-                # Merge aux results + submit result into ONE user message
-                all_results = list(aux_results) + [
-                    {"type": "tool_result", "tool_use_id": submit_block_id,
-                     "content": tool_result_text}
-                ]
-                messages.append({"role": "user", "content": all_results})
-
-                logger.info("GEN [%s] submit %d: compile=%s correct=%s speedup=%.3fx",
-                            strat_name, submit_count,
-                            result["compile_ok"], result["correct"],
-                            result.get("speedup", 0))
-                logger.info("\n📊 GEN FEEDBACK [%s submit %d]:\n%s\n",
-                            strat_name, submit_count, tool_result_text)
-
-                if result["compile_ok"] and result["correct"]:
-                    if best is None or result["speedup"] > best.speedup:
-                        best = KernelCandidate(
-                            code=submit_code,
-                            strategy=strat_name,
-                            round_num=round_num,
-                            compile_ok=True,
-                            correct=True,
-                            speedup=result["speedup"],
-                            metrics=result.get("metrics", {}),
-                            bottleneck=result.get("bottleneck", "unknown"),
-                        )
-                        best.strategy_context = strat_desc
-                        best_speedup = result["speedup"]
-
-            if best:
-                return best
-
-            # All turns failed — return failure
-            failed = KernelCandidate(
-                code="", strategy=strat_name, round_num=round_num,
-                compile_ok=False,
+            rag_context = self._search_pinecone_context(
+                plan_branch.get("rag_queries")
+                or [f"{self.env.kernel_type} {strat_name} CUDA optimization"]
             )
-            failed.strategy_context = strat_desc
-            return failed
+            current_profile = (
+                _format_profile_section(current_metrics, round_num)
+                if current_metrics else ""
+            )
+            initial_prompt = build_coder_prompt(
+                plan_branch=plan_branch,
+                kernel_code=kernel_slice,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                current_profile=current_profile,
+            )
+            return await self._run_agent_loop(
+                initial_prompt=initial_prompt,
+                strategy_name=strat_name,
+                round_num=round_num,
+                profile_fn=profile_fn,
+                model_id=self.sub_model,
+                comparison_speedup=0.0,
+                prev_inner_metrics=current_metrics,
+                strategy_context=strat_desc,
+                plan_branch=plan_branch,
+            )
 
         # ── One-shot fallback (no profile_fn or no description) ──────────
         if strat_desc:
             shape_str = str(self.env.problem_shapes[0])
-            
             prompt = f"""\
 You are an expert CUDA kernel optimizer targeting NVIDIA B200 (sm_100a, Blackwell).
 
@@ -657,6 +764,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             strategy=strat_name,
             round_num=round_num,
             compile_ok=bool(code),
+            plan_branch=plan_branch,
         )
         c.strategy_context = strat_desc
         return c
@@ -680,10 +788,54 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     async def refine_beams(self, survivors: list, round_num: int,
                            profile_fn=None) -> list:
-        tasks = [
-            self._refine_single_beam(candidate, round_num, profile_fn)
-            for candidate in survivors
-        ]
+        tasks = []
+        for candidate in survivors:
+            if candidate.speedup >= self.tree_speedup_threshold:
+                child_plans = self._expand_tree_plans(candidate)
+                for child_plan in child_plans:
+                    tasks.append(
+                        self._refine_single_beam(
+                            candidate,
+                            round_num,
+                            profile_fn=profile_fn,
+                            plan_branch=child_plan,
+                            fixer_mode=False,
+                        )
+                    )
+            else:
+                feedback = build_sandbox_feedback(
+                    {
+                        "compile_ok": candidate.compile_ok,
+                        "correct": candidate.correct,
+                        "speedup": candidate.speedup,
+                        "metrics": candidate.metrics,
+                        "error": candidate.compile_error,
+                    },
+                    parent_speedup=candidate.speedup,
+                    prev_inner_metrics=candidate.prev_metrics,
+                    kernel_type=self.env.kernel_type,
+                )
+                repair_plan = {
+                    "name": f"{candidate.strategy}_repair",
+                    "goal": "Repair the failing or below-baseline branch.",
+                    "what": feedback.next_action,
+                    "change_summary": feedback.next_action,
+                    "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
+                    "rag_queries": feedback.rag_queries,
+                    "planner_notes": feedback.planner_summary(),
+                    "parent_strategy": candidate.strategy,
+                    "tree_ready": False,
+                }
+                tasks.append(
+                    self._refine_single_beam(
+                        candidate,
+                        round_num,
+                        profile_fn=profile_fn,
+                        plan_branch=repair_plan,
+                        fixer_mode=True,
+                        feedback=feedback,
+                    )
+                )
         return list(await asyncio.gather(*tasks))
 
     async def _refine_single_beam(
@@ -691,229 +843,69 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         parent: 'KernelCandidate',
         round_num: int,
         profile_fn=None,
+        plan_branch: dict | None = None,
+        fixer_mode: bool = False,
+        feedback=None,
     ) -> 'KernelCandidate':
-        """Multi-turn refinement with tool use.
-
-        Single conversation where the model sees profiler data AND code,
-        reasons about the bottleneck, and calls submit_kernel to compile/profile.
-        If it fails or regresses, it sees the error and can fix+resubmit
-        (up to MAX_INNER_TURNS).
-
-        Returns a fully profiled KernelCandidate (best from inner loop).
-        """
         metrics = parent.metrics or {}
-        prev_metrics = parent.prev_metrics
-        has_fresh_data = bool(prev_metrics) and prev_metrics != metrics
-
-        # Build profiler observation — always show CURRENT best's SASS profile
-        # so the model knows what's left to optimize in the kernel it's refining
-        if has_fresh_data:
-            profile_section = _format_profile_section(metrics, round_num)
-            ineffective, ineff_lines = _compute_proven_ineffective(prev_metrics, metrics)
-            delta_section = _format_delta_section(metrics, prev_metrics,
-                                                  title="How Current Best Improved vs Previous")
-            if ineff_lines:
-                dead_ends = "\n### Proven Non-Bottlenecks (do NOT optimize these)\n"
-                dead_ends += "\n".join(f"- {l}" for l in ineff_lines)
-            else:
-                dead_ends = ""
-        else:
-            profile_section = _format_profile_section(metrics, round_num)
-            delta_section = ""
-            dead_ends = ""
-
-        last_error_section = _format_last_error_section(parent)
-        react_trace = _format_react_trace(parent)
-        strat_ctx = getattr(parent, 'strategy_context', '')
-        strat_name = parent.strategy.split("_r")[0]
-
-        logger.info("Refining [%s_r%d]: compile=%s correct=%s speedup=%.3fx",
-                     parent.strategy, round_num, parent.compile_ok,
-                     parent.correct, parent.speedup)
-
-        # Build observation block
-        obs_parts = [profile_section]
-        if delta_section:
-            obs_parts.append(delta_section)
-        if dead_ends:
-            obs_parts.append(dead_ends)
-        if last_error_section:
-            obs_parts.append(last_error_section)
-        observation = "\n".join(p for p in obs_parts if p)
-
-        # Build initial prompt: profiler data + code in ONE message
-        prompt_parts = []
-
-        # When above baseline, drop the stale Round 0 strategy direction.
-        # It conflicts with the system prompt's "instruction-level only" constraint.
-        # e.g., strategy_context="use shared memory" causes the model to do structural
-        # changes even though SASS says the bottleneck is FADD/FMUL fusion.
-        if strat_ctx and parent.speedup < 1.0:
-            prompt_parts.append(
-                f"You are beam \"{strat_name}\" optimizing a CUDA kernel.\n"
-                f"Direction: {strat_ctx}")
-        else:
-            prompt_parts.append(
-                f"You are beam \"{strat_name}\" optimizing a CUDA kernel.")
-
-        if has_fresh_data:
-            last_spd = prev_metrics.get("speedup", 0)
-            prompt_parts.append(
-                f"Best so far: {parent.speedup:.3f}x. Last attempt: {last_spd:.3f}x.")
-        else:
-            prompt_parts.append(f"Current: {parent.speedup:.3f}x.")
-
-        if react_trace:
-            prompt_parts.append(react_trace)
-
-        prompt_parts.append(f"Observation:\n{observation}")
-
-        # Code + launch signature — model sees BOTH data and code
-        base_code = parent.best_code or parent.code
-        base_speedup = parent.best_speedup or parent.speedup
         launch_sig = _get_launch_signature(self.env.kernel_type)
-        prompt_parts.append(
-            f"Current kernel ({base_speedup:.3f}x):\n```cuda\n{base_code}\n```"
-            f"\n\n{launch_sig}")
+        base_code = parent.best_code or parent.code
+        plan_branch = dict(plan_branch or parent.plan_branch or {})
+        plan_branch.setdefault("parent_strategy", parent.strategy)
+        branch_name = plan_branch.get("name", "repair")
+        strategy_name = f"{parent.strategy}__{branch_name}_r{round_num}"
 
-        prompt_parts.append(
-            "Make ONE targeted change per submission so you can measure its impact. "
-            "Do not bundle multiple unrelated optimizations.\n\n"
-            "Before calling submit_kernel, explain:\n"
-            "1. What single change you are making and why you expect it to help.\n\n"
-            "Then call submit_kernel with your complete .cu file.")
+        if feedback is None:
+            feedback = build_sandbox_feedback(
+                {
+                    "compile_ok": parent.compile_ok,
+                    "correct": parent.correct,
+                    "speedup": parent.speedup,
+                    "metrics": parent.metrics,
+                    "error": parent.compile_error,
+                },
+                parent_speedup=parent.speedup,
+                prev_inner_metrics=parent.prev_metrics,
+                kernel_type=self.env.kernel_type,
+            )
 
-        initial_prompt = "\n\n".join(prompt_parts)
-        logger.info("REFINE PROMPT [%s]: %d chars", parent.strategy, len(initial_prompt))
-
-        # ── Multi-turn tool-use conversation ──────────────────────────────
-        messages = [{"role": "user", "content": initial_prompt}]
-        best = None              # best KernelCandidate from inner loop
-        last_error = ""
-        prev_inner_metrics = metrics  # initialize to parent metrics for turn 0 deltas
-        submit_count = 0
-        max_api_turns = MAX_INNER_TURNS + 4  # extra turns for non-submit tools
-
-        for turn in range(max_api_turns):
-            if submit_count >= MAX_INNER_TURNS:
-                break
-            try:
-                system_prompt = _build_refine_system_prompt(parent.speedup, prev_inner_metrics)
-                response = await self._call_llm_with_tools_async(
-                    messages=messages,
-                    tools=ALL_TOOLS,
-                    model=self.sub_model,
-                    system=system_prompt,
-                    temperature=0.4,
-                )
-            except RuntimeError as e:
-                logger.error("Budget exceeded refine %s turn %d: %s",
-                             parent.strategy, turn, e)
-                break
-
-            # Extract and log model's reasoning/thoughts
-            text_blocks = [b.text for b in response.content if hasattr(b, 'text') and b.text.strip()]
-            if text_blocks:
-                reasoning = "\n".join(text_blocks)
-                logger.info("\n🧠 MODEL THOUGHTS [%s turn %d]:\n%s\n", parent.strategy, turn, reasoning)
-
-            # Append assistant message to conversation history
-            messages.append({"role": "assistant", "content": response.content})
-
-            # Handle all tool calls
-            submit_code, submit_block_id, aux_results = self._handle_tool_calls(
-                response, messages, profile_fn, parent.strategy, round_num,
-                parent.speedup, prev_inner_metrics)
-
-            # If only auxiliary tools were called, send results and continue
-            if submit_code is None and not submit_block_id:
-                if not aux_results:
-                    has_any_tool = any(b.type == "tool_use" for b in response.content)
-                    if not has_any_tool:
-                        text_parts = [b.text for b in response.content
-                                      if hasattr(b, 'text')]
-                        logger.info("REFINE [%s] turn %d: no tool call: %s",
-                                    parent.strategy, turn,
-                                    " ".join(text_parts)[:200])
-                        break
-                if aux_results:
-                    messages.append({"role": "user", "content": aux_results})
-                continue
-
-            if submit_code is None:
-                # submit_kernel with empty code — error in aux_results
-                if aux_results:
-                    messages.append({"role": "user", "content": aux_results})
-                continue
-
-            submit_count += 1
-
-            # Profile the submission via callback
-            if profile_fn:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, profile_fn, submit_code, parent.strategy, round_num)
-            else:
-                result = {"compile_ok": False, "correct": False, "speedup": 0,
-                          "metrics": {}, "error": "No profiler available",
-                          "bottleneck": "unknown"}
-
-            # Feed result back — merge aux results + submit result into ONE message
-            tool_result_text = self._format_tool_result(
-                result, parent.speedup, prev_inner_metrics)
-            if result["compile_ok"] and result["correct"] and result.get("metrics"):
-                prev_inner_metrics = result["metrics"]
-            all_results = list(aux_results) + [
-                {"type": "tool_result", "tool_use_id": submit_block_id,
-                 "content": tool_result_text}
-            ]
-            messages.append({"role": "user", "content": all_results})
-
-            logger.info("\n📊 FEEDBACK QUALITY DELIVERED [%s submit %d]:\n%s\n", parent.strategy, submit_count, tool_result_text)
-
-            new_spd = result.get("speedup", 0)
-            delta = new_spd - parent.speedup
-            logger.info("📈 IMPROVEMENT TRACKER [%s submit %d]: compile=%s correct=%s | Base=%.3fx -> New=%.3fx (Delta: %+.3fx)",
-                         parent.strategy, submit_count,
-                         result["compile_ok"], result["correct"],
-                         parent.speedup, new_spd, delta)
-
-            # Track best viable result
-            if result["compile_ok"] and result["correct"]:
-                if best is None or result["speedup"] > best.speedup:
-                    best = KernelCandidate(
-                        code=submit_code,
-                        strategy=f"{parent.strategy}_r{round_num}",
-                        round_num=round_num,
-                        compile_ok=True,
-                        correct=True,
-                        speedup=result["speedup"],
-                        metrics=result.get("metrics", {}),
-                        bottleneck=result.get("bottleneck", "unknown"),
-                        prev_metrics=parent.metrics,
-                    )
-                    best.strategy_context = strat_ctx
-                    text_parts = [b.text for b in response.content
-                                  if hasattr(b, 'text')]
-                    best.strategy_desc = (
-                        " ".join(text_parts)[:300] if text_parts else "")
-            else:
-                last_error = result.get("error", "")
-
-        # Return best viable candidate, or a failure
-        if best:
-            return best
-
-        failed = KernelCandidate(
-            code="",
-            strategy=f"{parent.strategy}_r{round_num}",
-            round_num=round_num,
-            compile_ok=False,
-            prev_metrics=parent.metrics,
+        rag_queries = plan_branch.get("rag_queries") or feedback.rag_queries
+        rag_context = self._search_pinecone_context(
+            rag_queries or [f"{self.env.kernel_type} {branch_name} CUDA optimization"]
         )
-        failed.compile_error = last_error or "All inner refinement attempts failed"
-        failed.strategy_context = strat_ctx
-        failed.strategy_desc = ""
-        return failed
+
+        if fixer_mode:
+            initial_prompt = build_fixer_prompt(
+                plan_branch=plan_branch,
+                kernel_code=base_code,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                feedback_json=feedback.to_tool_result_json(),
+            )
+            model_id = self.fixer_model
+        else:
+            current_profile = _format_profile_section(metrics, round_num) if metrics else ""
+            initial_prompt = build_coder_prompt(
+                plan_branch=plan_branch,
+                kernel_code=base_code,
+                launch_signature=launch_sig,
+                rag_context=rag_context,
+                current_profile=current_profile,
+            )
+            model_id = self.sub_model
+
+        return await self._run_agent_loop(
+            initial_prompt=initial_prompt,
+            strategy_name=strategy_name,
+            round_num=round_num,
+            profile_fn=profile_fn,
+            model_id=model_id,
+            comparison_speedup=parent.speedup,
+            prev_inner_metrics=metrics,
+            strategy_context=plan_branch.get("change_summary") or plan_branch.get("what", ""),
+            plan_branch=plan_branch,
+            parent_candidate=parent,
+        )
 
     # ── Auxiliary tool handlers ────────────────────────────────────────────────
 
@@ -1063,6 +1055,22 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                         "content": doc_result,
                     })
 
+            elif block.name == "search_pinecone":
+                query = block.input.get("query", "")
+                top_k = block.input.get("top_k")
+                if not query:
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": "Error: empty query.", "is_error": True,
+                    })
+                else:
+                    logger.info("🧠 SEARCH_PINECONE [%s]: %s", strategy_name, query)
+                    matches = self.rag.search_many([query], top_k=top_k or 3)
+                    aux_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": self.rag.format_matches(matches),
+                    })
+
             elif block.name == "submit_kernel":
                 code = block.input.get("cuda_code", "")
                 if not code:
@@ -1076,65 +1084,6 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     submit_block_id = block.id
 
         return submit_code, submit_block_id, aux_results
-
-    def _format_tool_result(self, result: dict, parent_speedup: float,
-                            prev_inner_metrics: dict = None) -> str:
-        """Format profiling result as tool_result content for the model.
-
-        Follows Anthropic guidance: error responses must communicate specific
-        and actionable improvements, success responses include delta + suggestions.
-        """
-        if not result["compile_ok"]:
-            error = result.get("error", "Unknown compilation error")
-            # Extract first actionable error line from nvcc output
-            lines = error.split('\n')
-            error_lines = [l for l in lines if 'error' in l.lower()
-                           and ('(' in l or ':' in l)]
-            if error_lines:
-                first = error_lines[0].strip()
-                return (f"COMPILE ERROR: {first}\n\n"
-                        f"Full output ({len(error_lines)} error(s)):\n"
-                        f"{error[:500]}")
-            return f"COMPILE ERROR:\n{error[:600]}"
-
-        if not result["correct"]:
-            error = result.get("error", "Output mismatch (atol=1e-2)")
-            return f"CORRECTNESS FAILURE: {error[:400]}"
-
-        # Viable — verdict + delta + suggestions (no code echo)
-        metrics = result.get("metrics", {})
-        speedup = result.get("speedup", 0)
-
-        if parent_speedup <= 0:
-            above = "above" if speedup >= 1.0 else "below"
-            verdict = f"FIRST RESULT: {speedup:.3f}x ({above} FlashInfer baseline)"
-        elif speedup > parent_speedup:
-            verdict = f"IMPROVED: {speedup:.3f}x (was {parent_speedup:.3f}x)"
-        elif speedup < parent_speedup:
-            verdict = f"REGRESSION: {speedup:.3f}x (was {parent_speedup:.3f}x) — revert to your previous approach and make a smaller change"
-        else:
-            verdict = f"NO CHANGE: {speedup:.3f}x"
-
-        parts = [verdict]
-
-        # Always show full profiler snapshot (includes SASS instruction breakdown)
-        parts.append(_format_profile_section(metrics, 0))
-
-        # Also show delta from previous submission so model sees what changed
-        if prev_inner_metrics:
-            delta = _format_delta_section(
-                metrics, prev_inner_metrics,
-                title="Changes from Previous Submission")
-            if delta:
-                parts.append(delta)
-
-        # Data-driven suggestions for remaining bottlenecks
-        suggestions = _format_suggestions_section(
-            metrics, kernel_type=self.env.kernel_type)
-        if suggestions:
-            parts.append(suggestions)
-
-        return "\n".join(parts)
 
     # ── Combination step ──────────────────────────────────────────────────────
 

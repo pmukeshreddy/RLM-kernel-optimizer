@@ -1,6 +1,9 @@
 # RLM Beam Search Configuration
 
 models:
+  planner_model: "claude-sonnet-4-6"      # planner agent
+  coder_model: "claude-sonnet-4-6"        # code generation agent
+  fixer_model: "claude-sonnet-4-6"        # repair agent for compile/below-baseline failures
   root_model: "claude-sonnet-4-6"         # decomposition
   sub_model: "claude-sonnet-4-6"          # codegen
   combine_model: "claude-sonnet-4-6"      # combination
@@ -11,6 +14,8 @@ beam:
   max_sub_calls_per_round: 2  # cap recursive depth
   combine_top_k: 2            # merge top-K into final
   diversity_mode: "bottleneck_cluster"  # cluster-based pruning
+  tree_speedup_threshold: 1.0 # once a branch clears baseline, expand it via planner tree
+  tree_branching_factor: 2    # child branches created from above-baseline parents
 
 strategies:
   enabled:
@@ -45,6 +50,20 @@ cost_control:
 
 target:
   min_speedup: 1.5               # target speedup over baseline
+
+rag:
+  provider: "pinecone"
+  top_k: 4
+  namespace_env: "PINECONE_NAMESPACE"
+  api_key_env: "PINECONE_API_KEY"
+  index_host_env: "PINECONE_INDEX_HOST"
+  text_field: "chunk_text"
+  title_field: "title"
+  source_field: "source"
+  fields:
+    - "chunk_text"
+    - "title"
+    - "source"
 
 eval:
   correctness_atol: 1e-2
