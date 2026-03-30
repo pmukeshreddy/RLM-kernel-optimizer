@@ -1,0 +1,279 @@
+"""
+hybrid_profiler.py — Lightweight profiler using CUDA Events + Occupancy API.
+
+Real data sources:
+  1. CUDA Event timing   -> duration_us, speedup  (measured by benchmark harness)
+  2. CUDA Occupancy API  -> sm_occupancy (compiled query program)
+  3. Theoretical occupancy fallback (from register count + block size + shared mem)
+  4. Compiler metrics     -> registers, spills, smem (from nvcc -Xptxas -v)
+  5. SASS instruction mix -> from cuobjdump -sass (via CompilerMetrics)
+  6. Roofline math        -> mem_throughput_pct (from timing + transfer bytes)
+"""
+
+from __future__ import annotations
+import logging
+import math
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+from .metrics import KernelMetrics, CompilerMetrics
+
+logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
+# ── Helper ────────────────────────────────────────────────────────────────
+
+def _estimate_shared_memory(kernel_src: str) -> int:
+    """Estimate shared memory usage from __shared__ declarations."""
+    total = 0
+    type_sizes = {
+        "float": 4, "double": 8, "int": 4, "unsigned": 4,
+        "half": 2, "__half": 2, "__nv_bfloat16": 2,
+        "float4": 16, "float2": 8, "int4": 16,
+        "char": 1, "uint8_t": 1, "int8_t": 1,
+        "uint32_t": 4, "int32_t": 4, "uint16_t": 2,
+    }
+    for m in re.finditer(r'__shared__\s+(\w+)\s+\w+\[([^\]]+)\]', kernel_src):
+        dtype, size_expr = m.group(1), m.group(2).strip()
+        elem_size = type_sizes.get(dtype, 4)
+        try:
+            total += int(size_expr) * elem_size
+        except ValueError:
+            total += 1024 * elem_size
+    if "extern __shared__" in kernel_src:
+        total = max(total, 4096)
+    return total
+
+
+# ── Main Profiler Class ───────────────────────────────────────────────────
+
+class HybridProfiler:
+    """
+    Computes kernel metrics from real data sources.
+
+    Returns: timing, speedup, SM occupancy, mem_throughput_pct, and compiler/SASS metrics.
+    """
+
+    def __init__(self, config: dict, hw_spec: dict):
+        self.config = config
+        self.hw_spec = hw_spec
+
+        sm = hw_spec.get("sm", {})
+        mem = hw_spec.get("memory", {})
+
+        self.sm_count = sm.get("count", 148)
+        self.max_warps_per_sm = sm.get("max_warps_per_sm", 64)
+        self.max_blocks_per_sm = sm.get("max_blocks_per_sm", 32)
+        self.warp_size = sm.get("warp_size", 32)
+        self.max_threads_per_sm = sm.get("max_threads_per_sm", 2048)
+        self.shared_mem_per_sm = mem.get("shared_memory_per_sm_kb", 228) * 1024
+
+        self.nvcc = "nvcc"
+        self.cuda_arch = "sm_100a"
+        self.nvcc_flags = [
+            "-O3", f"-arch={self.cuda_arch}", "--use_fast_math", "-std=c++17",
+            f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
+            f"-I{PROJECT_ROOT}",
+        ]
+
+    # ── Main Entry Point ───────────────────────────────────────────────────
+
+    def profile(
+        self,
+        kernel_src: str,
+        timing_us: float,
+        kernel_type: str,
+        problem_shape: tuple,
+        baseline_us: float = 0.0,
+        compiler_metrics: Optional[CompilerMetrics] = None,
+    ) -> Optional[KernelMetrics]:
+        if timing_us <= 0:
+            return None
+
+        cm = compiler_metrics or CompilerMetrics()
+
+        # ── 1. Occupancy (real from CUDA API, or theoretical fallback) ────
+        block_size, shared_mem = self._parse_launch_config(kernel_src)
+        if cm.static_smem_bytes > 0:
+            shared_mem = cm.static_smem_bytes
+
+        gpu_occupancy = self._query_occupancy_from_binary(kernel_src, block_size, shared_mem)
+        if gpu_occupancy is None:
+            gpu_occupancy = self._compute_theoretical_occupancy(
+                block_size, shared_mem, cm.registers_per_thread
+            )
+
+        # ── 2. Speedup ───────────────────────────────────────────────────
+        speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 1.0
+
+        # ── 3. Compute mem_throughput_pct from roofline math ────────────
+        mem_throughput_pct = 0.0
+        peak_bw_tbs = self.hw_spec.get("memory", {}).get("hbm_bandwidth_tbs", 8.0)
+        total_bytes = self._estimate_transfer_bytes(kernel_type, problem_shape)
+        if total_bytes > 0 and timing_us > 0:
+            achieved_bw = total_bytes / timing_us / 1e6  # TB/s
+            mem_throughput_pct = achieved_bw / peak_bw_tbs * 100
+
+        # ── 4. Build KernelMetrics ────────────────────────────────────────
+        metrics = KernelMetrics(
+            sm_occupancy=round(gpu_occupancy, 2),
+            achieved_occupancy=round(gpu_occupancy * self.max_warps_per_sm / 100.0, 2),
+            duration_us=timing_us,
+            speedup=speedup,
+            mem_throughput_pct=round(mem_throughput_pct, 2),
+        )
+
+        # Attach compiler metrics for the reflection prompt
+        metrics._compiler_metrics = cm
+
+        # ── 5. Log real data ──────────────────────────────────────────────
+        log_parts = [
+            f"occ={gpu_occupancy:.1f}%",
+            f"timing={timing_us:.1f}us",
+            f"speedup={speedup:.3f}x",
+            f"mem_bw={mem_throughput_pct:.1f}%",
+        ]
+        if cm.registers_per_thread > 0:
+            log_parts.append(f"regs={cm.registers_per_thread}")
+        if cm.has_spills:
+            log_parts.append(f"SPILLS={cm.spill_stores_bytes}B")
+        if cm.sass_total_instructions > 0:
+            log_parts.append(f"sass={cm.sass_total_instructions}")
+            log_parts.append(f"vec_ld%={cm.vectorized_load_pct:.0f}")
+
+        logger.info("Hybrid profiler: %s", " ".join(log_parts))
+        return metrics
+
+    # ── Transfer Bytes Estimation ─────────────────────────────────────────
+
+    @staticmethod
+    def _estimate_transfer_bytes(kernel_type: str, problem_shape: tuple) -> int:
+        """Estimate total HBM bytes transferred (same math as get_roofline_feedback)."""
+        if kernel_type == "add_rmsnorm":
+            rows, hidden = problem_shape
+            n = rows * hidden
+            return n * 2 + n * 2 + hidden * 2 + n * 2 + n // 2 + n // 16 + n * 2
+        elif kernel_type == "silu_mul":
+            n = problem_shape[0] * problem_shape[1] * problem_shape[2] if len(problem_shape) == 3 else problem_shape[0]
+            return n * 2 * 2 + n // 2 + n // 16
+        elif kernel_type == "nvfp4_quantize":
+            n = problem_shape[0] * problem_shape[1] if len(problem_shape) == 2 else problem_shape[0]
+            return n * 2 + n // 2 + n // 16
+        return 0
+
+    # ── Launch Config Parsing ──────────────────────────────────────────────
+
+    def _parse_launch_config(self, kernel_src: str) -> tuple[int, int]:
+        """Extract block size and shared memory from kernel source."""
+        launch = re.search(
+            r'<<<\s*[^,]+,\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*\w+)?\s*>>>', kernel_src
+        )
+        if launch:
+            block_size = int(launch.group(1))
+            shared_mem = int(launch.group(2)) if launch.group(2) else 0
+            return block_size, shared_mem
+
+        dim3 = re.search(r'dim3\s+\w+\s*\(\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:,\s*(\d+))?\s*\)', kernel_src)
+        if dim3:
+            x = int(dim3.group(1))
+            y = int(dim3.group(2)) if dim3.group(2) else 1
+            z = int(dim3.group(3)) if dim3.group(3) else 1
+            return x * y * z, 0
+
+        block_def = re.search(
+            r'(?:#define\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|BLOCK_DIM)\s+(\d+))|'
+            r'(?:constexpr\s+int\s+(?:BLOCK_SIZE|THREADS_PER_BLOCK|NUM_THREADS|kBlockSize)\s*=\s*(\d+))',
+            kernel_src
+        )
+        block_size = int(block_def.group(1) or block_def.group(2)) if block_def else 256
+        shared_mem = _estimate_shared_memory(kernel_src)
+        return block_size, shared_mem
+
+    # ── Occupancy ──────────────────────────────────────────────────────────
+
+    def _query_occupancy_from_binary(
+        self, kernel_src: str, block_size: int, shared_mem: int
+    ) -> Optional[float]:
+        """Query real occupancy via CUDA API (accounts for register pressure)."""
+        global_funcs = re.findall(r'__global__\s+void\s+(\w+)\s*\(', kernel_src)
+        if not global_funcs:
+            return None
+
+        kernel_name = global_funcs[0]
+        query_src = f"""
+{kernel_src}
+
+#include <cstdio>
+#include <cuda_runtime.h>
+
+int main() {{
+    int num_blocks = 0;
+    int block_size = {block_size};
+    size_t shared_mem = {shared_mem};
+
+    cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, {kernel_name}, block_size, shared_mem);
+
+    if (err != cudaSuccess) {{
+        printf("occ_error\\n");
+        return 1;
+    }}
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int warps_per_block = (block_size + prop.warpSize - 1) / prop.warpSize;
+    int active_warps = num_blocks * warps_per_block;
+    int max_warps = prop.maxThreadsPerMultiProcessor / prop.warpSize;
+    float occupancy = (float)active_warps / (float)max_warps * 100.0f;
+
+    printf("occ_pct: %.2f\\n", occupancy);
+    printf("active_blocks: %d\\n", num_blocks);
+    return 0;
+}}
+"""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
+                f.write(query_src)
+                src_path = f.name
+            bin_path = src_path.replace(".cu", "_occ")
+            comp = subprocess.run(
+                [self.nvcc] + self.nvcc_flags + [src_path, "-o", bin_path],
+                capture_output=True, text=True, timeout=60,
+            )
+            if comp.returncode != 0:
+                logger.debug("Occupancy query compilation failed: %s", comp.stderr[:200])
+                return None
+            run = subprocess.run([bin_path], capture_output=True, text=True, timeout=10)
+            if run.returncode != 0:
+                return None
+            match = re.search(r"occ_pct:\s*([\d.]+)", run.stdout)
+            if match:
+                occ = float(match.group(1))
+                logger.info("CUDA Occupancy API: %.1f%%", occ)
+                return occ
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("Occupancy query failed: %s", e)
+        return None
+
+    def _compute_theoretical_occupancy(
+        self, block_size: int, shared_mem: int, registers_per_thread: int = 0
+    ) -> float:
+        warps_per_block = math.ceil(block_size / self.warp_size)
+        max_by_warps = self.max_warps_per_sm // warps_per_block if warps_per_block > 0 else 0
+        max_by_smem = int(self.shared_mem_per_sm / shared_mem) if shared_mem > 0 else self.max_blocks_per_sm
+
+        # Register-based occupancy limit (B200: 65536 registers per SM)
+        regs_per_sm = 65536
+        if registers_per_thread > 0:
+            regs_per_block = registers_per_thread * block_size
+            max_by_regs = regs_per_sm // regs_per_block if regs_per_block > 0 else self.max_blocks_per_sm
+        else:
+            max_by_regs = self.max_blocks_per_sm
+
+        active_blocks = min(max_by_warps, max_by_smem, max_by_regs, self.max_blocks_per_sm)
+        active_warps = active_blocks * warps_per_block
+        return min(100.0, max(0.0, active_warps / self.max_warps_per_sm * 100.0))
