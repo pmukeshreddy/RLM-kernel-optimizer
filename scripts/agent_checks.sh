@@ -16,6 +16,7 @@ usage() {
 Usage:
   scripts/agent_checks.sh pinecone [query]
   scripts/agent_checks.sh planner [kernel_name]
+  scripts/agent_checks.sh coder [kernel_name] [branch_index]
   scripts/agent_checks.sh sandbox [kernel_name] [beam_width] [rounds]
   scripts/agent_checks.sh tree [kernel_name] [beam_width] [rounds]
   scripts/agent_checks.sh all [kernel_name]
@@ -23,6 +24,7 @@ Usage:
 Examples:
   scripts/agent_checks.sh pinecone "rmsnorm vectorized stores register pressure cuda code"
   scripts/agent_checks.sh planner add_rmsnorm_fp4quant_b128xh2048
+  scripts/agent_checks.sh coder add_rmsnorm_fp4quant_b128xh2048 1
   scripts/agent_checks.sh sandbox add_rmsnorm_fp4quant_b128xh2048 1 1
   scripts/agent_checks.sh tree add_rmsnorm_fp4quant_b128xh2048 2 2
 EOF
@@ -76,6 +78,13 @@ finally:
 PY
 }
 
+coder_check() {
+  local branch_index="${3:-1}"
+  python3 scripts/coder_sandbox_check.py \
+    --kernel "$KERNEL" \
+    --branch-index "$branch_index"
+}
+
 sandbox_check() {
   local beam_width="${3:-1}"
   local rounds="${4:-1}"
@@ -116,6 +125,9 @@ all_check() {
   echo "===== PLANNER ====="
   planner_check
   echo
+  echo "===== CODER ====="
+  coder_check coder "$KERNEL" 1
+  echo
   echo "===== SANDBOX ====="
   sandbox_check sandbox "$KERNEL" 1 1
   echo
@@ -129,6 +141,9 @@ case "$MODE" in
     ;;
   planner)
     planner_check
+    ;;
+  coder)
+    coder_check "$@"
     ;;
   sandbox)
     sandbox_check "$@"
