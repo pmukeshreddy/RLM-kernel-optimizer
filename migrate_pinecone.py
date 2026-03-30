@@ -231,10 +231,7 @@ def main() -> int:
     logger.info("=== Step 3: Upserting %d records into %r ===", len(upsert_docs), args.new)
     for i in range(0, len(upsert_docs), args.upsert_batch):
         batch = upsert_docs[i : i + args.upsert_batch]
-        kwargs = {"records": batch}
-        if args.namespace:
-            kwargs["namespace"] = args.namespace
-        new_index.upsert_records(**kwargs)
+        new_index.upsert_records(args.namespace or "", batch)
         logger.info("  upserted %d / %d", min(i + args.upsert_batch, len(upsert_docs)), len(upsert_docs))
 
     # ── Step 4: print update instructions ────────────────────────────────
