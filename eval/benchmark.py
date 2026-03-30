@@ -140,13 +140,30 @@ class Benchmarker:
             print(kernel_src)
             print("=" * 80 + "\n")
 
+        cuda_cflags = [
+            "-O3",
+            "-arch=sm_100a",
+            "--use_fast_math",
+            "-std=c++17",
+            # PyTorch JIT may inject *_NO_HALF* / *_NO_BFLOAT16_* defines.
+            # Explicitly undefine them so bf16/half intrinsics match the direct nvcc path.
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+        ] + [f"-I{d}" for d in self.include_dirs]
+
+        logger.info(
+            "JIT extension compile: TORCH_CUDA_ARCH_LIST=%s flags=%s",
+            os.getenv("TORCH_CUDA_ARCH_LIST", "<unset>"),
+            " ".join(cuda_cflags),
+        )
+
         module = load_inline(
             name=mod_name,
             cuda_sources=[cuda_src],
             cpp_sources=[wrapper_code],
-            extra_cuda_cflags=[
-                "-O3", "-arch=sm_100a", "--use_fast_math", "-std=c++17",
-            ] + [f"-I{d}" for d in self.include_dirs],
+            extra_cuda_cflags=cuda_cflags,
             verbose=False,
         )
 
