@@ -65,6 +65,30 @@ class Benchmarker:
         n = int(l2_size * 3 / input_bytes) + 1
         return min(n, _MAX_L2_CYCLE_BUFS)
 
+    @staticmethod
+    def _cuda_harness_prelude() -> str:
+        return r"""
+#define CHECK_CUDA(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        return 2; \
+    } \
+} while (0)
+#define cudaMalloc(...) CHECK_CUDA(cudaMalloc(__VA_ARGS__))
+#define cudaMemcpy(...) CHECK_CUDA(cudaMemcpy(__VA_ARGS__))
+#define cudaMemset(...) CHECK_CUDA(cudaMemset(__VA_ARGS__))
+#define cudaFree(...) CHECK_CUDA(cudaFree(__VA_ARGS__))
+#define cudaStreamCreate(...) CHECK_CUDA(cudaStreamCreate(__VA_ARGS__))
+#define cudaStreamSynchronize(...) CHECK_CUDA(cudaStreamSynchronize(__VA_ARGS__))
+#define cudaDeviceSynchronize(...) CHECK_CUDA(cudaDeviceSynchronize())
+#define cudaEventCreate(...) CHECK_CUDA(cudaEventCreate(__VA_ARGS__))
+#define cudaEventRecord(...) CHECK_CUDA(cudaEventRecord(__VA_ARGS__))
+#define cudaEventElapsedTime(...) CHECK_CUDA(cudaEventElapsedTime(__VA_ARGS__))
+#define cudaEventDestroy(...) CHECK_CUDA(cudaEventDestroy(__VA_ARGS__))
+#define cudaDeviceGetAttribute(...) CHECK_CUDA(cudaDeviceGetAttribute(__VA_ARGS__))
+"""
+
     def _input_bytes(self, shape: tuple) -> int:
         """Compute input bytes for L2 cycling calculation."""
         if self.kernel_type == "add_rmsnorm":
@@ -381,10 +405,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             exe = Path(tmpdir) / "bench"
             src.write_text(combined)
             cmd = ["nvcc"] + nvcc_flags + [str(src), "-o", str(exe)]
-            r   = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning("Benchmark compile timed out after 120s for shape %s", shape)
+                return None
             if r.returncode != 0:
                 return None
-            r2     = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            try:
+                r2 = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                logger.warning("Benchmark run timed out after 60s for shape %s", shape)
+                return None
             output = r2.stdout
             if "TIMING_ANOMALY" in output:
                 logger.warning("Timing anomaly detected (event/wall ratio > 1.5x): %s",
@@ -408,16 +440,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         return f"""
     // Warmup with L2 cycling
     for(int i=0;i<{warmup};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
     cudaStreamSynchronize(s);
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0,s);
     for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
     cudaEventRecord(t1,s); cudaStreamSynchronize(s);
     float ms_event=0; cudaEventElapsedTime(&ms_event,t0,t1);
     float us_event=ms_event*1000.f/{iters};
     cudaDeviceSynchronize();
     struct timespec ts0,ts1; clock_gettime(CLOCK_MONOTONIC,&ts0);
     for(int i=0;i<{iters};++i) {{ int buf_idx = i % nbufs; {launch_call_indexed} }}
+    CHECK_CUDA(cudaGetLastError());
     cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC,&ts1);
     double wall_ns=(ts1.tv_sec-ts0.tv_sec)*1e9+(ts1.tv_nsec-ts0.tv_nsec);
     float us_wall=(float)(wall_ns/1000.0/{iters});
@@ -456,6 +491,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+{self._cuda_harness_prelude()}
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
@@ -494,6 +530,7 @@ int main() {{
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+{self._cuda_harness_prelude()}
 void launch_silu_mul_fp4quant(
     const __nv_bfloat16*, const __nv_bfloat16*,
     uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
@@ -529,6 +566,7 @@ int main() {{
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+{self._cuda_harness_prelude()}
 void launch_nvfp4_quantize_bf16(
     const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main() {{
@@ -555,7 +593,7 @@ int main() {{
         speedups = []
         for shape, baseline in baseline_us_per_shape.items():
             t_us = self._compile_and_time(kernel_src, shape)
-            if t_us is not None:
+            if t_us is not None and baseline and baseline > 0:
                 speedup = baseline / t_us
                 speedups.append(speedup)
                 results[shape] = {"timing_us": t_us, "speedup": speedup, "baseline_us": baseline}

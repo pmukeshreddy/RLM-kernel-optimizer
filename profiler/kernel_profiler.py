@@ -72,7 +72,11 @@ class KernelProfiler:
         cmd = [self.nvcc] + self.nvcc_flags + ["-Xptxas", "-v", str(kernel_file), "-o", str(binary_file)]
         logger.info("Compiling: %s", " ".join(cmd[:4]) + " ...")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            logger.warning("Compilation timed out after 120s for %s", output_name)
+            return False, "Compilation timed out after 120s", binary_file, None
         if result.returncode != 0:
             error_lines = [l for l in result.stderr.splitlines()
                            if not l.strip().startswith("ptxas info")
@@ -158,10 +162,14 @@ class KernelProfiler:
         """Run binary, parse 'timing_us: <float>' from stdout. Returns microseconds."""
         if not binary_path.exists():
             return None
-        result = subprocess.run(
-            [str(binary_path), f"--warmup={warmup}", f"--iters={iters}"],
-            capture_output=True, text=True, timeout=120,
-        )
+        try:
+            result = subprocess.run(
+                [str(binary_path), f"--warmup={warmup}", f"--iters={iters}"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("Benchmark timed out after 120s: %s", binary_path)
+            return None
         if result.returncode != 0:
             logger.error("Benchmark failed: %s", result.stderr[:200])
             return None
@@ -192,7 +200,7 @@ class KernelProfiler:
         if timing_us is None:
             return True, None, 0.0
 
-        speedup = baseline_us / timing_us if timing_us > 0 else 0.0
+        speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
         metrics = self.profile(
             binary, report_name=name,
             kernel_src=kernel_src, kernel_type=kernel_type,

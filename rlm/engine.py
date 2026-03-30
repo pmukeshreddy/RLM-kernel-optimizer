@@ -33,6 +33,10 @@ from .reflector import (
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent
+ALLOWED_READ_ROOTS = (
+    (PROJECT_ROOT / "kernels" / "common").resolve(),
+    (PROJECT_ROOT / "kernels" / "reference").resolve(),
+)
 
 
 # ── Refinement: tool-use agent loop ────────────────────────────────────────
@@ -204,19 +208,22 @@ class RLMEngine:
     def __init__(self, env: RLMEnvironment):
         self.env = env
         cfg = env.search_config
+        self.beam_width    = cfg["beam"]["width"]
+        self.refine_rounds = cfg["beam"]["refine_rounds"]
         # Sync client for root/combine calls (sequential); async client for parallel beams
         self.client       = anthropic.Anthropic()
         self.async_client = AsyncAnthropic(max_retries=10)
-        # Limit concurrent API calls to avoid 429 rate-limit errors
-        self._api_semaphore = asyncio.Semaphore(2)
+        max_concurrent_api_calls = int(
+            cfg["beam"].get("max_concurrent_api_calls", max(2, min(self.beam_width, 4)))
+        )
+        # Limit concurrent API calls to avoid 429s without artificially serializing the beam.
+        self._api_semaphore = asyncio.Semaphore(max(1, max_concurrent_api_calls))
         self._loop = None  # persistent event loop for async calls
 
         self.root_model    = cfg["models"].get("planner_model", cfg["models"]["root_model"])
         self.sub_model     = cfg["models"].get("coder_model", cfg["models"]["sub_model"])
         self.fixer_model   = cfg["models"].get("fixer_model", cfg["models"]["sub_model"])
         self.combine_model = cfg["models"]["combine_model"]
-        self.beam_width    = cfg["beam"]["width"]
-        self.refine_rounds = cfg["beam"]["refine_rounds"]
         self.combine_top_k = cfg["beam"]["combine_top_k"]
         self.tree_speedup_threshold = float(cfg["beam"].get("tree_speedup_threshold", 1.0))
         self.tree_branching_factor = int(cfg["beam"].get("tree_branching_factor", 2))
@@ -322,6 +329,13 @@ class RLMEngine:
 
     def _planner_baseline_context(self) -> str:
         env = self.env
+        ops = env.count_memory_ops()
+        missing = env.detect_missing_optimizations()
+        analysis = (
+            f"  Source signals: loads={ops['loads']} stores={ops['stores']} "
+            f"float4={ops['float4']} tma={ops['tma']} syncthreads={ops['syncthreads']} shfl={ops['shfl']}\n"
+            f"  Preferred search surfaces: {', '.join(missing[:5]) if missing else 'none singled out from source analysis'}\n"
+        )
         if env.baseline_naive_us and env.baseline_us_reported:
             rows = env.problem_shapes[0][0]
             sm_count = env.hw_spec.get("sm", {}).get("count", 148)
@@ -335,8 +349,12 @@ class RLMEngine:
                 f"  Compiler: {cm_str}\n"
                 f"  Grid: {rows} blocks launched on {sm_count} SMs"
                 f"{' — some SMs get zero work' if rows < sm_count else ''}\n"
+                f"{analysis}"
             )
-        return "BASELINE PROFILER DATA: unavailable — analyze kernel source and retrieved production patterns.\n"
+        return (
+            "BASELINE PROFILER DATA: unavailable — analyze kernel source and retrieved production patterns.\n"
+            f"{analysis}"
+        )
 
     def _search_pinecone_context(self, queries: list[str], top_k: int = 3) -> str:
         clean_queries = [q.strip() for q in queries if q and q.strip()]
@@ -350,7 +368,7 @@ class RLMEngine:
         shape = "x".join(str(dim) for dim in env.problem_shapes[0])
         operation = _kernel_operation_phrase(env.kernel_type)
         aliases = ", ".join(_kernel_aliases(env.kernel_type)[:4])
-        return [
+        queries = [
             (
                 f"Operation: {operation}. "
                 f"Shape: {shape}. Aliases: {aliases}. Need: production CUDA kernel source_code."
@@ -359,6 +377,9 @@ class RLMEngine:
             f"{operation} best production kernel B200 bf16 fp4 source code",
             f"{operation} vectorized loads stores bf16 fp4 CUDA source code",
         ]
+        for hint in env.detect_missing_optimizations()[:2]:
+            queries.append(f"{operation} {hint.replace('_', ' ')} CUDA source code")
+        return queries
 
     def _expand_tree_plans(self, parent: KernelCandidate, branch_count: int | None = None) -> list[dict]:
         branch_count = int(branch_count or self.tree_branching_factor)
@@ -745,13 +766,19 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                 s, kernel_slice, current_metrics, round_num, profile_fn)
             for s in strategies
         ]
-        return list(await asyncio.gather(*tasks))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            result if not isinstance(result, Exception)
+            else self._beam_exception_candidate(strategy, round_num, result)
+            for strategy, result in zip(strategies, results)
+        ]
 
     # ── Refinement: multi-turn tool-use loop ─────────────────────────────────
 
     async def refine_beams(self, survivors: list, round_num: int,
                            profile_fn=None) -> list:
         tasks = []
+        fallbacks = []
         for candidate in survivors:
             if candidate.compile_ok and candidate.correct:
                 branch_count = (
@@ -762,6 +789,9 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                 )
                 followup_plans = self._expand_tree_plans(candidate, branch_count=branch_count)
                 for child_plan in followup_plans:
+                    fallbacks.append(
+                        self._refine_exception_candidate(candidate, round_num, child_plan)
+                    )
                     tasks.append(
                         self._refine_single_beam(
                             candidate,
@@ -806,7 +836,63 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                         feedback=feedback,
                     )
                 )
-        return list(await asyncio.gather(*tasks))
+                fallbacks.append(
+                    self._refine_exception_candidate(
+                        candidate,
+                        round_num,
+                        {
+                            "name": f"{candidate.strategy}_repair",
+                            "parent_strategy": candidate.strategy,
+                        },
+                    )
+                )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        refined = []
+        for fallback, result in zip(fallbacks, results):
+            if isinstance(result, Exception):
+                fallback.compile_error = f"Refinement task failed: {result}"
+                refined.append(fallback)
+            else:
+                refined.append(result)
+        return refined
+
+    def _beam_exception_candidate(self, strategy, round_num: int, exc: Exception) -> KernelCandidate:
+        plan_branch = strategy if isinstance(strategy, dict) else {}
+        strategy_name = plan_branch.get("name") if isinstance(plan_branch, dict) else str(strategy)
+        family = (
+            plan_branch.get("parent_strategy")
+            or plan_branch.get("name")
+            or strategy_name
+        )
+        return KernelCandidate(
+            code="",
+            strategy=strategy_name or "beam_failed",
+            round_num=round_num,
+            compile_ok=False,
+            compile_error=f"Beam generation failed: {exc}",
+            branch_family=(family or "").split("__", 1)[0],
+            plan_branch=plan_branch,
+        )
+
+    def _refine_exception_candidate(
+        self,
+        parent: KernelCandidate,
+        round_num: int,
+        plan_branch: dict | None = None,
+    ) -> KernelCandidate:
+        plan_branch = dict(plan_branch or {})
+        branch_name = plan_branch.get("name", "refine_failed")
+        return KernelCandidate(
+            code=parent.best_code or parent.code,
+            strategy=f"{parent.strategy}__{branch_name}_r{round_num}",
+            round_num=round_num,
+            speedup=0.0,
+            compile_ok=False,
+            correct=False,
+            branch_family=parent.branch_family or parent.strategy.split("__", 1)[0],
+            parent_strategy=parent.strategy,
+            plan_branch=plan_branch,
+        )
 
     async def _refine_single_beam(
         self,
@@ -882,31 +968,28 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     def _handle_read_file(self, path: str) -> str:
         """Read an allowed project file."""
-        ALLOWED_PREFIXES = [
-            "kernels/common/",
-            "kernels/reference/",
-        ]
-        # Normalize and validate
-        clean = path.strip().lstrip("/")
-        if not any(clean.startswith(p) for p in ALLOWED_PREFIXES):
+        clean = path.strip()
+        if not clean:
+            return "File path is required."
+
+        candidate_path = (PROJECT_ROOT / clean.lstrip("/")).resolve()
+        if not any(root == candidate_path or root in candidate_path.parents for root in ALLOWED_READ_ROOTS):
             return (f"Access denied: '{path}'. Allowed paths:\n"
                     "- kernels/common/nvfp4_utils.cuh\n"
                     "- kernels/common/b200_intrinsics.cuh\n"
                     "- kernels/reference/add_rmsnorm.cu\n"
                     "- kernels/reference/silu_mul.cu\n"
                     "- kernels/reference/nvfp4_quantize.cu")
-
-        full_path = PROJECT_ROOT / clean
-        if not full_path.exists():
+        if not candidate_path.exists():
             return f"File not found: {clean}"
         try:
-            content = full_path.read_text()
+            content = candidate_path.read_text()
             # Truncate very large files
             if len(content) > 12000:
                 content = content[:12000] + "\n... (truncated)"
             return content
         except Exception as e:
-            return f"Error reading {clean}: {e}"
+            return f"Error reading {candidate_path.relative_to(PROJECT_ROOT)}: {e}"
 
     def _handle_tool_calls(self, response, messages, profile_fn, strategy_name,
                            round_num, parent_speedup, prev_inner_metrics):
@@ -1057,6 +1140,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
         from AsyncAnthropic's httpx connection pool cleanup."""
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         return self._loop
 
     def close(self):

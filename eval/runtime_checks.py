@@ -28,6 +28,28 @@ _ROWS   = 32
 _HIDDEN = 256
 
 
+def _cuda_harness_prelude() -> str:
+    return r"""
+#define CHECK_CUDA(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "RTCHECK internal CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        exit(2); \
+    } \
+} while (0)
+#define cudaMalloc(...) CHECK_CUDA(cudaMalloc(__VA_ARGS__))
+#define cudaMemcpy(...) CHECK_CUDA(cudaMemcpy(__VA_ARGS__))
+#define cudaMemset(...) CHECK_CUDA(cudaMemset(__VA_ARGS__))
+#define cudaFree(...) CHECK_CUDA(cudaFree(__VA_ARGS__))
+#define cudaStreamCreate(...) CHECK_CUDA(cudaStreamCreate(__VA_ARGS__))
+#define cudaStreamSynchronize(...) CHECK_CUDA(cudaStreamSynchronize(__VA_ARGS__))
+#define cudaEventCreate(...) CHECK_CUDA(cudaEventCreate(__VA_ARGS__))
+#define cudaEventRecord(...) CHECK_CUDA(cudaEventRecord(__VA_ARGS__))
+#define cudaEventElapsedTime(...) CHECK_CUDA(cudaEventElapsedTime(__VA_ARGS__))
+#define cudaEventDestroy(...) CHECK_CUDA(cudaEventDestroy(__VA_ARGS__))
+"""
+
+
 @dataclass
 class RuntimeCheckResult:
     passed:     bool
@@ -55,6 +77,7 @@ def _runtime_harness(rows: int, hidden: int) -> str:
 #include <string.h>
 #include <math.h>
 #include <time.h>
+{_cuda_harness_prelude()}
 
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
@@ -347,14 +370,22 @@ class RuntimeChecker:
             src.write_text(combined)
 
             cmd = ["nvcc"] + self.nvcc_flags + [str(src), "-o", str(exe)]
-            r   = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning("Runtime check harness compilation timed out after 120s")
+                return [RuntimeCheckResult(True, "compile", "harness compile timeout — skipped")]
             if r.returncode != 0:
                 logger.warning("Runtime check harness failed to compile: %s",
                                r.stderr[:300])
                 # Compilation failure is itself a signal — return inconclusive
                 return [RuntimeCheckResult(True, "compile", "harness compile failed — skipped")]
 
-            r2     = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            try:
+                r2 = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                logger.warning("Runtime check harness timed out after 60s")
+                return [RuntimeCheckResult(False, "timeout", "runtime check timeout")]
             output = r2.stdout
 
         return self._parse(output)

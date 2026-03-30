@@ -11,7 +11,7 @@ def operational_intensity(metrics: KernelMetrics) -> float:
     total_bytes = metrics.dram_read_bytes + metrics.dram_write_bytes
     flops = metrics.inst_fp32 * 2 + metrics.inst_fp16
     if total_bytes <= 0:
-        return float("inf")
+        return 0.0
     return flops / total_bytes
 
 

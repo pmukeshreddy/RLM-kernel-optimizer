@@ -127,7 +127,11 @@ def optimize_kernel(
         baseline = benchmarker_tmp._compile_and_time(src_path.read_text(), shape)
         if baseline is None:
             logger.error("Cannot measure baseline for %s", name)
-            baseline = 1.0
+            return {
+                "kernel_name": name,
+                "status": "baseline_measurement_failed",
+                "metadata": {"official_baseline": False, "baseline_source": "reference_fallback_failed"},
+            }
         baseline_source = "reference_fallback"
         logger.info("Reference kernel baseline for %s: %.2f us", name, baseline)
 

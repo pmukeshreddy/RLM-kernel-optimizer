@@ -88,6 +88,6 @@ def metrics_from_dict(d: dict) -> KernelMetrics:
         cm = CompilerMetrics()
         for k, v in compiler_data.items():
             if hasattr(cm, k):
-                setattr(cm, k, int(v) if isinstance(v, (int, float)) else v)
+                setattr(cm, k, v)
         m._compiler_metrics = cm
     return m

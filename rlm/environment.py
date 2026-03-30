@@ -4,6 +4,7 @@ Loads kernel source, hardware spec, manages optimization state across rounds.
 """
 
 from __future__ import annotations
+import logging
 import re
 import yaml
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -118,11 +120,12 @@ class RLMEnvironment:
 
         self.profile_report: Optional[dict] = None
         self.baseline_us: Optional[float] = None
-        self.baseline_us_reported: float = 12.4
+        self.baseline_us_reported: Optional[float] = None
         self.baseline_source: str = "unknown"
         self.official_baseline: bool = False
         self.baseline_naive_us: Optional[float] = None
         self.baseline_compiler_metrics = None  # CompilerMetrics from reference kernel
+        self._pricing_warnings: set[str] = set()
 
         # Task-specific shape takes priority over config shapes
         if problem_shape is not None:
@@ -245,7 +248,33 @@ class RLMEnvironment:
             "claude-haiku-4-5-20251001":  {"in": 0.25, "out": 1.25},
             "claude-3-opus-20240229":     {"in": 15.0, "out": 75.0},
         }
-        p = _costs_per_million.get(model, {"in": 3.0, "out": 15.0})
+        pricing_cfg = self.search_config.get("pricing", {})
+        configured = pricing_cfg.get(model)
+        if configured is not None:
+            p = configured
+        elif model in _costs_per_million:
+            p = _costs_per_million[model]
+        else:
+            default_pricing = pricing_cfg.get("default_model_pricing")
+            if default_pricing is not None:
+                p = default_pricing
+                if model not in self._pricing_warnings:
+                    logger.warning(
+                        "Using configured default pricing for unknown model '%s': in=%s out=%s",
+                        model, p.get("in"), p.get("out"),
+                    )
+                    self._pricing_warnings.add(model)
+            else:
+                p = {
+                    "in": max(item["in"] for item in _costs_per_million.values()),
+                    "out": max(item["out"] for item in _costs_per_million.values()),
+                }
+                if model not in self._pricing_warnings:
+                    logger.warning(
+                        "Unknown model '%s' has no configured pricing; using conservative fallback in=%s out=%s",
+                        model, p["in"], p["out"],
+                    )
+                    self._pricing_warnings.add(model)
         cost = (tokens_in * p["in"] + tokens_out * p["out"]) / 1_000_000
         self.total_api_cost_usd += cost
         return cost

@@ -28,12 +28,20 @@ def compile_and_run(cuda_src: str, name: str = "validate") -> tuple:
     bin_path = src_path.replace(".cu", f"_{name}")
     cmd = [NVCC, "-O3", f"-arch={ARCH}", "--use_fast_math", "-std=c++17",
            src_path, "-o", bin_path]
-    comp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        comp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("COMPILE ERROR: timed out after 120s")
+        return None, None
     if comp.returncode != 0:
         print(f"COMPILE ERROR: {comp.stderr[:500]}")
         return None, None
 
-    run = subprocess.run([bin_path], capture_output=True, text=True, timeout=30)
+    try:
+        run = subprocess.run([bin_path], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print("RUN ERROR: timed out after 30s")
+        return None, bin_path
     if run.returncode != 0:
         print(f"RUN ERROR: {run.stderr[:500]}")
         return None, bin_path

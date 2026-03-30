@@ -48,8 +48,13 @@ class BeamSearch:
         self.beam_w   = env.search_config["beam"]["width"]
         self.rounds   = env.search_config["beam"]["refine_rounds"]
         beam_cfg = env.search_config.get("beam", {})
+        profiler_cfg = env.search_config.get("profiler", {})
         self.family_retire_gap = float(beam_cfg.get("family_retire_gap", 0.25))
         self.family_retire_ratio = float(beam_cfg.get("family_retire_ratio", 0.8))
+        self.plateau_refine_attempts = int(beam_cfg.get("plateau_refine_attempts", 2))
+        self.plateau_bad_rounds = int(beam_cfg.get("plateau_bad_rounds", 2))
+        self.population_crossover = bool(beam_cfg.get("population_crossover", True))
+        self.max_profile_workers = int(profiler_cfg.get("max_profile_workers", 2))
         self._env_lock = threading.Lock()  # guards shared env counters
 
     @staticmethod
@@ -61,11 +66,37 @@ class BeamSearch:
         )
 
     @staticmethod
-    def _is_plateaued(candidate: KernelCandidate) -> bool:
-        if candidate.refine_attempts >= 1:
+    def _recent_bad_outcomes(candidate: KernelCandidate, limit: int) -> int:
+        recent = list(candidate.refinement_history[-limit:])
+        return sum(entry.get("outcome") in {"stagnant", "regression"} for entry in recent)
+
+    def _is_plateaued(self, candidate: KernelCandidate) -> bool:
+        if candidate.refine_attempts >= self.plateau_refine_attempts:
             return True
-        recent = list(candidate.refinement_history[-2:])
-        return any(entry.get("outcome") in {"stagnant", "regression"} for entry in recent)
+        return self._recent_bad_outcomes(candidate, self.plateau_bad_rounds) >= self.plateau_bad_rounds
+
+    @staticmethod
+    def _cuda_harness_prelude() -> str:
+        return r"""
+#define CHECK_CUDA(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        return 2; \
+    } \
+} while (0)
+#define cudaMalloc(...) CHECK_CUDA(cudaMalloc(__VA_ARGS__))
+#define cudaMemcpy(...) CHECK_CUDA(cudaMemcpy(__VA_ARGS__))
+#define cudaMemset(...) CHECK_CUDA(cudaMemset(__VA_ARGS__))
+#define cudaFree(...) CHECK_CUDA(cudaFree(__VA_ARGS__))
+#define cudaStreamCreate(...) CHECK_CUDA(cudaStreamCreate(__VA_ARGS__))
+#define cudaStreamSynchronize(...) CHECK_CUDA(cudaStreamSynchronize(__VA_ARGS__))
+#define cudaEventCreate(...) CHECK_CUDA(cudaEventCreate(__VA_ARGS__))
+#define cudaEventRecord(...) CHECK_CUDA(cudaEventRecord(__VA_ARGS__))
+#define cudaEventElapsedTime(...) CHECK_CUDA(cudaEventElapsedTime(__VA_ARGS__))
+#define cudaEventDestroy(...) CHECK_CUDA(cudaEventDestroy(__VA_ARGS__))
+#define cudaDeviceGetAttribute(...) CHECK_CUDA(cudaDeviceGetAttribute(__VA_ARGS__))
+"""
 
     def _prune_stale_families(self, survivors: list[KernelCandidate]) -> list[KernelCandidate]:
         if len(survivors) <= 1:
@@ -105,6 +136,43 @@ class BeamSearch:
         pruned.sort(key=lambda c: -c.speedup)
         return pruned[:self.beam_w]
 
+    def _family_distinct_top_pair(self, candidates: list[KernelCandidate]) -> tuple[KernelCandidate, KernelCandidate] | None:
+        ranked = [candidate for candidate in sorted(candidates, key=lambda c: -c.speedup) if candidate.is_viable()]
+        if len(ranked) < 2:
+            return None
+        first = ranked[0]
+        first_family = self._branch_family(first)
+        for other in ranked[1:]:
+            if self._branch_family(other) != first_family:
+                return first, other
+        return None
+
+    def _spawn_crossover_candidate(
+        self,
+        survivors: list[KernelCandidate],
+        round_num: int,
+        problem_shape: tuple,
+        baseline_us: float,
+    ) -> tuple[KernelCandidate, KernelMetrics] | None:
+        if not self.population_crossover or len(survivors) < 2 or self.env.over_budget():
+            return None
+        pair = self._family_distinct_top_pair(survivors)
+        if pair is None:
+            return None
+        logger.info(
+            "Injecting crossover candidate from families %s + %s",
+            self._branch_family(pair[0]),
+            self._branch_family(pair[1]),
+        )
+        try:
+            merged = self.engine.combine(list(pair))
+        except Exception as exc:
+            logger.warning("Crossover combine failed: %s", exc)
+            return None
+        merged.round_num = round_num
+        metrics = self._profile_candidate(merged, problem_shape, baseline_us)
+        return merged, metrics or KernelMetrics()
+
     def _build_harness(self, problem_shape: tuple) -> str:
         kt = self.env.kernel_type
         if kt == "add_rmsnorm":
@@ -126,6 +194,7 @@ class BeamSearch:
 #include <cuda_fp8.h>
 #include <stdio.h>
 #include <stdlib.h>
+{self._cuda_harness_prelude()}
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
     __nv_bfloat16*, unsigned char*, __nv_fp8_storage_t*, int, int, cudaStream_t);
@@ -178,6 +247,7 @@ int main(int argc, char** argv) {{
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+{self._cuda_harness_prelude()}
 void launch_silu_mul_fp4quant(
     const __nv_bfloat16*, const __nv_bfloat16*,
     uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
@@ -227,6 +297,7 @@ int main(int argc, char** argv) {{
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+{self._cuda_harness_prelude()}
 void launch_nvfp4_quantize_bf16(
     const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
 int main(int argc, char** argv) {{
@@ -340,7 +411,7 @@ int main(int argc, char** argv) {{
                 candidate.correct = True
                 timing_us = self.profiler.benchmark_timing(binary)
                 if timing_us is not None:
-                    speedup = baseline_us / timing_us if timing_us > 0 else 0.0
+                    speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
                     metrics = self.profiler.profile(
                         binary, report_name=name,
                         kernel_src=candidate.code,
@@ -424,7 +495,8 @@ int main(int argc, char** argv) {{
 
         results = [None] * len(candidates)
 
-        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        max_workers = max(1, min(len(candidates), self.max_profile_workers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_idx = {
                 pool.submit(self._profile_candidate, c, problem_shape, baseline_us): i
                 for i, c in enumerate(candidates)
@@ -447,6 +519,11 @@ int main(int argc, char** argv) {{
         problem_shape = env.problem_shapes[0]
 
         baseline_us = env.baseline_us_reported
+        if baseline_us is None or baseline_us <= 0:
+            raise RuntimeError(
+                f"Invalid speedup baseline for {env.kernel_name}: {baseline_us!r}. "
+                "Measure a valid FlashInfer or explicit reference baseline before search."
+            )
         search_naive_us, baseline_cm = self.measure_search_baseline(problem_shape)
         if search_naive_us:
             logger.info("Naive reference kernel (harness): %.3f us", search_naive_us)
@@ -536,7 +613,7 @@ int main(int argc, char** argv) {{
             to_refine = []
             stagnant = []
             for s in survivors:
-                if s.refine_attempts >= 3:
+                if s.refine_attempts >= max(3, self.plateau_refine_attempts + 1):
                     stagnant.append(s)
                     logger.info("  Retiring stagnant [%s] after %d failed refine attempts",
                                 s.strategy, s.refine_attempts)
@@ -709,6 +786,12 @@ int main(int argc, char** argv) {{
                 for c in fresh_pre_profiled
             ] + fresh_metrics:
                 improved_new.append((fresh_c, m))
+
+            crossover_candidate = self._spawn_crossover_candidate(
+                survivors, round_num, problem_shape, baseline_us
+            )
+            if crossover_candidate is not None:
+                improved_new.append(crossover_candidate)
 
             all_candidates = [
                 (s, metrics_from_dict(s.metrics) if s.metrics else KernelMetrics())

@@ -30,42 +30,18 @@ def extract_shared_memory_decls(cuda_src: str) -> list:
 
 
 def naive_merge(variant_a: KernelCandidate, variant_b: KernelCandidate) -> str:
-    """Naive merge: combine shared memory and loop bodies from both variants."""
-    body_a = extract_kernel_body(variant_a.code)
-    body_b = extract_kernel_body(variant_b.code)
-    smem_a = extract_shared_memory_decls(variant_a.code)
-    smem_b = extract_shared_memory_decls(variant_b.code)
-    all_smem = list(dict.fromkeys(smem_a + smem_b))
-
-    return f"""// Auto-merged: {variant_a.strategy} + {variant_b.strategy}
-// Variant A speedup: {variant_a.speedup:.3f}x ({variant_a.strategy})
-// Variant B speedup: {variant_b.speedup:.3f}x ({variant_b.strategy})
-// WARNING: Naive merge — review for correctness before production use
-
-#include "../common/nvfp4_utils.cuh"
-#include "../common/b200_intrinsics.cuh"
-
-__global__ void fused_add_rmsnorm_nvfp4_optimized(
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_bfloat16* __restrict__ residual,
-    const __nv_bfloat16* __restrict__ rms_weight,
-    __nv_bfloat16*       __restrict__ residual_out,
-    uint8_t*             __restrict__ quant_out,
-    __nv_fp8_storage_t*  __restrict__ quant_scales,
-    int hidden_size,
-    float eps)
-{{
-    // Shared memory (merged from both variants)
-    {chr(10).join('    ' + s for s in all_smem)}
-
-    // === From Variant A ({variant_a.strategy}) ===
-    {{
-        {body_a[:2000]}
-    }}
-
-    // === From Variant B ({variant_b.strategy}) ===
-    {{
-        {body_b[:2000]}
-    }}
-}}
-"""
+    """Conservative fallback: keep the better parent rather than emit broken merged CUDA."""
+    winner = variant_a if variant_a.speedup >= variant_b.speedup else variant_b
+    loser = variant_b if winner is variant_a else variant_a
+    logger.warning(
+        "Naive merge fallback selected better parent instead of attempting an unsafe textual merge: %s over %s",
+        winner.strategy,
+        loser.strategy,
+    )
+    return (
+        f"// Combine fallback kept the better parent unchanged.\n"
+        f"// Selected: {winner.strategy} ({winner.speedup:.3f}x)\n"
+        f"// Rejected merge target: {loser.strategy} ({loser.speedup:.3f}x)\n"
+        f"// Reason: naive textual merging is unsafe for nontrivial CUDA kernels.\n\n"
+        f"{winner.code}"
+    )

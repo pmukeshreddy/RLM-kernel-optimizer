@@ -232,25 +232,25 @@ int main() {{
 }}
 """
         try:
-            with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
-                f.write(query_src)
-                src_path = f.name
-            bin_path = src_path.replace(".cu", "_occ")
-            comp = subprocess.run(
-                [self.nvcc] + self.nvcc_flags + [src_path, "-o", bin_path],
-                capture_output=True, text=True, timeout=60,
-            )
-            if comp.returncode != 0:
-                logger.debug("Occupancy query compilation failed: %s", comp.stderr[:200])
-                return None
-            run = subprocess.run([bin_path], capture_output=True, text=True, timeout=10)
-            if run.returncode != 0:
-                return None
-            match = re.search(r"occ_pct:\s*([\d.]+)", run.stdout)
-            if match:
-                occ = float(match.group(1))
-                logger.info("CUDA Occupancy API: %.1f%%", occ)
-                return occ
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src_path = Path(tmpdir) / "occupancy_query.cu"
+                bin_path = Path(tmpdir) / "occupancy_query"
+                src_path.write_text(query_src)
+                comp = subprocess.run(
+                    [self.nvcc] + self.nvcc_flags + [str(src_path), "-o", str(bin_path)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if comp.returncode != 0:
+                    logger.debug("Occupancy query compilation failed: %s", comp.stderr[:200])
+                    return None
+                run = subprocess.run([str(bin_path)], capture_output=True, text=True, timeout=10)
+                if run.returncode != 0:
+                    return None
+                match = re.search(r"occ_pct:\s*([\d.]+)", run.stdout)
+                if match:
+                    occ = float(match.group(1))
+                    logger.info("CUDA Occupancy API: %.1f%%", occ)
+                    return occ
         except (subprocess.TimeoutExpired, OSError) as e:
             logger.debug("Occupancy query failed: %s", e)
         return None

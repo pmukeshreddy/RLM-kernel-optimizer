@@ -110,16 +110,16 @@ class SandboxFeedback:
             "next_action": {
                 "type": self.action_type,
                 "instruction": self.next_action,
-                "focus": self.focus[:4],
+                "focus": self.focus[:6],
             },
             "memory": {
                 "branch_family": self.memory.get("branch_family", ""),
                 "plateau_count": self.memory.get("plateau_count", 0),
-                "tried_and_failed": self.memory.get("tried_and_failed", [])[:3],
-                "tried_and_helped": self.memory.get("tried_and_helped", [])[:3],
+                "tried_and_failed": self.memory.get("tried_and_failed", [])[:6],
+                "tried_and_helped": self.memory.get("tried_and_helped", [])[:6],
             },
             "rag": {
-                "queries": self.rag_queries[:3],
+                "queries": self.rag_queries[:6],
                 "filters": self.rag_filters,
             },
         }
@@ -130,7 +130,7 @@ class SandboxFeedback:
                 if key in self.observations
             }
         if self.evidence:
-            summary["evidence"] = self.evidence[:6]
+            summary["evidence"] = self.evidence[:10]
         return json.dumps(summary, indent=2, sort_keys=True)
 
 

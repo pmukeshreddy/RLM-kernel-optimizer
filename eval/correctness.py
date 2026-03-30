@@ -20,6 +20,28 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def _cuda_harness_prelude() -> str:
+    return r"""
+#define CHECK_CUDA(call) do { \
+    cudaError_t err__ = (call); \
+    if (err__ != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+        return 2; \
+    } \
+} while (0)
+#define cudaMalloc(...) CHECK_CUDA(cudaMalloc(__VA_ARGS__))
+#define cudaMemcpy(...) CHECK_CUDA(cudaMemcpy(__VA_ARGS__))
+#define cudaMemset(...) CHECK_CUDA(cudaMemset(__VA_ARGS__))
+#define cudaFree(...) CHECK_CUDA(cudaFree(__VA_ARGS__))
+#define cudaStreamCreate(...) CHECK_CUDA(cudaStreamCreate(__VA_ARGS__))
+#define cudaStreamSynchronize(...) CHECK_CUDA(cudaStreamSynchronize(__VA_ARGS__))
+#define cudaEventCreate(...) CHECK_CUDA(cudaEventCreate(__VA_ARGS__))
+#define cudaEventRecord(...) CHECK_CUDA(cudaEventRecord(__VA_ARGS__))
+#define cudaEventElapsedTime(...) CHECK_CUDA(cudaEventElapsedTime(__VA_ARGS__))
+#define cudaEventDestroy(...) CHECK_CUDA(cudaEventDestroy(__VA_ARGS__))
+"""
+
+
 def _generate_flashinfer_harness(kernel_type: str, shape: tuple,
                                   ref_data_dir: str, atol: float, rtol: float) -> str:
     """Generate CUDA harness that loads FlashInfer reference outputs and compares."""
@@ -45,6 +67,7 @@ def _flashinfer_harness_add_rmsnorm(shape: tuple, ref_dir: str,
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+{_cuda_harness_prelude()}
 
 void launch_fused_add_rmsnorm_nvfp4(
     const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
@@ -188,6 +211,7 @@ def _flashinfer_harness_silu_mul(shape: tuple, ref_dir: str,
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+{_cuda_harness_prelude()}
 
 void launch_silu_mul_fp4quant(
     const __nv_bfloat16*, const __nv_bfloat16*,
@@ -309,6 +333,7 @@ def _flashinfer_harness_nvfp4_quantize(shape: tuple, ref_dir: str,
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+{_cuda_harness_prelude()}
 
 void launch_nvfp4_quantize_bf16(
     const __nv_bfloat16*, uint8_t*, __nv_fp8_storage_t*, int, cudaStream_t);
@@ -416,6 +441,7 @@ def _generate_cuda_reference_harness(rows: int, hidden: int, atol: float, rtol: 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+{_cuda_harness_prelude()}
 
 __device__ float _wref_sum(float v) {{
     for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xFFFFFFFF, v, m);
@@ -507,6 +533,11 @@ class CorrectnessChecker:
     def __init__(self, config: dict):
         self.atol = config["eval"]["correctness_atol"]
         self.rtol = config["eval"]["correctness_rtol"]
+        seeds_cfg = config["eval"].get("correctness_seeds", [42, 123, 999])
+        if isinstance(seeds_cfg, int):
+            self.correctness_seeds = [42 + idx for idx in range(max(1, seeds_cfg))]
+        else:
+            self.correctness_seeds = [int(seed) for seed in seeds_cfg] or [42]
         self.nvcc_flags = [
             "-O2", "-arch=sm_100a", "-std=c++17",
             f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
@@ -535,29 +566,38 @@ class CorrectnessChecker:
         """Check correctness using FlashInfer-generated reference data."""
         import torch
 
-        ref_data = flashinfer_ref.generate_reference(kernel_type, shape)
-        if ref_data is None:
-            logger.warning("FlashInfer reference generation failed, falling back")
-            if kernel_type == "add_rmsnorm":
-                return self._check_with_cuda_ref(candidate_src, shape)
-            return False, float("inf"), "FlashInfer reference unavailable"
+        last_err = float("inf")
+        last_msg = "FlashInfer reference unavailable"
+        for seed in self.correctness_seeds:
+            ref_data = flashinfer_ref.generate_reference(kernel_type, shape, seed=seed)
+            if ref_data is None:
+                logger.warning("FlashInfer reference generation failed for seed %s", seed)
+                if kernel_type == "add_rmsnorm":
+                    return self._check_with_cuda_ref(candidate_src, shape)
+                return False, float("inf"), "FlashInfer reference unavailable"
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Save reference tensors as raw binary
-            for name, tensor in ref_data.items():
-                if isinstance(tensor, torch.Tensor):
-                    # Use raw bytes to avoid numpy bf16 unsupported error
-                    with open(f"{tmpdir}/{name}.bin", "wb") as bf:
-                        bf.write(tensor.cpu().contiguous().numpy(force=True).tobytes()
-                                 if tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
-                                 else bytes(tensor.cpu().contiguous().untyped_storage()))
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for name, tensor in ref_data.items():
+                    if isinstance(tensor, torch.Tensor):
+                        with open(f"{tmpdir}/{name}.bin", "wb") as bf:
+                            bf.write(
+                                tensor.cpu().contiguous().numpy(force=True).tobytes()
+                                if tensor.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+                                else bytes(tensor.cpu().contiguous().untyped_storage())
+                            )
 
-            harness = _generate_flashinfer_harness(kernel_type, shape, tmpdir,
-                                                    self.atol, self.rtol)
-            if harness is None:
-                return False, float("inf"), f"No harness for {kernel_type}"
+                harness = _generate_flashinfer_harness(kernel_type, shape, tmpdir,
+                                                        self.atol, self.rtol)
+                if harness is None:
+                    return False, float("inf"), f"No harness for {kernel_type}"
 
-            return self._compile_and_run(candidate_src, harness, tmpdir)
+                passed, err, msg = self._compile_and_run(candidate_src, harness, tmpdir)
+                if not passed:
+                    return False, err, f"seed={seed} {msg}"
+                last_err = err
+                last_msg = msg
+
+        return True, last_err, f"{last_msg} seeds={self.correctness_seeds}"
 
     def _check_with_cuda_ref(self, candidate_src: str, shape: tuple) -> tuple:
         """Fallback: check using hand-written CUDA reference kernel."""
@@ -575,7 +615,10 @@ class CorrectnessChecker:
         src_file.write_text(combined_src)
 
         cmd = ["nvcc"] + self.nvcc_flags + [str(src_file), "-o", str(bin_file)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return False, float("inf"), "Compile timed out after 120s"
         if r.returncode != 0:
             return False, float("inf"), f"Compile failed: {r.stderr[:300]}"
 
