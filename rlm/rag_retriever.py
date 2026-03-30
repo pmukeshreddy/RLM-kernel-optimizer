@@ -792,9 +792,13 @@ class PineconeRetriever:
         return re.sub(r"[^a-z0-9+]+", " ", text)
 
     def _extract_hits(self, response) -> list[dict]:
-        if hasattr(response, "matches"):
-            hits = getattr(response, "matches", None) or []
-            return [self._normalize_hit(hit) for hit in hits]
+        # Plain vector query response: .matches is a non-empty list of ScoredVector.
+        # Only enter this branch when matches is actually populated — SearchRecordsResponse
+        # may have a .matches attribute that is None/empty even when result.hits has data.
+        matches_val = getattr(response, "matches", None)
+        if matches_val:
+            return [self._normalize_hit(hit) for hit in matches_val]
+
         if isinstance(response, dict):
             result = response.get("result", response)
             hits = result.get("hits") or result.get("matches") or []
@@ -811,9 +815,8 @@ class PineconeRetriever:
         else:
             hits = getattr(response, "hits", None) or getattr(response, "matches", None) or []
         if not hits:
-            logger.debug("_extract_hits: empty hits. response type=%s attrs=%s",
-                         type(response).__name__,
-                         [a for a in dir(response) if not a.startswith("__")])
+            logger.info("_extract_hits: empty hits. response type=%s repr=%.400s",
+                        type(response).__name__, repr(response))
         return [self._normalize_hit(hit) for hit in hits]
 
     def _normalize_hit(self, hit) -> dict:
