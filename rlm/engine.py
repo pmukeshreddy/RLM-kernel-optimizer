@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import subprocess
 from pathlib import Path
 
 import anthropic
@@ -50,8 +49,7 @@ SUBMIT_KERNEL_TOOL = {
         "- CORRECTNESS FAILURE: max error magnitude and which check failed\n"
         "- Result verdict (IMPROVED / REGRESSION / NO CHANGE) with:\n"
         "  timing_us, speedup vs baseline, SM occupancy,\n"
-        "  SASS breakdown (load vectorization %, loads by width, "
-        "stores, barriers, shuffles, register spills),\n"
+        "  memory/compute throughput, compiler resource usage, register spills,\n"
         "  delta from your previous submission,\n"
         "  remaining optimization suggestions from profiler data"
     ),
@@ -64,26 +62,6 @@ SUBMIT_KERNEL_TOOL = {
                     "Complete .cu file content with all #includes, "
                     "kernel functions, and the launch_* wrapper."
                 ),
-            }
-        },
-        "required": ["cuda_code"],
-    },
-}
-
-INSPECT_SASS_TOOL = {
-    "name": "inspect_sass",
-    "description": (
-        "Compile CUDA code and return the full SASS assembly (cuobjdump -sass output). "
-        "Use this to see exactly what instructions the compiler generated — load widths, "
-        "branch counts, spills, vectorization, etc. Does NOT run or benchmark the kernel. "
-        "Costs no submit_kernel turn."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "cuda_code": {
-                "type": "string",
-                "description": "Complete .cu file to compile and disassemble.",
             }
         },
         "required": ["cuda_code"],
@@ -162,7 +140,6 @@ SEARCH_PINECONE_TOOL = {
 
 ALL_TOOLS = [
     SUBMIT_KERNEL_TOOL,
-    INSPECT_SASS_TOOL,
     READ_FILE_TOOL,
     SEARCH_DOCS_TOOL,
     SEARCH_PINECONE_TOOL,
@@ -176,7 +153,6 @@ You target a single GPU (B200, sm_100a) and a single problem shape — use this 
 
 Available tools (only submit_kernel counts toward your turn limit):
 - submit_kernel: compile, test correctness, and benchmark your kernel
-- inspect_sass: compile code and see the raw SASS assembly (instruction-level view)
 - read_file: read project header files (nvfp4_utils.cuh, b200_intrinsics.cuh) or reference kernels
 - search_docs: look up CUDA intrinsic signatures and usage (fp4, fp8, warp, fast math, memory)
 - search_pinecone: query the user's Pinecone knowledge index for project-specific guidance
@@ -202,56 +178,25 @@ Rules:
 """
 
 def _build_refine_system_prompt(speedup: float, prev_metrics: dict = None) -> str:
-    """Build REFINE_SYSTEM_PROMPT with data-driven constraint based on SASS analysis."""
+    """Build REFINE_SYSTEM_PROMPT with constraints from measured runtime data."""
     if speedup >= 1.0 and prev_metrics:
-        # Already beating baseline — structural changes regress at this point.
-        # Guide model toward the specific instruction-level bottlenecks SASS identified.
         cm = prev_metrics.get("_compiler", {})
-        sass_total = cm.get("sass_total_instructions", 0)
-        bra = cm.get("sass_bra", 0)
-        fadd = cm.get("sass_fadd", 0)
-        fmul = cm.get("sass_fmul", 0)
-        ffma = cm.get("sass_ffma", 0)
-        stg32 = cm.get("sass_stg_32", 0)
+        mem_tput = float(prev_metrics.get("mem_throughput_pct", 0) or 0.0)
+        compute_tput = float(prev_metrics.get("compute_throughput_pct", 0) or 0.0)
+        occupancy = float(prev_metrics.get("sm_occupancy", 0) or 0.0)
+        hints = []
+        if cm.get("spill_stores_bytes", 0) or cm.get("spill_loads_bytes", 0):
+            hints.append("spills are present, so reduce live state before adding more work per thread")
+        if cm.get("registers_per_thread", 0) >= 96 or occupancy < 75.0:
+            hints.append("register pressure or occupancy is already tight")
+        if mem_tput >= max(compute_tput, 25.0):
+            hints.append("memory throughput is the stronger signal, so preserve the working math path and change one memory path at a time")
+        elif compute_tput > 0:
+            hints.append("runtime gains will come from a smaller hot path, not a structural rewrite")
 
-        bottlenecks = []
-        if fadd > 0 and fmul > 0 and (fadd + fmul) > ffma:
-            bottlenecks.append(f"FADD={fadd}+FMUL={fmul} not fused into FFMA — use fmaf()")
-        if bra > 3:
-            bottlenecks.append(f"BRA={bra} branch instructions — use branchless alternatives")
-        if stg32 > 1:
-            bottlenecks.append(f"STG.32={stg32} narrow stores — pack into wider writes")
-
-        fsetp = cm.get("sass_fsetp", 0)
-        sel = cm.get("sass_sel", 0)
-        if fsetp + sel > 10:
-            bottlenecks.append(f"FSETP={fsetp}+SEL={sel} predicate chains — replace software FP4 quantization with hardware intrinsics")
-
-        f2f = cm.get("sass_f2f", 0)
-        if f2f > 8:
-            bottlenecks.append(f"F2F={f2f} type conversions — keep math in native bf16 pairs")
-
-        prmt = cm.get("sass_prmt", 0)
-        lop3 = cm.get("sass_lop3", 0)
-        shf_cnt = cm.get("sass_shf", 0)
-        # Only penalize PRMT/LOP3/SHF if we are still doing software FP4 quantization
-        # (indicated by high FSETP + SEL). If FSETP is low, PRMT is being used correctly
-        # to pack uint8_t values into uint32_t/uint64_t for vectorized stores!
-        if (prmt + lop3 + shf_cnt > 8) and (fsetp + sel >= 4):
-            bottlenecks.append(f"PRMT={prmt}+LOP3={lop3}+SHF={shf_cnt} bit manipulation — use __nv_cvt_bfloat16raw2_to_fp4x2 instead of manual packing")
-
-        if bottlenecks:
-            hint = "; ".join(bottlenecks)
-            constraint = (
-                f"- You are ABOVE baseline ({speedup:.2f}x). Your remaining bottleneck is instruction-level, "
-                f"not structural. The SASS shows: {hint}\n"
-                f"- Each change should target reducing specific SASS instruction counts."
-            )
-        else:
-            constraint = (
-                f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical instruction-level "
-                f"changes over structural rewrites."
-            )
+        constraint = f"- You are ABOVE baseline ({speedup:.2f}x). Prefer surgical follow-up changes over structural rewrites."
+        if hints:
+            constraint += "\n- Measured constraints: " + "; ".join(hints) + "."
     else:
         constraint = "- Structural changes, algorithmic rewrites, and surgical optimizations are all allowed."
 
@@ -938,57 +883,6 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
 
     # ── Auxiliary tool handlers ────────────────────────────────────────────────
 
-    def _handle_inspect_sass(self, cuda_code: str) -> str:
-        """Compile code and return raw SASS disassembly via cuobjdump."""
-        import hashlib
-        build_dir = Path(self.env.search_config.get("output", {}).get("output_dir", "outputs")) / "build"
-        build_dir.mkdir(parents=True, exist_ok=True)
-
-        # Unique filename to avoid clobber when beams run concurrently
-        uid = hashlib.md5(cuda_code.encode()).hexdigest()[:8]
-        kernel_file = build_dir / f"_sass_inspect_{uid}.cu"
-        binary_file = build_dir / f"_sass_inspect_{uid}"
-
-        # Write source — need harness for compilation, but we only care about SASS
-        kernel_file.write_text(cuda_code)
-
-        nvcc_flags = [
-            "-O3", "-arch=sm_100a", "--use_fast_math", "-std=c++17",
-            f"-I{PROJECT_ROOT / 'kernels' / 'common'}",
-            f"-I{PROJECT_ROOT}",
-            "-c",  # compile only, no link — faster and avoids missing main()
-            "-o", str(binary_file) + ".o",
-        ]
-        cmd = ["nvcc"] + nvcc_flags + [str(kernel_file)]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                error_lines = [l for l in result.stderr.splitlines()
-                               if 'error' in l.lower() and ('(' in l or ':' in l)]
-                first_err = error_lines[0].strip() if error_lines else result.stderr[:300]
-                return f"COMPILE ERROR (cannot inspect SASS):\n{first_err}"
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            return f"Compilation failed: {e}"
-
-        # Disassemble
-        try:
-            sass_result = subprocess.run(
-                ["cuobjdump", "-sass", str(binary_file) + ".o"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if sass_result.returncode != 0:
-                return f"cuobjdump failed: {sass_result.stderr[:300]}"
-            sass = sass_result.stdout
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            return f"cuobjdump not available: {e}"
-
-        # Truncate if very long (keep first 400 lines — enough for one kernel)
-        lines = sass.splitlines()
-        if len(lines) > 400:
-            sass = "\n".join(lines[:400]) + f"\n... ({len(lines) - 400} more lines truncated)"
-
-        return sass if sass.strip() else "No SASS output (empty binary?)"
-
     def _handle_read_file(self, path: str) -> str:
         """Read an allowed project file."""
         ALLOWED_PREFIXES = [
@@ -1036,24 +930,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             if block.type != "tool_use":
                 continue
 
-            if block.name == "inspect_sass":
-                code = block.input.get("cuda_code", "")
-                if not code:
-                    aux_results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": "Error: empty cuda_code.", "is_error": True,
-                    })
-                else:
-                    logger.info("🔍 INSPECT_SASS [%s]: compiling for SASS dump", strategy_name)
-                    sass_output = self._handle_inspect_sass(code)
-                    logger.info("🔍 SASS [%s]: %d lines returned", strategy_name,
-                                len(sass_output.splitlines()))
-                    aux_results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": sass_output,
-                    })
-
-            elif block.name == "read_file":
+            if block.name == "read_file":
                 path = block.input.get("path", "")
                 if not path:
                     aux_results.append({

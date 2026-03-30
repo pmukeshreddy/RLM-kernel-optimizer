@@ -23,16 +23,9 @@ OBSERVATION_COMPILER_KEYS = (
     "registers_per_thread",
     "spill_stores_bytes",
     "spill_loads_bytes",
-    "sass_ldg_32",
-    "sass_ldg_64",
-    "sass_ldg_128",
-    "sass_stg_32",
-    "sass_stg_64",
-    "sass_stg_128",
-    "sass_ffma",
-    "sass_fadd",
-    "sass_fmul",
-    "sass_bra",
+    "static_smem_bytes",
+    "cmem_bytes",
+    "stack_frame_bytes",
 )
 
 
@@ -263,29 +256,22 @@ def _bottleneck_focus_terms(metrics: dict, root_cause: str | None = None) -> lis
     focus = []
     cause = (root_cause or "").lower()
 
+    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0) or "spill" in cause:
+        focus.append("spill elimination")
     if compiler.get("registers_per_thread", 0) > 96 or "register pressure" in cause:
         focus.extend(["register pressure", "occupancy tuning", "launch bounds"])
-    if compiler.get("spill_stores_bytes", 0) or compiler.get("spill_loads_bytes", 0):
-        focus.append("spill elimination")
-    if compiler.get("sass_stg_32", 0) > 1 or "stores" in cause:
-        focus.extend(["vectorized stores", "uint4 store packing", "store alignment"])
-    if compiler.get("sass_ldg_32", 0) > 2 or "loads" in cause:
-        focus.extend(["vectorized loads", "uint4 load alignment", "coalesced loads"])
-    if compiler.get("sass_bra", 0) > 3 or "branch" in cause:
-        focus.extend(["branchless control flow", "warp shuffle reduction", "predicate reduction"])
-    if (
-        compiler.get("sass_fadd", 0) + compiler.get("sass_fmul", 0) > compiler.get("sass_ffma", 0)
-        or "ffma" in cause
-        or "arithmetic" in cause
-    ):
-        focus.extend(["ffma fusion", "bf16 pair math", "hardware intrinsics"])
 
     mem_tput = metrics.get("mem_throughput_pct", 0)
     compute_tput = metrics.get("compute_throughput_pct", 0)
-    if mem_tput > compute_tput and mem_tput > 0:
-        focus.extend(["memory bandwidth", "coalesced memory path"])
-    elif compute_tput > 0:
-        focus.extend(["instruction mix", "compute efficiency"])
+    occupancy = metrics.get("sm_occupancy", 0)
+    if "memory traffic" in cause or (mem_tput > compute_tput and mem_tput > 0):
+        focus.extend(["pass elimination", "coalesced memory path", "vectorized access", "cache reuse"])
+    elif "arithmetic throughput" in cause or compute_tput > 0:
+        focus.extend(["hot-path simplification", "hardware intrinsics", "branchless arithmetic"])
+    elif "latency" in cause or occupancy < 75.0:
+        focus.extend(["latency hiding", "occupancy tuning", "independent work per thread"])
+    else:
+        focus.extend(["single hot path", "localized experiment"])
 
     return _unique_queries(focus)
 
@@ -315,41 +301,39 @@ def _performance_queries(kernel_type: str, metrics: dict, root_cause: str, memor
     if focus_terms:
         queries.append(f"{operation} {' '.join(focus_terms[:2])} CUDA source code")
 
-    compiler = metrics.get("_compiler", {}) if metrics else {}
-    if compiler.get("sass_stg_32", 0) > 1 or "stores" in root_cause.lower():
-        queries.append(f"{operation} vectorized stores uint4 store packing CUDA")
-    if compiler.get("sass_ldg_32", 0) > 2 or "loads" in root_cause.lower():
-        queries.append(f"{operation} vectorized loads uint4 alignment CUDA")
-    if compiler.get("sass_bra", 0) > 3 or "branch" in root_cause.lower():
-        queries.append(f"{operation} branchless control flow warp shuffle CUDA")
-    if "register pressure" in root_cause.lower():
+    cause = root_cause.lower()
+    if "memory traffic" in cause:
+        queries.append(f"{operation} eliminate extra memory pass register reuse CUDA")
+        queries.append(f"{operation} vectorized access coalesced memory CUDA")
+    if "register pressure" in cause:
         queries.append(f"{operation} register pressure occupancy reduction CUDA")
-    if "ffma" in root_cause.lower() or "arithmetic" in root_cause.lower():
-        queries.append(f"{operation} hardware intrinsic ffma fusion CUDA")
+    if "arithmetic throughput" in cause:
+        queries.append(f"{operation} hardware intrinsics hot path simplification CUDA")
+    if "latency" in cause:
+        queries.append(f"{operation} latency hiding occupancy ilp CUDA")
 
     return _unique_queries(queries)
 
 
 def _performance_root_cause(metrics: dict) -> str:
     compiler = metrics.get("_compiler", {}) if metrics else {}
-    if compiler.get("registers_per_thread", 0) > 96:
-        return "Register pressure is likely reducing occupancy."
-    if compiler.get("sass_stg_32", 0) > 1:
-        return "Narrow global stores are dominating the write path."
-    if compiler.get("sass_ldg_32", 0) > 2:
-        return "Narrow global loads are limiting memory efficiency."
-    if compiler.get("sass_bra", 0) > 3:
-        return "Branch-heavy control flow is adding instruction overhead."
-    if compiler.get("sass_fadd", 0) + compiler.get("sass_fmul", 0) > compiler.get("sass_ffma", 0):
-        return "Arithmetic is not fusing cleanly into FFMA."
+    spill_total = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
+    regs = compiler.get("registers_per_thread", 0)
+    occupancy = float(metrics.get("sm_occupancy", 0) or 0.0)
+    mem_tput = float(metrics.get("mem_throughput_pct", 0) or 0.0)
+    compute_tput = float(metrics.get("compute_throughput_pct", 0) or 0.0)
 
-    mem_tput = metrics.get("mem_throughput_pct", 0)
-    compute_tput = metrics.get("compute_throughput_pct", 0)
-    if mem_tput > compute_tput:
-        return "The kernel still looks memory-bound."
-    if compute_tput > 0:
-        return "The kernel still has compute-side inefficiency."
-    return "No single dominant bottleneck was isolated from the sandbox metrics."
+    if spill_total > 0:
+        return "Hypothesis: spills and local-memory traffic may be limiting performance."
+    if regs > 96 or (regs > 0 and occupancy < 75.0):
+        return "Hypothesis: register pressure may be limiting occupancy."
+    if mem_tput >= max(compute_tput, 25.0):
+        return "Hypothesis: memory traffic is the main limiter."
+    if compute_tput >= max(mem_tput, 25.0):
+        return "Hypothesis: arithmetic throughput is the current limiter."
+    if occupancy > 0 and occupancy < 60.0:
+        return "Hypothesis: the kernel is latency-limited due to low occupancy."
+    return "Hypothesis: no single dominant bottleneck is confirmed yet."
 
 
 def _collect_performance_evidence(
@@ -455,28 +439,50 @@ def _root_cause_metric_support(root_cause: str, metrics: dict, prev_inner_metric
         else:
             evidence_against.append(msg)
 
-    if "register pressure" in cause:
+    before_occ = (prev_inner_metrics or {}).get("sm_occupancy")
+    after_occ = metrics.get("sm_occupancy")
+    before_mem = (prev_inner_metrics or {}).get("mem_throughput_pct")
+    after_mem = metrics.get("mem_throughput_pct")
+    before_compute = (prev_inner_metrics or {}).get("compute_throughput_pct")
+    after_compute = metrics.get("compute_throughput_pct")
+
+    if "spill" in cause:
+        before_spills = prev_compiler.get("spill_stores_bytes", 0) + prev_compiler.get("spill_loads_bytes", 0)
+        after_spills = compiler.get("spill_stores_bytes", 0) + compiler.get("spill_loads_bytes", 0)
+        if before_spills != after_spills:
+            msg = f"spill_bytes {before_spills} -> {after_spills}"
+            if after_spills < before_spills:
+                evidence_for.append(msg)
+            else:
+                evidence_against.append(msg)
+    elif "register pressure" in cause:
         add_delta("registers_per_thread", better_when_smaller=True)
-        before_occ = (prev_inner_metrics or {}).get("sm_occupancy")
-        after_occ = metrics.get("sm_occupancy")
         if before_occ is not None and after_occ is not None and before_occ != after_occ:
             msg = f"sm_occupancy {before_occ} -> {after_occ}"
             if after_occ > before_occ:
                 evidence_for.append(msg)
             else:
                 evidence_against.append(msg)
-    elif "stores" in cause:
-        add_delta("sass_stg_32", better_when_smaller=True)
-        add_delta("sass_stg_128", better_when_smaller=False)
-    elif "loads" in cause:
-        add_delta("sass_ldg_32", better_when_smaller=True)
-        add_delta("sass_ldg_128", better_when_smaller=False)
-    elif "branch-heavy" in cause:
-        add_delta("sass_bra", better_when_smaller=True)
-    elif "ffma" in cause or "arithmetic" in cause:
-        add_delta("sass_ffma", better_when_smaller=False)
-        add_delta("sass_fadd", better_when_smaller=True)
-        add_delta("sass_fmul", better_when_smaller=True)
+    elif "memory traffic" in cause:
+        if before_mem is not None and after_mem is not None and before_mem != after_mem:
+            msg = f"mem_throughput_pct {before_mem} -> {after_mem}"
+            if after_mem > before_mem:
+                evidence_for.append(msg)
+            else:
+                evidence_against.append(msg)
+    elif "arithmetic throughput" in cause:
+        if before_compute is not None and after_compute is not None and before_compute != after_compute:
+            msg = f"compute_throughput_pct {before_compute} -> {after_compute}"
+            if after_compute > before_compute:
+                evidence_for.append(msg)
+            else:
+                evidence_against.append(msg)
+    elif "latency" in cause and before_occ is not None and after_occ is not None and before_occ != after_occ:
+        msg = f"sm_occupancy {before_occ} -> {after_occ}"
+        if after_occ > before_occ:
+            evidence_for.append(msg)
+        else:
+            evidence_against.append(msg)
 
     return evidence_for, evidence_against
 
@@ -546,30 +552,30 @@ def _next_experiment_fields(
         if label:
             revert.append(str(label))
 
-    if "stores" in cause:
-        instruction = "Keep the working load and reduction path. Change only the quant/store path in one local place."
-        focus = ["quant_out packing", "scale writes", "store alignment"]
+    if "memory traffic" in cause:
+        instruction = "Keep the working math path. Change only one memory path or one extra pass through global memory."
+        focus = ["pass elimination", "coalesced access", "vectorized access", "cache reuse"]
         success_criteria.extend([
-            "sass_stg_32 decreases without a large register increase.",
-            "timing_us improves against the parent."
+            "timing_us improves against the parent.",
+            "register pressure and spills stay controlled.",
         ])
         abort_if = [
             "registers_per_thread increases by more than 8 with <=1% speedup gain",
-            "occupancy drops below 75% without a compensating runtime win",
+            "new spills appear without a compensating runtime win",
         ]
-    elif "loads" in cause:
-        instruction = "Preserve the working quant path. Change only the global load path and alignment assumptions."
-        focus = ["vectorized loads", "alignment", "coalesced access"]
+    elif "spill" in cause:
+        instruction = "Keep the algorithm unchanged. Reduce spills by trimming live state or simplifying per-thread work."
+        focus = ["spill elimination", "live-range trimming", "smaller per-thread state"]
         success_criteria.extend([
-            "sass_ldg_32 decreases or sass_ldg_128 increases.",
+            "spill bytes go down.",
             "timing_us improves against the parent."
         ])
         abort_if = [
-            "alignment assumptions require a launch contract change",
-            "register pressure rises without a runtime gain",
+            "register count rises while spills remain",
+            "the fix requires a launch-contract change",
         ]
     elif "register pressure" in cause:
-        instruction = "Keep the fastest math path. Reduce live values or split work without changing the algorithm."
+        instruction = "Keep the fastest path intact. Reduce live values or split work without changing the algorithm."
         focus = ["live-range trimming", "launch bounds", "smaller per-thread state"]
         success_criteria.extend([
             "registers_per_thread drops or occupancy rises.",
@@ -577,27 +583,28 @@ def _next_experiment_fields(
         ])
         abort_if = [
             "spills appear",
-            "occupancy falls without a meaningful speedup gain",
+            "occupancy falls without a meaningful runtime win",
         ]
-    elif "branch-heavy" in cause:
-        instruction = "Preserve the working data path. Remove one divergent branch or replace one branchy helper with a uniform intrinsic path."
-        focus = ["branchless control flow", "warp-uniform logic", "hardware intrinsics"]
+    elif "arithmetic throughput" in cause:
+        instruction = "Keep the current memory path. Simplify one arithmetic hot path or swap in one hardware intrinsic."
+        focus = ["hot-path simplification", "hardware intrinsics", "branchless arithmetic"]
         success_criteria.extend([
-            "sass_bra decreases or instruction count drops.",
-            "runtime improves against the parent."
+            "timing_us improves against the parent.",
+            "registers_per_thread and spills stay controlled.",
         ])
         abort_if = [
-            "extra shuffles or helper logic increase instruction count without timing gain",
+            "instruction changes require a full rewrite",
+            "register pressure rises without a runtime gain",
         ]
-    elif "ffma" in cause or "arithmetic" in cause:
-        instruction = "Keep the current memory path. Target one arithmetic hot path and replace it with a hardware intrinsic or a simpler fused sequence."
-        focus = ["hardware intrinsics", "ffma-friendly algebra", "instruction count"]
+    elif "latency" in cause:
+        instruction = "Preserve the working kernel structure. Add one localized change that improves occupancy or hides latency."
+        focus = ["latency hiding", "occupancy tuning", "independent work per thread"]
         success_criteria.extend([
-            "sass_ffma increases or total SASS drops.",
-            "runtime improves against the parent."
+            "occupancy or measured throughput improves with runtime gain.",
+            "new spills do not appear."
         ])
         abort_if = [
-            "instruction count rises while speed stays flat",
+            "occupancy drops below 75% without a compensating runtime win",
         ]
     else:
         instruction = "Revise the bottleneck assumption and make one smaller localized change."

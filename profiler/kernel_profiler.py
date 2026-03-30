@@ -3,7 +3,6 @@ kernel_profiler.py — CUDA kernel compilation, timing, and profiling.
 
 Handles: write .cu → nvcc compile → benchmark timing → hybrid profiling.
 Compiler metrics (registers, spills) extracted via -Xptxas,-v.
-SASS instruction mix extracted via cuobjdump -sass.
 """
 
 from __future__ import annotations
@@ -27,7 +26,6 @@ class KernelProfiler:
 
     Real data sources:
       - nvcc -Xptxas -v  → registers, spills, shared memory (exact)
-      - cuobjdump -sass   → instruction mix, vectorization % (exact)
       - CUDA events       → kernel timing in microseconds (measured)
       - Occupancy API     → SM occupancy (computed from register/smem usage)
     """
@@ -63,7 +61,7 @@ class KernelProfiler:
         output_name: str = "kernel_bench",
     ) -> tuple:
         """Compile kernel + harness. Returns (success, error_msg, binary_path, CompilerMetrics).
-        Extracts compiler metrics (registers, spills) via -Xptxas,-v and SASS via cuobjdump."""
+        Extracts compiler metrics (registers, spills) via -Xptxas,-v."""
         build_dir = self.output_dir / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -90,22 +88,6 @@ class KernelProfiler:
 
         # Parse compiler metrics from ptxas verbose output
         compiler_metrics = self._parse_ptxas_verbose(result.stderr)
-
-        # SASS disassembly for instruction mix
-        sass_metrics = self._parse_sass_disassembly(binary_file)
-        if sass_metrics:
-            for attr in [
-                'sass_total_instructions', 'sass_ldg_32', 'sass_ldg_64', 'sass_ldg_128',
-                'sass_stg_32', 'sass_stg_64', 'sass_stg_128', 'sass_lds', 'sass_sts',
-                'sass_ldl', 'sass_stl', 'sass_ffma', 'sass_hfma2', 'sass_mufu',
-                'sass_fadd', 'sass_fmul', 'sass_bar', 'sass_shfl', 'sass_bra',
-                # New categories
-                'sass_mov', 'sass_setp', 'sass_sel', 'sass_imad', 'sass_iadd',
-                'sass_isetp', 'sass_f2f', 'sass_i2f', 'sass_f2i',
-                'sass_prmt', 'sass_lop3', 'sass_shf', 'sass_fsetp',
-                'sass_other',
-            ]:
-                setattr(compiler_metrics, attr, getattr(sass_metrics, attr, 0))
 
         logger.info("Compiler metrics: %s", compiler_metrics.summary_str())
         return True, "", binary_file, compiler_metrics
@@ -140,69 +122,6 @@ class KernelProfiler:
 
         return cm
 
-    def _parse_sass_disassembly(self, binary_path: Path) -> Optional[CompilerMetrics]:
-        """Disassemble binary with cuobjdump -sass and count instruction types."""
-        try:
-            result = subprocess.run(
-                ["cuobjdump", "-sass", str(binary_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
-                logger.debug("cuobjdump failed: %s", result.stderr[:200])
-                return None
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            logger.debug("cuobjdump not available or timed out")
-            return None
-
-        sass = result.stdout
-        cm = CompilerMetrics()
-
-        instructions = re.findall(r'/\*[0-9a-f]+\*/\s+([A-Z][A-Z0-9_.]+)', sass)
-        cm.sass_total_instructions = len(instructions)
-
-        classified = 0
-        for inst in instructions:
-            if inst.startswith("LDG"):
-                if ".128" in inst:    cm.sass_ldg_128 += 1
-                elif ".64" in inst:   cm.sass_ldg_64 += 1
-                else:                 cm.sass_ldg_32 += 1
-                classified += 1
-            elif inst.startswith("STG"):
-                if ".128" in inst:    cm.sass_stg_128 += 1
-                elif ".64" in inst:   cm.sass_stg_64 += 1
-                else:                 cm.sass_stg_32 += 1
-                classified += 1
-            elif inst.startswith("LDS"):   cm.sass_lds += 1; classified += 1
-            elif inst.startswith("STS"):   cm.sass_sts += 1; classified += 1
-            elif inst.startswith("LDL"):   cm.sass_ldl += 1; classified += 1
-            elif inst.startswith("STL"):   cm.sass_stl += 1; classified += 1
-            elif inst.startswith("FFMA"):  cm.sass_ffma += 1; classified += 1
-            elif inst.startswith("HFMA2"): cm.sass_hfma2 += 1; classified += 1
-            elif inst.startswith("MUFU"):  cm.sass_mufu += 1; classified += 1
-            elif inst.startswith("FADD"):  cm.sass_fadd += 1; classified += 1
-            elif inst.startswith("FMUL"):  cm.sass_fmul += 1; classified += 1
-            elif inst == "BAR" or inst.startswith("BAR."): cm.sass_bar += 1; classified += 1
-            elif inst.startswith("SHFL"):  cm.sass_shfl += 1; classified += 1
-            elif inst.startswith("BRA"):   cm.sass_bra += 1; classified += 1
-            # --- New: categories that dominate FP4 quantization code ---
-            elif inst.startswith("MOV"):   cm.sass_mov += 1; classified += 1
-            elif inst.startswith("FSETP"): cm.sass_fsetp += 1; classified += 1
-            elif inst.startswith("SETP"):  cm.sass_setp += 1; classified += 1
-            elif inst.startswith("SEL"):   cm.sass_sel += 1; classified += 1
-            elif inst.startswith("IMAD"):  cm.sass_imad += 1; classified += 1
-            elif inst.startswith("IADD"):  cm.sass_iadd += 1; classified += 1
-            elif inst.startswith("ISETP"): cm.sass_isetp += 1; classified += 1
-            elif inst.startswith("F2F"):   cm.sass_f2f += 1; classified += 1
-            elif inst.startswith("I2F") or inst.startswith("I2FP"): cm.sass_i2f += 1; classified += 1
-            elif inst.startswith("F2I"):   cm.sass_f2i += 1; classified += 1
-            elif inst.startswith("PRMT"):  cm.sass_prmt += 1; classified += 1
-            elif inst.startswith("LOP3") or inst.startswith("LOP"):  cm.sass_lop3 += 1; classified += 1
-            elif inst.startswith("SHF"):   cm.sass_shf += 1; classified += 1
-            else:
-                cm.sass_other += 1
-
-        return cm if cm.sass_total_instructions > 0 else None
-
     # ── Profiling ─────────────────────────────────────────────────────────────
 
     def profile(
@@ -217,7 +136,7 @@ class KernelProfiler:
         timing_us: float = 0.0,
         compiler_metrics: 'CompilerMetrics' = None,
     ) -> Optional[KernelMetrics]:
-        """Profile using hybrid profiler (timing + compiler metrics + SASS)."""
+        """Profile using hybrid profiler (timing + compiler metrics)."""
         if not kernel_src or not kernel_type or not problem_shape or timing_us <= 0:
             logger.warning("Profiler: insufficient info (type=%s shape=%s timing=%.1f)",
                           kernel_type, problem_shape, timing_us)

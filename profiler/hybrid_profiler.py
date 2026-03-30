@@ -6,8 +6,7 @@ Real data sources:
   2. CUDA Occupancy API  -> sm_occupancy (compiled query program)
   3. Theoretical occupancy fallback (from register count + block size + shared mem)
   4. Compiler metrics     -> registers, spills, smem (from nvcc -Xptxas -v)
-  5. SASS instruction mix -> from cuobjdump -sass (via CompilerMetrics)
-  6. Roofline math        -> mem_throughput_pct (from timing + transfer bytes)
+  5. Roofline math        -> mem_throughput_pct (from timing + transfer bytes)
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ class HybridProfiler:
     """
     Computes kernel metrics from real data sources.
 
-    Returns: timing, speedup, SM occupancy, mem_throughput_pct, and compiler/SASS metrics.
+    Returns: timing, speedup, SM occupancy, mem_throughput_pct, and compiler metrics.
     """
 
     def __init__(self, config: dict, hw_spec: dict):
@@ -141,9 +140,6 @@ class HybridProfiler:
             log_parts.append(f"regs={cm.registers_per_thread}")
         if cm.has_spills:
             log_parts.append(f"SPILLS={cm.spill_stores_bytes}B")
-        if cm.sass_total_instructions > 0:
-            log_parts.append(f"sass={cm.sass_total_instructions}")
-            log_parts.append(f"vec_ld%={cm.vectorized_load_pct:.0f}")
 
         logger.info("Hybrid profiler: %s", " ".join(log_parts))
         return metrics

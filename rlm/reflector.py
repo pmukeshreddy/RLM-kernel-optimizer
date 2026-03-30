@@ -135,11 +135,7 @@ def _build_hw_context(hw_spec: dict) -> str:
 # ── Profile data formatter ───────────────────────────────────────────────────
 
 def _format_profile_section(metrics: dict, iteration: int) -> str:
-    """Format REAL profiler data only: timing, occupancy, compiler metrics, SASS.
-
-    Bottleneck-filtered (CUDAMaster technique): when the kernel is memory-bound,
-    suppress compute metrics to prevent the LLM from chasing compute red herrings.
-    """
+    """Format real runtime and compiler resource data only."""
     if not metrics:
         return ""
 
@@ -178,75 +174,14 @@ def _format_profile_section(metrics: dict, iteration: int) -> str:
         regs = cm.get("registers_per_thread", 0)
         spill_total = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
         smem = cm.get("static_smem_bytes", 0)
+        stack = cm.get("stack_frame_bytes", 0)
 
         lines.append("")
         lines.append(f"Registers per thread:          {regs}")
         lines.append(f"Register spills:               {spill_total} bytes{' *** SPILLING ***' if spill_total > 0 else ''}")
         lines.append(f"Shared memory:                 {smem} bytes")
-
-        # SASS instruction breakdown — the agent needs this to optimize at instruction level
-        sass_total = cm.get("sass_total_instructions", 0)
-        if sass_total > 0:
-            lines.append("")
-            lines.append(f"SASS instruction count:        {sass_total}")
-            # Loads by width
-            ldg32 = cm.get("sass_ldg_32", 0)
-            ldg64 = cm.get("sass_ldg_64", 0)
-            ldg128 = cm.get("sass_ldg_128", 0)
-            lines.append(f"  Global loads:                LDG.32={ldg32}  LDG.64={ldg64}  LDG.128={ldg128}")
-            # Stores by width
-            stg32 = cm.get("sass_stg_32", 0)
-            stg64 = cm.get("sass_stg_64", 0)
-            stg128 = cm.get("sass_stg_128", 0)
-            lines.append(f"  Global stores:               STG.32={stg32}  STG.64={stg64}  STG.128={stg128}")
-            # Compute
-            ffma = cm.get("sass_ffma", 0)
-            hfma2 = cm.get("sass_hfma2", 0)
-            mufu = cm.get("sass_mufu", 0)
-            fadd = cm.get("sass_fadd", 0)
-            fmul = cm.get("sass_fmul", 0)
-            lines.append(f"  Compute:                     FFMA={ffma}  HFMA2={hfma2}  MUFU={mufu}  FADD={fadd}  FMUL={fmul}")
-            # Type conversions (bf16↔float overhead)
-            f2f = cm.get("sass_f2f", 0)
-            i2f = cm.get("sass_i2f", 0)
-            f2i = cm.get("sass_f2i", 0)
-            if f2f + i2f + f2i > 0:
-                lines.append(f"  Type convert:                F2F={f2f}  I2F={i2f}  F2I={f2i}")
-            # Predicate/select (from branchy FP4 quantization)
-            fsetp = cm.get("sass_fsetp", 0)
-            setp = cm.get("sass_setp", 0)
-            sel = cm.get("sass_sel", 0)
-            if fsetp + setp + sel > 0:
-                lines.append(f"  Predicate/select:            FSETP={fsetp}  SETP={setp}  SEL={sel}")
-            # Integer/address math
-            imad = cm.get("sass_imad", 0)
-            iadd = cm.get("sass_iadd", 0)
-            isetp = cm.get("sass_isetp", 0)
-            if imad + iadd + isetp > 0:
-                lines.append(f"  Integer/addr math:           IMAD={imad}  IADD={iadd}  ISETP={isetp}")
-            # Bit manipulation (FP4 packing overhead)
-            prmt = cm.get("sass_prmt", 0)
-            lop3 = cm.get("sass_lop3", 0)
-            shf = cm.get("sass_shf", 0)
-            if prmt + lop3 + shf > 0:
-                lines.append(f"  Bit manipulation:            PRMT={prmt}  LOP3={lop3}  SHF={shf}")
-            # Control flow
-            bra = cm.get("sass_bra", 0)
-            bar = cm.get("sass_bar", 0)
-            shfl = cm.get("sass_shfl", 0)
-            mov = cm.get("sass_mov", 0)
-            lines.append(f"  Control/sync:                BRA={bra}  BAR={bar}  SHFL={shfl}  MOV={mov}")
-            # Shared mem and spill instructions
-            lds = cm.get("sass_lds", 0)
-            sts = cm.get("sass_sts", 0)
-            ldl = cm.get("sass_ldl", 0)
-            stl = cm.get("sass_stl", 0)
-            if lds + sts + ldl + stl > 0:
-                lines.append(f"  Shared/local:                LDS={lds}  STS={sts}  LDL={ldl}  STL={stl}")
-            # Other
-            other = cm.get("sass_other", 0)
-            if other > 0:
-                lines.append(f"  Other unclassified:          {other}")
+        if stack > 0:
+            lines.append(f"Stack frame:                   {stack} bytes")
 
     lines.append("```")
     return "\n".join(lines)
@@ -291,110 +226,41 @@ _REDUCTION_KERNEL_TYPES = frozenset({
 
 def _format_suggestions_section(metrics: dict, ineffective: set = None,
                                  kernel_type: str = "") -> str:
-    """Generate data-driven suggestions based on SASS instruction breakdown.
-    No hardcoded strategies — just quantitative observations about the instruction mix."""
+    """Generate data-driven suggestions from runtime and compiler-resource data."""
     cm = metrics.get("_compiler", {})
-    sass_total = cm.get("sass_total_instructions", 0)
-    if sass_total == 0:
-        return ""
 
     hints: list[str] = []
+    mem_tput = metrics.get("mem_throughput_pct", 0)
+    compute_tput = metrics.get("compute_throughput_pct", 0)
+    occupancy = metrics.get("sm_occupancy", 0)
 
-    # Branch analysis
-    bra = cm.get("sass_bra", 0)
-    if bra > 0:
-        bra_pct = bra / sass_total * 100
-        if bra_pct > 5:
-            hints.append(
-                f"Branch instructions (BRA={bra}, {bra_pct:.0f}% of total) — "
-                f"look for branchless alternatives or hardware intrinsics"
-            )
-
-    # Store width analysis
-    stg32 = cm.get("sass_stg_32", 0)
-    stg64 = cm.get("sass_stg_64", 0)
-    stg128 = cm.get("sass_stg_128", 0)
-    total_stg = stg32 + stg64 + stg128
-    if stg32 > 0 and total_stg > 0:
-        narrow_pct = stg32 / total_stg * 100
-        if narrow_pct > 50:
-            hints.append(
-                f"Narrow stores (STG.32={stg32}/{total_stg} total, {narrow_pct:.0f}% are 32-bit) — "
-                f"pack outputs into wider stores (64/128-bit)"
-            )
-
-    # Load width analysis
-    ldg32 = cm.get("sass_ldg_32", 0)
-    ldg128 = cm.get("sass_ldg_128", 0)
-    total_ldg = ldg32 + cm.get("sass_ldg_64", 0) + ldg128
-    if ldg32 > 0 and total_ldg > 0:
-        narrow_ld_pct = ldg32 / total_ldg * 100
-        if narrow_ld_pct > 30:
-            hints.append(
-                f"Narrow loads (LDG.32={ldg32}/{total_ldg} total) — "
-                f"use vectorized 128-bit loads (uint4/float4)"
-            )
-
-    # Separate mul+add vs fused
-    fadd = cm.get("sass_fadd", 0)
-    fmul = cm.get("sass_fmul", 0)
-    ffma = cm.get("sass_ffma", 0)
-    if fadd > 0 and fmul > 0 and (fadd + fmul) > ffma:
+    spill_total = cm.get("spill_stores_bytes", 0) + cm.get("spill_loads_bytes", 0)
+    if spill_total > 0:
         hints.append(
-            f"Separate FADD={fadd} + FMUL={fmul} vs FFMA={ffma} — "
-            f"use fmaf() to fuse multiply-add into single instructions"
+            f"Register spills ({spill_total} bytes) — reduce live state or simplify per-thread work"
         )
-
-    # Spill analysis
-    ldl = cm.get("sass_ldl", 0)
-    stl = cm.get("sass_stl", 0)
-    if ldl + stl > 0:
-        spill_pct = (ldl + stl) / sass_total * 100
+    regs = cm.get("registers_per_thread", 0)
+    if regs >= 96:
         hints.append(
-            f"Register spills (LDL={ldl} + STL={stl}, {spill_pct:.0f}% of total) — "
-            f"reduce register pressure or add __launch_bounds__"
+            f"High register count ({regs} per thread) — trim live ranges before adding more fused work"
         )
-
-    # FSETP+SEL chains — branchy FP4 quantization code
-    fsetp = cm.get("sass_fsetp", 0)
-    sel = cm.get("sass_sel", 0)
-    if fsetp + sel > 10:
+    if occupancy > 0 and occupancy < 75.0:
         hints.append(
-            f"Predicate/select chains (FSETP={fsetp} + SEL={sel}) — "
-            f"these come from threshold-based FP4 quantization; "
-            f"use search_docs to find hardware FP4 conversion intrinsics"
+            f"Low SM occupancy ({occupancy:.1f}%) — prefer smaller localized changes that preserve occupancy"
         )
-
-    # F2F type conversion overhead
-    f2f = cm.get("sass_f2f", 0)
-    if f2f > 8:
+    if mem_tput >= max(compute_tput, 25.0):
         hints.append(
-            f"Type conversions (F2F={f2f}) — bf16↔float conversion overhead; "
-            f"keep computation in native bf16 using bfloat162 pair operations"
+            f"Memory throughput is the stronger signal ({mem_tput:.1f}% vs compute {compute_tput:.1f}%) — remove extra passes or improve memory access locality"
         )
-
-    # Bit packing overhead (only penalize if still using software FP4 conversion)
-    prmt = cm.get("sass_prmt", 0)
-    lop3 = cm.get("sass_lop3", 0)
-    shf = cm.get("sass_shf", 0)
-    if (prmt + lop3 + shf > 8) and (fsetp + sel >= 4):
+    elif compute_tput > 25.0:
         hints.append(
-            f"Bit manipulation (PRMT={prmt} + LOP3={lop3} + SHF={shf}) — "
-            f"software FP4 packing detected alongside predicate chains. "
-            f"Use __nv_cvt_bfloat16raw2_to_fp4x2 conversion intrinsic."
-        )
-
-    # High total instruction count
-    if sass_total > 400:
-        hints.append(
-            f"High total instruction count ({sass_total}) — "
-            f"look for multi-instruction sequences that could be replaced with single hardware intrinsics"
+            f"Compute throughput is the stronger signal ({compute_tput:.1f}% of peak) — simplify one arithmetic hot path or use a hardware intrinsic"
         )
 
     if not hints:
         return ""
 
-    lines = ["\n### SASS Analysis"]
+    lines = ["\n### Optimization Signals"]
     for h in hints:
         lines.append(f"- {h}")
     return "\n".join(lines)
@@ -535,50 +401,15 @@ def _format_delta_section(current: dict, previous: dict,
             warn = "  *** REGRESSED ***" if cur_spills > prev_spills else "  (improved)" if cur_spills < prev_spills else ""
             lines.append(f"{'Register spill bytes':30s}  {prev_spills:6d}  -> {cur_spills:6d}{warn}")
 
-        # SASS instruction count delta — critical for tracking instruction-level progress
-        cur_sass = cur_cm.get("sass_total_instructions", 0)
-        prev_sass = prev_cm.get("sass_total_instructions", 0)
-        if cur_sass > 0 and prev_sass > 0 and cur_sass != prev_sass:
-            delta = cur_sass - prev_sass
-            direction = "fewer" if delta < 0 else "more"
-            lines.append(f"{'SASS instructions':30s}  {prev_sass:6d}  -> {cur_sass:6d}  ({abs(delta)} {direction})")
-
-        # Key instruction category deltas
         for label, key in [
-            # Memory access widths
-            ("Loads LDG.32", "sass_ldg_32"),
-            ("Loads LDG.64", "sass_ldg_64"),
-            ("Loads LDG.128", "sass_ldg_128"),
-            ("Stores STG.32", "sass_stg_32"),
-            ("Stores STG.64", "sass_stg_64"),
-            ("Stores STG.128", "sass_stg_128"),
-            # Compute
-            ("FFMA (fused mul-add)", "sass_ffma"),
-            ("HFMA2 (half2 FMA)", "sass_hfma2"),
-            ("MUFU (SFU/transcendental)", "sass_mufu"),
-            ("FADD", "sass_fadd"),
-            ("FMUL", "sass_fmul"),
-            # Type conversions
-            ("F2F (type convert)", "sass_f2f"),
-            # Predicate/select
-            ("FSETP (FP predicate)", "sass_fsetp"),
-            ("SEL (select)", "sass_sel"),
-            # Bit manipulation
-            ("PRMT (permute)", "sass_prmt"),
-            ("LOP3 (logic op)", "sass_lop3"),
-            ("SHF (funnel shift)", "sass_shf"),
-            # Control flow
-            ("Branches (BRA)", "sass_bra"),
-            ("Barriers (BAR)", "sass_bar"),
-            ("Shuffles (SHFL)", "sass_shfl"),
-            # Spills
-            ("LDL (spill load)", "sass_ldl"),
-            ("STL (spill store)", "sass_stl"),
+            ("Shared memory bytes", "static_smem_bytes"),
+            ("Stack frame bytes", "stack_frame_bytes"),
+            ("Constant memory bytes", "cmem_bytes"),
         ]:
             cur_v = cur_cm.get(key, 0)
             prev_v = prev_cm.get(key, 0)
             if cur_v != prev_v and (cur_v > 0 or prev_v > 0):
-                lines.append(f"{'  ' + label:30s}  {prev_v:6d}  -> {cur_v:6d}")
+                lines.append(f"{label:30s}  {prev_v:6d}  -> {cur_v:6d}")
 
     lines.append("```")
 

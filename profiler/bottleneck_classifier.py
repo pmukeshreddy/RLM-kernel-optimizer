@@ -36,11 +36,6 @@ class BottleneckClassifier:
 
         # Low utilization on both axes
         if metrics.mem_throughput_pct < 30 and metrics.compute_throughput_pct < 30:
-            # Fallback heuristic using SASS metrics if available
-            if hasattr(metrics, '_compiler_metrics') and metrics._compiler_metrics:
-                cm = metrics._compiler_metrics
-                if cm.memory_instruction_ratio > 5.0 or cm.vectorized_load_pct > 0.0:
-                    return Bottleneck.MEMORY_BOUND
             return Bottleneck.LATENCY_BOUND
 
         return Bottleneck.UNKNOWN
