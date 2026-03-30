@@ -156,6 +156,7 @@ def _render_planner_prompt(spec: PlannerSpec) -> str:
         "Use the Pinecone RAG context to name concrete implementation patterns or reference kernels.",
         "Prefer branches that adapt retrieved production code over branches that speculate about bottlenecks.",
         "If the RAG context already contains a strong production pattern, branch around minimal adaptations of that pattern.",
+        "Assume the coder will only implement the branch you output; make the adaptation scope explicit and narrow.",
         "Each branch must be distinct and testable in one sandbox iteration.",
         "Do not write CUDA code.",
         "No prose outside the JSON array.",

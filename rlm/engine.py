@@ -138,11 +138,10 @@ SEARCH_PINECONE_TOOL = {
     },
 }
 
-ALL_TOOLS = [
+REFINE_TOOLS = [
     SUBMIT_KERNEL_TOOL,
     READ_FILE_TOOL,
     SEARCH_DOCS_TOOL,
-    SEARCH_PINECONE_TOOL,
 ]
 
 REFINE_SYSTEM_PROMPT = f"""\
@@ -155,7 +154,6 @@ Available tools (only submit_kernel counts toward your turn limit):
 - submit_kernel: compile, test correctness, and benchmark your kernel
 - read_file: read project header files (nvfp4_utils.cuh, b200_intrinsics.cuh) or reference kernels
 - search_docs: look up CUDA intrinsic signatures and usage (fp4, fp8, warp, fast math, memory)
-- search_pinecone: query the user's Pinecone knowledge index for project-specific guidance
 
 Target hardware — NVIDIA B200 (sm_100a, Blackwell):
 - HBM3e: 8 TB/s bandwidth, 192 GB
@@ -362,7 +360,8 @@ class RLMEngine:
             f"{operation} vectorized loads stores bf16 fp4 CUDA source code",
         ]
 
-    def _expand_tree_plans(self, parent: KernelCandidate) -> list[dict]:
+    def _expand_tree_plans(self, parent: KernelCandidate, branch_count: int | None = None) -> list[dict]:
+        branch_count = int(branch_count or self.tree_branching_factor)
         rag_context = self._search_pinecone_context(
             parent.plan_branch.get("rag_queries")
             or [f"{self.env.kernel_type} {parent.strategy} next optimization"]
@@ -390,12 +389,12 @@ class RLMEngine:
             kernel_src=parent.best_code or parent.code,
             feedback_summary=feedback.planner_summary(),
             rag_context=rag_context,
-            branch_count=self.tree_branching_factor,
+            branch_count=branch_count,
         )
         response, _, _ = self._call_llm(prompt, model=self.root_model, temperature=0.2)
         return parse_plan_response(
             response,
-            count=self.tree_branching_factor,
+            count=branch_count,
             prefix=f"{parent.strategy}_child",
             parent_strategy=parent.strategy,
         )
@@ -463,7 +462,7 @@ class RLMEngine:
             try:
                 response = await self._call_llm_with_tools_async(
                     messages=messages,
-                    tools=ALL_TOOLS,
+                    tools=REFINE_TOOLS,
                     model=model_id,
                     system=system_prompt,
                     temperature=0.4,
@@ -754,12 +753,15 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                            profile_fn=None) -> list:
         tasks = []
         for candidate in survivors:
-            if (
-                candidate.speedup >= self.tree_speedup_threshold
-                and candidate.feedback_route == "planner_tree"
-            ):
-                child_plans = self._expand_tree_plans(candidate)
-                for child_plan in child_plans:
+            if candidate.compile_ok and candidate.correct:
+                branch_count = (
+                    self.tree_branching_factor
+                    if candidate.speedup >= self.tree_speedup_threshold
+                    and candidate.feedback_route == "planner_tree"
+                    else 1
+                )
+                followup_plans = self._expand_tree_plans(candidate, branch_count=branch_count)
+                for child_plan in followup_plans:
                     tasks.append(
                         self._refine_single_beam(
                             candidate,
@@ -783,24 +785,23 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     kernel_type=self.env.kernel_type,
                     candidate=candidate,
                 )
-                repair_plan = {
-                    "name": f"{candidate.strategy}_repair",
-                    "goal": "Repair the failing or below-baseline branch.",
-                    "what": feedback.next_action,
-                    "change_summary": feedback.next_action,
-                    "bottleneck": "",
-                    "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
-                    "rag_queries": feedback.rag_queries,
-                    "planner_notes": feedback.planner_summary(),
-                    "parent_strategy": candidate.strategy,
-                    "tree_ready": False,
-                }
                 tasks.append(
                     self._refine_single_beam(
                         candidate,
                         round_num,
                         profile_fn=profile_fn,
-                        plan_branch=repair_plan,
+                        plan_branch={
+                            "name": f"{candidate.strategy}_repair",
+                            "goal": "Repair the failing branch without changing its overall strategy family.",
+                            "what": feedback.next_action,
+                            "change_summary": feedback.next_action,
+                            "bottleneck": "",
+                            "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
+                            "rag_queries": feedback.rag_queries,
+                            "planner_notes": feedback.planner_summary(),
+                            "parent_strategy": candidate.strategy,
+                            "tree_ready": False,
+                        },
                         fixer_mode=True,
                         feedback=feedback,
                     )

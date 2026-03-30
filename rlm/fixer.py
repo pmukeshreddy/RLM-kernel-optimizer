@@ -27,6 +27,7 @@ def build_fixer_prompt(
     parts.append(
         "Rules:\n"
         "- Fix the concrete failure mode first.\n"
+        "- Do not change strategy family or overall optimization direction while repairing.\n"
         "- If speedup is below 1.0x, question the current adaptation before making another large change.\n"
         "- Use observations as ground truth and hypothesis_test.status to decide whether the last idea was confirmed or falsified.\n"
         "- Treat uncertainty as real. Do not invent a stronger diagnosis than the measurements support.\n"
@@ -34,7 +35,7 @@ def build_fixer_prompt(
         "- Make one local repair or follow-up experiment at a time.\n"
         "- Use next_action.success_criteria and next_action.abort_if to bound the experiment.\n"
         "- Use memory.tried_and_failed to avoid repeating dead ends.\n"
-        "- Use search_pinecone when you need implementation guidance from the knowledge index.\n"
+        "- Use the attached Pinecone RAG context only; do not start a new Pinecone search.\n"
         "- Before submit_kernel, explain the observed failure mode or measured result and the exact repair you are making.\n"
         "- Then call submit_kernel with the complete .cu file."
     )

@@ -45,12 +45,14 @@ def build_coder_prompt(
     parts.append(
         "Rules:\n"
         "- Implement this branch only.\n"
+        "- Planner owns strategy selection. Do not change branch family, optimization surface, or overall direction.\n"
         "- Preserve correctness and the launch signature.\n"
         "- submit_kernel returns evaluator JSON, not prose. Use observations, hypothesis_test, next_action, memory, uncertainty, and rag.\n"
-        "- Use search_pinecone when the attached RAG context is not enough.\n"
+        "- Use the attached Pinecone RAG context as the planner-approved reference set. Do not start a new Pinecone search or invent a new strategy.\n"
         "- Treat observations as ground truth. Treat hypothesis_test.status as the verdict on your last idea.\n"
-        "- If the RAG context already shows a strong production pattern, prefer adapting that pattern over inventing a new theory.\n"
+        "- If the attached RAG context shows a strong production pattern, adapt that pattern as faithfully as possible within this branch.\n"
         "- Make one local experiment at a time. Follow next_action.success_criteria and next_action.abort_if.\n"
+        "- If the branch seems weak, keep the adaptation minimal and let the sandbox result send control back to the planner.\n"
         "- Before submit_kernel, explain what the latest result confirmed or left uncertain and the exact code change.\n"
         "- Then call submit_kernel with the complete .cu file."
     )
