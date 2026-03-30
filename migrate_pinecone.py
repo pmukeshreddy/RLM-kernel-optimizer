@@ -167,6 +167,10 @@ def main() -> int:
                         help="IDs per fetch call (default: 200)")
     parser.add_argument("--upsert-batch", type=int, default=50,
                         help="Records per upsert call (default: 50)")
+    parser.add_argument("--batch-delay", type=float, default=4.0,
+                        help="Seconds to sleep between upsert batches to avoid rate limits (default: 4.0)")
+    parser.add_argument("--start-from", type=int, default=0,
+                        help="Skip this many records at the start — use to resume after a 429 (default: 0)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and count only — no writes")
     args = parser.parse_args()
@@ -228,11 +232,31 @@ def main() -> int:
     new_index = pc.Index(args.new)
 
     # ── Step 3: upsert records ────────────────────────────────────────────
-    logger.info("=== Step 3: Upserting %d records into %r ===", len(upsert_docs), args.new)
-    for i in range(0, len(upsert_docs), args.upsert_batch):
-        batch = upsert_docs[i : i + args.upsert_batch]
-        new_index.upsert_records(args.namespace or "__default__", batch)
-        logger.info("  upserted %d / %d", min(i + args.upsert_batch, len(upsert_docs)), len(upsert_docs))
+    remaining = upsert_docs[args.start_from:]
+    total = len(upsert_docs)
+    if args.start_from:
+        logger.info("Resuming from record %d (skipping first %d already upserted).",
+                    args.start_from, args.start_from)
+    logger.info("=== Step 3: Upserting %d records into %r ===", len(remaining), args.new)
+
+    for i in range(0, len(remaining), args.upsert_batch):
+        batch = remaining[i : i + args.upsert_batch]
+        # Retry up to 5 times on 429 with exponential backoff
+        for attempt in range(5):
+            try:
+                new_index.upsert_records(args.namespace or "__default__", batch)
+                break
+            except Exception as exc:
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    wait = 60 * (attempt + 1)
+                    logger.warning("Rate limited (429). Waiting %ds before retry %d/5...", wait, attempt + 1)
+                    time.sleep(wait)
+                else:
+                    raise
+        done = args.start_from + i + len(batch)
+        logger.info("  upserted %d / %d", done, total)
+        if i + args.upsert_batch < len(remaining):
+            time.sleep(args.batch_delay)
 
     # ── Step 4: print update instructions ────────────────────────────────
     logger.info("=== Migration complete ===")
