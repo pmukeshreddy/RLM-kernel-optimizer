@@ -373,6 +373,12 @@ int main(int argc, char** argv) {{
             return None
         return ((graph_timing_us - binary_timing_us) / binary_timing_us) * 100.0
 
+    @staticmethod
+    def _speedup_from_timing(baseline_us: float, timing_us: Optional[float]) -> float:
+        if timing_us is None or timing_us <= 0 or baseline_us <= 0:
+            return 0.0
+        return baseline_us / timing_us
+
     def _profile_candidate(
         self,
         candidate: KernelCandidate,
@@ -430,6 +436,8 @@ int main(int argc, char** argv) {{
                 graph_timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
                 binary_timing_us = self.profiler.benchmark_timing(binary)
                 timing_delta_pct = self._timing_delta_pct(graph_timing_us, binary_timing_us)
+                graph_speedup = self._speedup_from_timing(baseline_us, graph_timing_us)
+                binary_speedup = self._speedup_from_timing(baseline_us, binary_timing_us)
 
                 if graph_timing_us is not None or binary_timing_us is not None:
                     graph_str = f"{graph_timing_us:.3f}" if graph_timing_us is not None else "n/a"
@@ -442,16 +450,32 @@ int main(int argc, char** argv) {{
                         binary_str,
                         delta_str,
                     )
+                    logger.info(
+                        "  Speedup check [%s]: baseline=%.3fus source=%s graph=%.3fx binary=%.3fx",
+                        candidate.strategy,
+                        baseline_us,
+                        self.env.baseline_source,
+                        graph_speedup,
+                        binary_speedup,
+                    )
+                    if timing_delta_pct is not None and abs(timing_delta_pct) >= 10.0:
+                        logger.warning(
+                            "  Timing-path mismatch [%s]: graph and binary differ by %.1f%%",
+                            candidate.strategy,
+                            timing_delta_pct,
+                        )
 
                 timing_us = graph_timing_us
+                timing_path = "graph"
                 if timing_us is None:
                     logger.warning(
                         "Graph benchmark failed for [%s]; falling back to binary event timing",
                         candidate.strategy,
                     )
                     timing_us = binary_timing_us
+                    timing_path = "binary_fallback"
                 if timing_us is not None:
-                    speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
+                    speedup = self._speedup_from_timing(baseline_us, timing_us)
                     metrics = self.profiler.profile(
                         binary, report_name=name,
                         kernel_src=candidate.code,
@@ -467,10 +491,23 @@ int main(int argc, char** argv) {{
                         metrics.graph_timing_us = graph_timing_us or 0.0
                         metrics.binary_timing_us = binary_timing_us or 0.0
                         metrics.timing_delta_pct = timing_delta_pct or 0.0
+                        metrics.graph_speedup = graph_speedup
+                        metrics.binary_speedup = binary_speedup
                         logger.info("  Profiler: occ=%.1f%% timing=%.1fus speedup=%.3fx",
                                     metrics.sm_occupancy, metrics.duration_us, metrics.speedup)
                     else:
                         logger.warning("  Profiler returned no metrics for [%s]", candidate.strategy)
+                    candidate.metrics = {
+                        "baseline_us": baseline_us,
+                        "baseline_source": self.env.baseline_source,
+                        "selected_timing_path": timing_path,
+                        "selected_timing_us": timing_us,
+                        "graph_timing_us": graph_timing_us,
+                        "binary_timing_us": binary_timing_us,
+                        "timing_delta_pct": timing_delta_pct,
+                        "graph_speedup": graph_speedup,
+                        "binary_speedup": binary_speedup,
+                    }
                 ok = True
 
         # Runtime hack checks — run after compile confirms the kernel is valid CUDA
@@ -492,7 +529,9 @@ int main(int argc, char** argv) {{
         # Always set speedup from timing, even if profiling failed
         candidate.speedup = speedup
         if metrics:
-            candidate.metrics    = metrics.to_dict()
+            metrics_dict = metrics.to_dict()
+            metrics_dict.update(candidate.metrics)
+            candidate.metrics = metrics_dict
             candidate.bottleneck = self._branch_family(candidate) or "unlabeled"
         if candidate.compile_ok and candidate.correct:
             candidate.feedback_route = (

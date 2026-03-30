@@ -37,6 +37,8 @@ class KernelMetrics:
     graph_timing_us:        float = 0.0
     binary_timing_us:       float = 0.0
     timing_delta_pct:       float = 0.0
+    graph_speedup:          float = 0.0
+    binary_speedup:         float = 0.0
     speedup:                float = 1.0
 
     def to_dict(self) -> dict:
