@@ -119,7 +119,7 @@ def _compiler_queries(kernel_type: str, error: str) -> list[str]:
     first = _first_actionable_error(error)
     operation = _kernel_operation_phrase(kernel_type)
     queries = [
-        f"Operation: {operation}. Hardware: Blackwell B200 sm100a. Problem: CUDA compile error. Signature: {first}",
+        f"Operation: {operation}. Problem: CUDA compile error. Signature: {first}. Need: production CUDA source_code.",
         f"{operation} launch signature compile error CUDA",
     ]
     if "__syncthreads" in error:
@@ -188,7 +188,7 @@ def _build_targeted_query(kernel_type: str, metrics: dict, focus_terms: list[str
     aliases = ", ".join(_kernel_aliases(kernel_type)[:4])
     optimizations = ", ".join(focus_terms[:4]) or "instruction mix"
     return (
-        f"Operation: {operation}. Hardware: Blackwell B200 sm100a. "
+        f"Operation: {operation}. "
         f"Aliases: {aliases}. Optimizations: {optimizations}. "
         f"Need: production CUDA kernel source_code."
     )
@@ -201,22 +201,22 @@ def _performance_queries(kernel_type: str, metrics: dict) -> list[str]:
 
     if focus_terms:
         primary = " ".join(focus_terms[:2])
-        queries.append(f"{operation} Blackwell B200 {primary} CUDA source")
+        queries.append(f"{operation} {primary} CUDA source code")
 
     compiler = metrics.get("_compiler", {}) if metrics else {}
     if compiler.get("sass_bra", 0) > 3:
-        queries.append(f"{operation} B200 warp shuffle reduction branchless CUDA")
+        queries.append(f"{operation} warp shuffle reduction branchless CUDA")
     if compiler.get("sass_stg_32", 0) > 1:
-        queries.append(f"{operation} B200 vectorized stores uint4 store packing CUDA")
+        queries.append(f"{operation} vectorized stores uint4 store packing CUDA")
     if compiler.get("sass_ldg_32", 0) > 2:
-        queries.append(f"{operation} B200 vectorized loads uint4 alignment CUDA")
+        queries.append(f"{operation} vectorized loads uint4 alignment CUDA")
     if compiler.get("registers_per_thread", 0) > 96:
-        queries.append(f"{operation} B200 register pressure occupancy reduction CUDA")
+        queries.append(f"{operation} register pressure occupancy reduction CUDA")
     if compiler.get("sass_fadd", 0) + compiler.get("sass_fmul", 0) > compiler.get("sass_ffma", 0):
-        queries.append(f"{operation} B200 bf16 ffma fusion CUDA")
+        queries.append(f"{operation} bf16 ffma fusion CUDA")
 
     if len(queries) == 1:
-        queries.append(f"{operation} Blackwell B200 production CUDA optimization")
+        queries.append(f"{operation} production CUDA optimization source code")
 
     return _unique_queries(queries)
 

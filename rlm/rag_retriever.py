@@ -476,10 +476,26 @@ class PineconeRetriever:
         pool = matches[: max(top_n, self.rerank_pool)]
         for match in pool:
             metadata = match.metadata or {}
+            combined_text = "\n".join(
+                part
+                for part in (
+                    match.text,
+                    f"title: {match.title}" if match.title else "",
+                    f"source: {match.source}" if match.source else "",
+                    f"hardware_target: {metadata.get('hardware_target')}" if metadata.get("hardware_target") else "",
+                    f"op_type: {metadata.get('op_type')}" if metadata.get("op_type") else "",
+                    (
+                        f"optimization_pattern: {metadata.get('optimization_pattern')}"
+                        if metadata.get("optimization_pattern")
+                        else ""
+                    ),
+                )
+                if part
+            )
             documents.append(
                 {
                     "id": match.match_id,
-                    "text": match.text,
+                    "text": combined_text,
                     "title": match.title,
                     "source": match.source,
                     "hardware_target": str(metadata.get("hardware_target") or ""),
@@ -495,7 +511,7 @@ class PineconeRetriever:
                 documents=documents,
                 top_n=min(top_n, len(documents)),
                 return_documents=True,
-                rank_fields=["text", "title", "op_type", "optimization_pattern", "hardware_target"],
+                rank_fields=["text"],
                 parameters={"truncate": "END"},
             )
         except Exception as exc:  # pragma: no cover - network/runtime behavior

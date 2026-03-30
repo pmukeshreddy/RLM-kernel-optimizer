@@ -414,11 +414,11 @@ class RLMEngine:
         aliases = ", ".join(_kernel_aliases(env.kernel_type)[:4])
         return [
             (
-                f"Operation: {operation}. Hardware: Blackwell B200 sm100a. "
+                f"Operation: {operation}. "
                 f"Shape: {shape}. Aliases: {aliases}. Need: production CUDA kernel source_code."
             ),
-            f"{operation} Blackwell B200 FlashInfer bottleneck CUDA",
-            f"{operation} Blackwell B200 vectorized loads stores bf16 fp4 CUDA",
+            f"{operation} FlashInfer bottleneck CUDA source code",
+            f"{operation} vectorized loads stores bf16 fp4 CUDA source code",
         ]
 
     def _expand_tree_plans(self, parent: KernelCandidate) -> list[dict]:
