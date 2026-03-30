@@ -173,6 +173,7 @@ def _render_planner_prompt(spec: PlannerSpec) -> str:
                 "Spread branches across different optimization surfaces when possible.",
             ]
         )
+    rules_block = "\n- ".join(mode_rules)
 
     return f"""\
 You are the planner agent for a CUDA kernel optimizer.
@@ -195,7 +196,7 @@ Return ONLY a JSON array with exactly {spec.branch_count} objects in this schema
 ]
 
 Rules:
-- {"\n- ".join(mode_rules)}
+- {rules_block}
 """
 
 
