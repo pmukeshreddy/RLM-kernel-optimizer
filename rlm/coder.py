@@ -79,7 +79,7 @@ def build_coder_prompt(
             "For add+rmsnorm+fp4 on shape 128x2048, treat the Phase-2 residual_out reread as a primary cost center.",
             "Prefer project helpers from kernels/common/nvfp4_utils.cuh (for example pack_fp4_pair / quantize_block_nvfp4) over re-implementing a scalar branch chain.",
             "Preserve the working occupancy regime. The strong working path is around 32 registers/thread and 100% occupancy.",
-            "Hard guard: if your change is likely to push registers above 32 on this 128x2048 kernel, treat it as a probable regression unless it has a very strong reason to beat 1.05x.",
+            "Hard guard: if your first submit on this 128x2048 kernel shows registers above 32 and speedup below 1.05x, you MUST revert in the next turn. Do not iterate further on a high-register path.",
         ])
         if not _branch_mentions(branch_text, "warp", "shuffle", "reduction", "shfl", "syncthreads"):
             kernel_specific_rules.append(
@@ -91,6 +91,7 @@ def build_coder_prompt(
                 "Each thread owns exactly 8 elements (2048/256). If you cache them, use a float reg[8] budget consciously.",
                 "A float reg[8] cache costs about 8 registers. Starting from a ~32-register working path, that puts you near ~40 registers, which may drop occupancy sharply.",
                 "If you use reg[8], keep every other change minimal and avoid adding extra arrays or shared-memory staging unless absolutely necessary.",
+                "Abort condition for the single-pass path: if registers reach 40 and speedup stays below 1.05x, revert to the 32-register version immediately and do not continue refining the high-register path.",
             ])
         if _branch_mentions(branch_text, "fp4", "intrinsic", "pack", "quant"):
             kernel_specific_rules.append(
