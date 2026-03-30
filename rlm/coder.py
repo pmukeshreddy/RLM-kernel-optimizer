@@ -46,8 +46,10 @@ def build_coder_prompt(
         "Rules:\n"
         "- Implement this branch only.\n"
         "- Preserve correctness and the launch signature.\n"
-        "- submit_kernel returns evaluator JSON, not prose. Use verdict, evidence, next_action, and rag.\n"
+        "- submit_kernel returns evaluator JSON, not prose. Use observations, hypothesis_test, next_action, memory, and rag.\n"
         "- Use search_pinecone when the attached RAG context is not enough.\n"
+        "- Treat observations as ground truth. Treat hypothesis_test.status as the verdict on your last idea.\n"
+        "- Make one local experiment at a time. Follow next_action.success_criteria and next_action.abort_if.\n"
         "- Before submit_kernel, explain the bottleneck and the exact code change.\n"
         "- Then call submit_kernel with the complete .cu file."
     )

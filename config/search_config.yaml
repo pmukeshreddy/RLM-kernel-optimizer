@@ -16,6 +16,8 @@ beam:
   diversity_mode: "bottleneck_cluster"  # cluster-based pruning
   tree_speedup_threshold: 1.0 # once a branch clears baseline, expand it via planner tree
   tree_branching_factor: 2    # child branches created from above-baseline parents
+  family_retire_gap: 0.25     # retire plateaued families if they trail the leader by this much
+  family_retire_ratio: 0.80   # retire plateaued families if they trail the leader by this ratio
 
 strategies:
   enabled:

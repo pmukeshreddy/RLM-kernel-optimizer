@@ -35,6 +35,7 @@ class KernelCandidate:
     best_speedup: float = 0.0 # best speedup seen for this beam lineage
     strategy_context: str = "" # original strategy description — anchors refinement direction
     parent_strategy: str = ""
+    branch_family: str = ""
     plan_branch: dict = field(default_factory=dict)
     feedback_route: str = ""
 

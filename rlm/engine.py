@@ -437,6 +437,7 @@ class RLMEngine:
             parent_speedup=parent.speedup,
             prev_inner_metrics=parent.prev_metrics,
             kernel_type=self.env.kernel_type,
+            candidate=parent,
         )
         prompt = build_tree_plan_prompt(
             kernel_type=self.env.kernel_type,
@@ -583,6 +584,7 @@ class RLMEngine:
                 parent_speedup=max(best_speedup, comparison_speedup),
                 prev_inner_metrics=prev_inner_metrics,
                 kernel_type=self.env.kernel_type,
+                candidate=best or parent_candidate,
             )
             feedback_route = feedback.route
 
@@ -623,6 +625,11 @@ class RLMEngine:
                         parent_strategy=(
                             parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
                         ),
+                        branch_family=(
+                            parent_candidate.branch_family
+                            if parent_candidate and parent_candidate.branch_family
+                            else (plan_branch.get("parent_strategy") or plan_branch.get("name") or strategy_name)
+                        ),
                         plan_branch=dict(plan_branch),
                         feedback_route=feedback.route,
                     )
@@ -644,6 +651,11 @@ class RLMEngine:
             prev_metrics=parent_candidate.metrics if parent_candidate else None,
             parent_strategy=(
                 parent_candidate.strategy if parent_candidate else plan_branch.get("parent_strategy", "")
+            ),
+            branch_family=(
+                parent_candidate.branch_family
+                if parent_candidate and parent_candidate.branch_family
+                else (plan_branch.get("parent_strategy") or plan_branch.get("name") or strategy_name)
             ),
             plan_branch=dict(plan_branch),
             feedback_route=feedback_route,
@@ -774,6 +786,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             strategy=strat_name,
             round_num=round_num,
             compile_ok=bool(code),
+            branch_family=(plan_branch.get("parent_strategy") or plan_branch.get("name") or strat_name),
             plan_branch=plan_branch,
         )
         c.strategy_context = strat_desc
@@ -800,7 +813,10 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                            profile_fn=None) -> list:
         tasks = []
         for candidate in survivors:
-            if candidate.speedup >= self.tree_speedup_threshold:
+            if (
+                candidate.speedup >= self.tree_speedup_threshold
+                and candidate.feedback_route == "planner_tree"
+            ):
                 child_plans = self._expand_tree_plans(candidate)
                 for child_plan in child_plans:
                     tasks.append(
@@ -824,12 +840,14 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     parent_speedup=candidate.speedup,
                     prev_inner_metrics=candidate.prev_metrics,
                     kernel_type=self.env.kernel_type,
+                    candidate=candidate,
                 )
                 repair_plan = {
                     "name": f"{candidate.strategy}_repair",
                     "goal": "Repair the failing or below-baseline branch.",
                     "what": feedback.next_action,
                     "change_summary": feedback.next_action,
+                    "bottleneck": feedback.root_cause,
                     "expected_signal": "Compilation succeeds, correctness holds, and speed improves.",
                     "rag_queries": feedback.rag_queries,
                     "planner_notes": feedback.planner_summary(),
@@ -877,6 +895,7 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                 parent_speedup=parent.speedup,
                 prev_inner_metrics=parent.prev_metrics,
                 kernel_type=self.env.kernel_type,
+                candidate=parent,
             )
 
         rag_queries = plan_branch.get("rag_queries") or feedback.rag_queries

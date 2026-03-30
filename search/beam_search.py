@@ -49,7 +49,63 @@ class BeamSearch:
         self.checker  = CorrectnessChecker(env.search_config)
         self.beam_w   = env.search_config["beam"]["width"]
         self.rounds   = env.search_config["beam"]["refine_rounds"]
+        beam_cfg = env.search_config.get("beam", {})
+        self.family_retire_gap = float(beam_cfg.get("family_retire_gap", 0.25))
+        self.family_retire_ratio = float(beam_cfg.get("family_retire_ratio", 0.8))
         self._env_lock = threading.Lock()  # guards shared env counters
+
+    @staticmethod
+    def _branch_family(candidate: KernelCandidate) -> str:
+        return (
+            candidate.branch_family
+            or candidate.parent_strategy
+            or candidate.strategy.split("__", 1)[0]
+        )
+
+    @staticmethod
+    def _is_plateaued(candidate: KernelCandidate) -> bool:
+        if candidate.refine_attempts >= 1:
+            return True
+        recent = list(candidate.refinement_history[-2:])
+        return any(entry.get("outcome") in {"stagnant", "regression"} for entry in recent)
+
+    def _prune_stale_families(self, survivors: list[KernelCandidate]) -> list[KernelCandidate]:
+        if len(survivors) <= 1:
+            return survivors
+
+        best = max(survivors, key=lambda c: c.speedup)
+        best_family = self._branch_family(best)
+        pruned = []
+
+        for candidate in survivors:
+            if candidate is best:
+                pruned.append(candidate)
+                continue
+
+            family = self._branch_family(candidate)
+            materially_behind = (
+                candidate.speedup < best.speedup * self.family_retire_ratio
+                or (best.speedup - candidate.speedup) > self.family_retire_gap
+            )
+            if (
+                family != best_family
+                and materially_behind
+                and self._is_plateaued(candidate)
+            ):
+                logger.info(
+                    "Pruning stale family [%s]: best=%s %.3fx candidate=%.3fx attempts=%d",
+                    family,
+                    best_family,
+                    best.speedup,
+                    candidate.speedup,
+                    candidate.refine_attempts,
+                )
+                continue
+
+            pruned.append(candidate)
+
+        pruned.sort(key=lambda c: -c.speedup)
+        return pruned[:self.beam_w]
 
     def _build_harness(self, problem_shape: tuple) -> str:
         kt = self.env.kernel_type
@@ -326,6 +382,10 @@ int main(int argc, char** argv) {{
         if metrics:
             candidate.metrics    = metrics.to_dict()
             candidate.bottleneck = self.clf.classify(metrics).value
+        if candidate.compile_ok and candidate.correct:
+            candidate.feedback_route = (
+                "planner_tree" if candidate.speedup >= 1.0 else "fixer_with_rag"
+            )
         return metrics
 
     def _make_inner_profile_fn(self, problem_shape, baseline_us):
@@ -450,6 +510,7 @@ int main(int argc, char** argv) {{
             logger.info("Failed strategies saved for retry: %s", names)
 
         survivors = self.selector.select_survivors(metrics_list, max_survivors=self.beam_w)
+        survivors = self._prune_stale_families(survivors)
         for s in survivors:
             if s.prev_metrics is None:
                 s.prev_metrics = s.metrics
@@ -654,6 +715,7 @@ int main(int argc, char** argv) {{
             ] + improved_new
             prev_survivor_ids = {id(s) for s in survivors}
             survivors = self.selector.select_survivors(all_candidates, max_survivors=self.beam_w)
+            survivors = self._prune_stale_families(survivors)
             # Only set prev_metrics on NEW entrants; carried-over survivors keep theirs
             for s in survivors:
                 if id(s) not in prev_survivor_ids:
