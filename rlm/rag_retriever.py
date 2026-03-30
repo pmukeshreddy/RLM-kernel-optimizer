@@ -804,7 +804,10 @@ class PineconeRetriever:
         # then response.hits directly as a fallback
         result = getattr(response, "result", None)
         if result is not None:
-            hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
+            if isinstance(result, dict):
+                hits = result.get("hits") or result.get("matches") or []
+            else:
+                hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
         else:
             hits = getattr(response, "hits", None) or getattr(response, "matches", None) or []
         if not hits:
