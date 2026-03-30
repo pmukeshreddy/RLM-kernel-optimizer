@@ -54,6 +54,8 @@ target:
 
 rag:
   provider: "pinecone"
+  index_name: "cuda-kernels-v2"
+  index_host: "cuda-kernels-v2-69jsi4r.svc.aped-4627-b74a.pinecone.io"
   top_k: 4
   candidate_pool_multiplier: 3
   namespace_env: "PINECONE_NAMESPACE"

@@ -109,6 +109,7 @@ class PineconeRetriever:
         self.rerank_model_env = cfg.get("rerank_model_env", "PINECONE_RERANK_MODEL")
         self.default_filter = cfg.get("metadata_filter") or None
         self.index_name = cfg.get("index_name") or os.getenv(self.index_name_env)
+        self.index_host = cfg.get("index_host") or None
         self.embed_provider = cfg.get("embed_provider") or os.getenv(
             self.embed_provider_env, "sentence-transformers"
         )
@@ -141,7 +142,7 @@ class PineconeRetriever:
             return None
 
         api_key = os.getenv(self.api_key_env)
-        index_host = os.getenv(self.index_host_env)
+        index_host = self.index_host or os.getenv(self.index_host_env)
         if not api_key or not (index_host or self.index_name):
             self._init_error = (
                 f"Missing environment variables: {self.api_key_env} and either "
