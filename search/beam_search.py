@@ -397,6 +397,7 @@ int main(int argc, char** argv) {{
         ok = False
         metrics = None
         speedup = 0.0
+        binary_speedup = None  # set inside timing block; used for routing at end
         with self._env_lock:
             self.env.total_attempts += 1
 
@@ -421,15 +422,39 @@ int main(int argc, char** argv) {{
                 with self._env_lock:
                     self.env.correctness_passes += 1
                 candidate.correct = True
-                timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
-                if timing_us is None:
+                graph_timing_us = self._benchmark_with_graphs(candidate.code, problem_shape)
+                graph_ok = graph_timing_us is not None
+                if not graph_ok:
                     logger.warning(
                         "Graph benchmark failed for [%s]; falling back to binary event timing",
                         candidate.strategy,
                     )
-                    timing_us = self.profiler.benchmark_timing(binary)
+                # Always get binary timing: used for routing and as graph fallback.
+                binary_timing_us = self.profiler.benchmark_timing(binary)
+                timing_us = graph_timing_us if graph_ok else binary_timing_us
                 if timing_us is not None:
                     speedup = baseline_us / timing_us if timing_us > 0 and baseline_us > 0 else 0.0
+                    # A/B timing: graph timing is symmetric with the FlashInfer baseline
+                    # (same stream-s pre-capture pattern), so the ratio is fair. However,
+                    # the pre-capture step inflates both timings ~3-8%, compressing ratios
+                    # toward 1.0x. Binary timing is ground truth for routing decisions.
+                    binary_speedup = (
+                        baseline_us / binary_timing_us
+                        if binary_timing_us and binary_timing_us > 0 and baseline_us > 0
+                        else None
+                    )
+                    if graph_ok and binary_speedup is not None:
+                        delta_pct = (timing_us - binary_timing_us) / binary_timing_us * 100.0
+                        logger.info(
+                            "  Timing AB [%s]: graph=%.3fus binary=%.3fus delta=%+.1f%%",
+                            candidate.strategy, timing_us, binary_timing_us, delta_pct,
+                        )
+                        logger.info(
+                            "  Speedup check [%s]: baseline=%.3fus source=%s graph=%.3fx binary=%.3fx",
+                            candidate.strategy, baseline_us,
+                            "flashinfer" if self.env.official_baseline else "reference",
+                            speedup, binary_speedup,
+                        )
                     metrics = self.profiler.profile(
                         binary, report_name=name,
                         kernel_src=candidate.code,
@@ -470,8 +495,17 @@ int main(int argc, char** argv) {{
             candidate.metrics    = metrics.to_dict()
             candidate.bottleneck = self._branch_family(candidate) or "unlabeled"
         if candidate.compile_ok and candidate.correct:
-            candidate.feedback_route = (
-                "planner_tree" if candidate.speedup >= 1.0 else "fixer_with_rag"
+            # Use binary speedup for routing when available: graph timing is symmetric
+            # with the FlashInfer baseline but both are inflated ~3-8% by the stream-s
+            # pre-capture step, compressing ratios toward 1.0x. Binary timing is ground
+            # truth. A kernel is "above baseline" if either measure says so.
+            routing_speedup = max(speedup, binary_speedup if binary_speedup is not None else 0.0)
+            route = "planner_tree" if routing_speedup >= 1.0 else "fixer_with_rag"
+            candidate.feedback_route = route
+            logger.info(
+                "  route=%s graph=%.3fx binary=%s",
+                route, speedup,
+                f"{binary_speedup:.3f}x" if binary_speedup is not None else "n/a",
             )
         return metrics
 
