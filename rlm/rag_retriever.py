@@ -49,7 +49,9 @@ class PineconeRetriever:
         self.source_field = cfg.get("source_field", "source")
         self.api_key_env = cfg.get("api_key_env", "PINECONE_API_KEY")
         self.index_host_env = cfg.get("index_host_env", "PINECONE_INDEX_HOST")
+        self.index_name_env = cfg.get("index_name_env", "PINECONE_INDEX_NAME")
         self.default_filter = cfg.get("metadata_filter") or None
+        self.index_name = cfg.get("index_name") or os.getenv(self.index_name_env)
 
         self._client = None
         self._index = None
@@ -70,22 +72,53 @@ class PineconeRetriever:
 
         api_key = os.getenv(self.api_key_env)
         index_host = os.getenv(self.index_host_env)
-        if not api_key or not index_host:
+        if not api_key or not (index_host or self.index_name):
             self._init_error = (
-                f"Missing environment variables: {self.api_key_env} and/or "
-                f"{self.index_host_env}."
+                f"Missing environment variables: {self.api_key_env} and either "
+                f"{self.index_host_env} or {self.index_name_env}."
             )
             return None
 
         try:
             self._client = Pinecone(api_key=api_key)
-            self._index = self._client.Index(host=index_host)
+            if index_host:
+                self._index = self._client.Index(host=index_host)
+            else:
+                self._index = self._client.Index(self.index_name)
         except Exception as exc:  # pragma: no cover - network runtime
             self._init_error = f"Failed to initialize Pinecone index: {exc}"
             logger.warning(self._init_error)
             return None
 
         return self._index
+
+    def list_indexes(self) -> list[str]:
+        if Pinecone is None:
+            return []
+        api_key = os.getenv(self.api_key_env)
+        if not api_key:
+            return []
+        try:
+            client = self._client or Pinecone(api_key=api_key)
+            listing = client.list_indexes()
+        except Exception as exc:  # pragma: no cover - network runtime
+            logger.warning("Pinecone list_indexes failed: %s", exc)
+            return []
+
+        names = []
+        for item in listing:
+            if isinstance(item, dict):
+                name = item.get("name")
+            else:
+                name = getattr(item, "name", None)
+                if name is None and hasattr(item, "to_dict"):
+                    try:
+                        name = item.to_dict().get("name")
+                    except Exception:
+                        name = None
+            if name:
+                names.append(str(name))
+        return names
 
     def status(self) -> str:
         if self._ensure_index() is not None:

@@ -34,6 +34,7 @@ def main() -> int:
         "status": status,
         "query": args.query,
         "top_k": args.top_k,
+        "indexes": retriever.list_indexes(),
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
 

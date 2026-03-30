@@ -56,6 +56,7 @@ rag:
   top_k: 4
   namespace_env: "PINECONE_NAMESPACE"
   api_key_env: "PINECONE_API_KEY"
+  index_name_env: "PINECONE_INDEX_NAME"
   index_host_env: "PINECONE_INDEX_HOST"
   text_field: "chunk_text"
   title_field: "title"
