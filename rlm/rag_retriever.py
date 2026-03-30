@@ -793,15 +793,15 @@ class PineconeRetriever:
 
     def _extract_hits(self, response) -> list[dict]:
         if hasattr(response, "matches"):
-            hits = getattr(response, "matches", [])
+            hits = getattr(response, "matches", None) or []
             return [self._normalize_hit(hit) for hit in hits]
         if isinstance(response, dict):
             result = response.get("result", response)
-            hits = result.get("hits", result.get("matches", []))
+            hits = result.get("hits") or result.get("matches") or []
             return [self._normalize_hit(hit) for hit in hits]
 
         result = getattr(response, "result", response)
-        hits = getattr(result, "hits", getattr(result, "matches", []))
+        hits = getattr(result, "hits", None) or getattr(result, "matches", None) or []
         return [self._normalize_hit(hit) for hit in hits]
 
     def _normalize_hit(self, hit) -> dict:
