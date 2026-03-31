@@ -71,7 +71,9 @@ def build_root_planner_spec(
             "Prioritize replacing scalar/branchy FP4 packing with hardware FP4 intrinsics or existing project helpers before cosmetic cleanup.",
             "Do not spend multiple root branches on reduction-only ideas; treat warp-reduction-only branches as secondary unless paired with a larger memory-path improvement.",
             "The reference kernel baseline_context shows the actual register count and occupancy — use those numbers, not assumed values.",
-            "Favor branches that reduce register pressure (e.g. via __launch_bounds__(256, 8) to cap at 32 regs) or structural simplification. Do not assume the baseline is already at 32 registers.",
+            "KNOWN BUG in reference kernel: Phase-2 loop `for (qb=tid; qb<128; qb+=256)` leaves threads 128-255 completely idle (50% thread waste). This is the primary bottleneck — fix it before other optimizations.",
+            "Favor branches that fix the 50% Phase-2 thread waste: change BLOCK_THREADS to 128 (all threads get 1 quant block each), OR use warp-cooperative cvt_warp_fp16_to_fp4 with CVT_FP4_NUM_THREADS_PER_SF=2.",
+            "Always include __launch_bounds__(256, 8) [or (128, 16) if changing to 128 threads] to cap registers at 32 and restore 100% occupancy.",
         ])
     return PlannerSpec(
         mode="root",

@@ -82,9 +82,15 @@ def build_coder_prompt(
         kernel_specific_rules.extend([
             f"BASELINE: reference kernel compiles to {_baseline_regs} registers/thread, {_baseline_occ}% occupancy on SM100 (256-thread blocks).",
             f"On SM100, <=32 registers/thread gives 100% occupancy (8 blocks/SM). At {_baseline_regs} regs the baseline is already below 100%.",
-            "To recover full occupancy, use `__launch_bounds__(256, 8)` which caps registers at 32 on SM100. Occupancy recovery alone gives ~1.33x.",
-            "For add+rmsnorm+fp4 on shape 128x2048, treat the Phase-2 residual_out reread as a primary cost center.",
-            "Prefer project helpers from kernels/common/nvfp4_utils.cuh (pack_fp4_pair / quantize_block_nvfp4) over re-implementing a scalar branch chain.",
+            "ALWAYS add `__launch_bounds__(256, 8)` to this kernel. It caps registers at 32 on SM100 regardless of which branch you implement.",
+            "CRITICAL THREAD WASTE BUG: Phase-2 loop is `for (int qb = tid; qb < 128; qb += 256)`. "
+            "With 256 threads and 128 quant blocks, threads 128-255 execute ZERO iterations — 50% of threads are completely idle in Phase 2. "
+            "This is the primary performance bottleneck. Fix it by either: "
+            "(a) changing BLOCK_THREADS to 128 so every thread handles exactly one quant block, OR "
+            "(b) using warp-cooperative packing (cvt_warp_fp16_to_fp4 with CVT_FP4_NUM_THREADS_PER_SF=2) so all 256 threads participate.",
+            "REGISTER SOURCE: `float block_vals[NVFP4_BLOCK_SIZE]` = float[16] costs 16 registers in Phase 2. "
+            "With __launch_bounds__(256, 8) the compiler spills these to stay at 32 regs total.",
+            "For add+rmsnorm+fp4 on shape 128x2048, treat Phase-2 thread waste and residual_out re-read as the two primary cost centers.",
             f"Hard guard: if your first submit shows registers above {_abort_regs} and speedup below 1.05x, revert to baseline in the next turn.",
         ])
         if not _branch_mentions(branch_text, "warp", "shuffle", "reduction", "shfl", "syncthreads"):
