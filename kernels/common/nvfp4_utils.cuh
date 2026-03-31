@@ -133,7 +133,7 @@ __device__ __forceinline__ uint8_t float_to_nvfp4(float x) {
 // Values must be pre-scaled to [-6, 6] range before calling.
 // ────────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ uint8_t pack_fp4_pair(float a, float b) {
-#if defined(__NV_E2M1)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     return (uint8_t)__nv_cvt_float2_to_fp4x2(make_float2(a, b), __NV_E2M1, cudaRoundNearest);
 #else
     return (float_to_nvfp4(b) << 4) | (float_to_nvfp4(a) & 0xF);
@@ -174,7 +174,7 @@ __device__ __forceinline__ void quantize_block_nvfp4(
     // Encode each element and pack 2 fp4 per byte
     #pragma unroll
     for (int i = 0; i < NVFP4_BLOCK_SIZE / 2; ++i) {
-#if defined(__NV_E2M1)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
         // Hardware FP4 conversion — single instruction per pair on sm_100a
         float2 pair = make_float2(x[2*i] * inv_s, x[2*i+1] * inv_s);
         packed[i] = (uint8_t)__nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
