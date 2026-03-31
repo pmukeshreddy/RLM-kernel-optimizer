@@ -65,8 +65,10 @@ class KernelProfiler:
         build_dir = self.output_dir / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
 
-        kernel_file = build_dir / f"{output_name}.cu"
-        binary_file = build_dir / output_name
+        # OS file name limit is 255 bytes; truncate long combined-branch names
+        safe_name = output_name[:80] if len(output_name) > 80 else output_name
+        kernel_file = build_dir / f"{safe_name}.cu"
+        binary_file = build_dir / safe_name
         kernel_file.write_text(kernel_src + "\n\n" + harness_src)
 
         cmd = [self.nvcc] + self.nvcc_flags + ["-Xptxas", "-v", str(kernel_file), "-o", str(binary_file)]
