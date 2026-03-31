@@ -114,12 +114,27 @@ beam:
 
 ## RAG Pipeline
 
-Pinecone vector database indexed with real CUDA kernels from open-source projects (vllm, lmdeploy, FlashInfer, etc.). At planning time:
+Pinecone vector database (`cuda-kernels-v2`) indexed with real production CUDA kernels from open-source projects. At planning time:
 
 1. Query embedded using the kernel type + operation description
-2. Top-K candidates retrieved and reranked
-3. Most relevant source patterns provided as context to the planner
-4. Agents can call `SEARCH_DOCS` tool during generation for additional lookups
+2. Top-K candidates retrieved and reranked by source quality + semantic similarity
+3. Most relevant source patterns injected as context into the planner prompt
+4. Agents can call `SEARCH_DOCS` tool mid-generation for additional targeted lookups
+
+### Data Sources
+
+| Source | Type | Quality Weight |
+|--------|------|---------------|
+| FlashInfer | Production inference kernels | 1.0 |
+| vLLM | Production inference kernels | 1.0 |
+| SGLang | Production inference kernels | 1.0 |
+| CUTLASS | NVIDIA template library | 0.95 |
+| Triton | GPU compiler kernels | 0.95 |
+| PyTorch | Framework CUDA kernels | 0.9 |
+| Apex | NVIDIA training utilities | 0.9 |
+| LMDeploy | Production inference kernels | 0.85 |
+
+Source quality weights ensure production kernels (FlashInfer, vLLM) are preferred over synthetic data. The index uses Pinecone integrated inference with `multilingual-e5-large` embeddings and reranking.
 
 ---
 
