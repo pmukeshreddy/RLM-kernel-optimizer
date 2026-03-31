@@ -105,9 +105,13 @@ def build_coder_prompt(
                 f"Abort condition: if registers exceed {_abort_regs} and speedup stays below 1.05x, revert to baseline immediately.",
             ])
         if _branch_mentions(branch_text, "fp4", "intrinsic", "pack", "quant"):
-            kernel_specific_rules.append(
-                "Do not leave the scalar float_to_nvfp4 if/else chain as the hot-path encoder if a project helper or hardware intrinsic path can replace it."
-            )
+            kernel_specific_rules.extend([
+                "Do not leave the scalar float_to_nvfp4 if/else chain as the hot-path encoder if a project helper or hardware intrinsic path can replace it.",
+                "HARDWARE FP4 PATH: `kernels/common/nvfp4_utils.cuh` provides `quantize_block_nvfp4(float* x, uint8_t* packed, fp8* scale)` "
+                "which internally calls `__nv_cvt_float2_to_fp4x2` on sm_100a — ONE hardware instruction per pair instead of 7 scalar comparisons. "
+                "Call `quantize_block_nvfp4` instead of the manual amax/scale/float_to_nvfp4 loop. "
+                "#include \"nvfp4_utils.cuh\" is already available via the -I kernels/common compile flag.",
+            ])
 
     if kernel_specific_rules:
         parts.append("Kernel-specific rules:\n- " + "\n- ".join(kernel_specific_rules))

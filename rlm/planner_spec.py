@@ -74,6 +74,9 @@ def build_root_planner_spec(
             "KNOWN BUG in reference kernel: Phase-2 loop `for (qb=tid; qb<128; qb+=256)` leaves threads 128-255 completely idle (50% thread waste). This is the primary bottleneck — fix it before other optimizations.",
             "Favor branches that fix the 50% Phase-2 thread waste: change BLOCK_THREADS to 128 (all threads get 1 quant block each), OR use warp-cooperative cvt_warp_fp16_to_fp4 with CVT_FP4_NUM_THREADS_PER_SF=2.",
             "Always include __launch_bounds__(256, 8) [or (128, 16) if changing to 128 threads] to cap registers at 32 and restore 100% occupancy.",
+            "HARDWARE FP4: the scalar float_to_nvfp4 if/else chain (7 comparisons per element × 2048 elements) is the compute bottleneck. "
+            "`kernels/common/nvfp4_utils.cuh` provides `quantize_block_nvfp4()` which uses `__nv_cvt_float2_to_fp4x2` on sm_100a — "
+            "one hardware instruction per pair. Propose at least one branch that replaces the manual amax/scale/encode loop with `quantize_block_nvfp4`.",
         ])
     return PlannerSpec(
         mode="root",
