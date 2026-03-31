@@ -469,10 +469,19 @@ int main(int argc, char** argv) {{
 
                 timing_us = graph_timing_us
                 timing_path = "graph"
+                # Fall back to binary if graph is None OR if mismatch is extreme
+                # (>100% delta indicates broken graph capture, e.g. L2 cycling issue on large shapes)
                 if timing_us is None:
                     logger.warning(
                         "Graph benchmark failed for [%s]; falling back to binary event timing",
                         candidate.strategy,
+                    )
+                    timing_us = binary_timing_us
+                    timing_path = "binary_fallback"
+                elif timing_delta_pct is not None and abs(timing_delta_pct) > 100.0 and binary_timing_us is not None:
+                    logger.warning(
+                        "  Graph timing suspect for [%s] (delta=%.1f%%); using binary timing %.3fus instead",
+                        candidate.strategy, timing_delta_pct, binary_timing_us,
                     )
                     timing_us = binary_timing_us
                     timing_path = "binary_fallback"
