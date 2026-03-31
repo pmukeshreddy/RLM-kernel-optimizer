@@ -26,32 +26,15 @@ Benchmarked on NVIDIA B200 (sm_100a / Blackwell), compared against FlashInfer pr
 
 ### Architecture
 
-```
-Reference Kernel (.cu)
-        │
-        ▼
-   Planner Agent  ←── RAG (Pinecone)
-        │
-        ▼
-  Beam Search (width=4)
-  ┌─────┬─────┬─────┬─────┐
-  │ B1  │ B2  │ B3  │ B4  │   ← parallel branches
-  └──┬──┴──┬──┴──┬──┴──┬──┘
-     │     │     │     │
-  Coder Agents (per branch)
-     │
-  nvcc compile
-     │
-  Benchmark (CUDA graph timing)
-     │
-  Correctness check (FlashInfer reference)
-     │
-  Profiler feedback → next iteration
-     │
-  Planner Tree (expand best branches)
-     │
-  Final best kernel
-```
+The system takes a reference CUDA kernel and autonomously generates an optimized version through a multi-agent loop:
+
+- **Planner Agent** reads the kernel source + RAG context and proposes optimization hypotheses
+- **Beam Search** runs 4 parallel branches, each testing a different strategy
+- **Coder Agents** implement each hypothesis as complete CUDA code
+- **Compiler + Benchmark** validates and times each candidate (CUDA graph methodology)
+- **Correctness Check** validates against FlashInfer reference outputs
+- **Profiler** feeds back occupancy, registers, memory bandwidth to guide next iteration
+- **Planner Tree** expands branches that beat baseline into surgical child variants
 
 ### Key Components
 
