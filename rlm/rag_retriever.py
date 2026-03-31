@@ -461,6 +461,16 @@ class PineconeRetriever:
 
         reranked = self._pinecone_rerank(query, matches, top_n=top_n)
         if reranked is not None:
+            logger.info(
+                "RAG FULL RANKING (%d candidates → top %d) for query %r:",
+                len(matches), top_n, query[:80],
+            )
+            for rank, m in enumerate(reranked, start=1):
+                flag = " ← RETURNED" if rank <= top_n else ""
+                logger.info(
+                    "  [%2d] score=%.4f  %-50s  %s%s",
+                    rank, m.score, (m.title or m.match_id)[:50], m.source[:40] if m.source else "", flag,
+                )
             return reranked
 
         scored = sorted(
@@ -468,6 +478,17 @@ class PineconeRetriever:
             key=lambda match: self._heuristic_rank_score(query, match),
             reverse=True,
         )
+        logger.info(
+            "RAG HEURISTIC RANKING (%d candidates → top %d) for query %r:",
+            len(scored), top_n, query[:80],
+        )
+        for rank, m in enumerate(scored, start=1):
+            flag = " ← RETURNED" if rank <= top_n else ""
+            logger.info(
+                "  [%2d] score=%.4f  %-50s  %s%s",
+                rank, self._heuristic_rank_score(query, m), (m.title or m.match_id)[:50],
+                m.source[:40] if m.source else "", flag,
+            )
         scored = self._diversify_matches(scored, top_n=top_n)
         if self.last_query_mode != "uninitialized" and "+heuristic" not in self.last_query_mode:
             self.last_query_mode = f"{self.last_query_mode}+heuristic+diverse"
@@ -486,7 +507,7 @@ class PineconeRetriever:
             return None
 
         documents = []
-        pool = matches[: max(top_n, self.rerank_pool)]
+        pool = matches  # pass ALL deduplicated candidates to reranker, not just rerank_pool
         for match in pool:
             metadata = match.metadata or {}
             combined_text = "\n".join(
@@ -522,7 +543,7 @@ class PineconeRetriever:
                 model=self.rerank_model,
                 query=query,
                 documents=documents,
-                top_n=min(top_n, len(documents)),
+                top_n=len(documents),  # fetch ALL so we can log full ranking
                 return_documents=True,
                 rank_fields=["text"],
                 parameters={"truncate": "END"},
@@ -563,6 +584,19 @@ class PineconeRetriever:
 
         if not ranked:
             return None
+
+        # Log full ranking so we can inspect what's below the cut
+        logger.info(
+            "RAG PINECONE RERANK: %d candidates, returning top %d. Query: %r",
+            len(ranked), top_n, query[:80],
+        )
+        for rank, m in enumerate(ranked, start=1):
+            flag = " ← RETURNED" if rank <= top_n else ""
+            logger.info(
+                "  [%2d] rerank_score=%.4f  %-50s  %s%s",
+                rank, m.score, (m.title or m.match_id)[:50], m.source[:40] if m.source else "", flag,
+            )
+
         ranked = self._diversify_matches(ranked, top_n=top_n)
         if ranked and self.last_query_mode != "uninitialized":
             self.last_query_mode = f"{self.last_query_mode}+rerank:{self.rerank_model}+diverse"
