@@ -2,7 +2,6 @@
 
 An autonomous CUDA kernel optimization system that uses LLM agents with beam search and RAG to generate faster GPU kernels. Given a reference CUDA kernel, the system discovers optimizations, generates improved code, and validates correctness — with no manual kernel analysis.
 
-**Author:** Mukesh Reddy
 
 ---
 
