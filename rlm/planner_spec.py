@@ -64,32 +64,17 @@ def build_root_planner_spec(
         "Prefer production-style CUDA implementation patterns over vague advice.",
         "Prefer exact operation matches over kernels that only share datatype or hardware family.",
         "Do not propose full rewrites in every branch; vary the plan surface.",
+        "Analyze kernel_src for thread utilization: check every loop where the iteration bound may be less than blockDim.x — threads beyond the bound are completely idle and waste SM resources.",
+        "Analyze kernel_src for compute bottlenecks: look for scalar if/else chains or manual encode loops that could be replaced by hardware intrinsics available on sm_100a.",
+        "Analyze kernel_src for redundant global memory passes: identify data written to global memory in one phase and re-read in a later phase that could be cached in registers instead.",
+        "Analyze kernel_src for memory access patterns: identify loads and stores that could be widened to float4/uint4 (128-bit) for better memory throughput.",
     ]
     if kernel_type == "add_rmsnorm":
-        hidden_size = problem_shape[1] if len(problem_shape) >= 2 else 2048
-        num_quant_blocks = hidden_size // 16  # NVFP4_BLOCK_SIZE=16
-        block_threads = 256  # reference kernel default
-        has_thread_waste = num_quant_blocks < block_threads
         constraints.extend([
             "For fused add+rmsnorm+fp4, prioritize eliminating the Phase-2 residual_out reread before minor local tweaks.",
-            "Prioritize replacing scalar/branchy FP4 packing with hardware FP4 intrinsics or existing project helpers before cosmetic cleanup.",
             "Do not spend multiple root branches on reduction-only ideas; treat warp-reduction-only branches as secondary unless paired with a larger memory-path improvement.",
             "The reference kernel baseline_context shows the actual register count and occupancy — use those numbers, not assumed values.",
-            f"Always include __launch_bounds__(256, 8) to cap registers at 32 and restore 100% occupancy.",
-            f"HARDWARE FP4: the scalar float_to_nvfp4 if/else chain (7 comparisons per element × {hidden_size} elements) is the compute bottleneck. "
-            "`kernels/common/nvfp4_utils.cuh` provides `quantize_block_nvfp4()` which uses `__nv_cvt_float2_to_fp4x2` on sm_100a — "
-            "one hardware instruction per pair. Propose at least one branch that replaces the manual amax/scale/encode loop with `quantize_block_nvfp4`.",
         ])
-        if has_thread_waste:
-            constraints.extend([
-                f"KNOWN BUG in reference kernel: Phase-2 loop `for (qb=tid; qb<{num_quant_blocks}; qb+=256)` leaves threads {num_quant_blocks}-255 completely idle (50% thread waste). This is the primary bottleneck — fix it before other optimizations.",
-                f"Favor branches that fix the 50% Phase-2 thread waste: change BLOCK_THREADS to {num_quant_blocks} (all threads get 1 quant block each), OR use warp-cooperative cvt_warp_fp16_to_fp4 with CVT_FP4_NUM_THREADS_PER_SF=2.",
-            ])
-        else:
-            constraints.extend([
-                f"For hidden_size={hidden_size}, num_quant_blocks={num_quant_blocks} > BLOCK_THREADS=256 — there is NO Phase-2 thread waste. Each thread already handles {num_quant_blocks // block_threads} quant blocks. Do NOT reduce BLOCK_THREADS.",
-                f"Primary bottlenecks for this shape: (1) hardware FP4 intrinsics to replace scalar encoding, (2) vectorized 128-bit loads for Phase-1, (3) eliminating Phase-2 residual_out re-read via register caching (each thread caches {hidden_size // block_threads} elements = {hidden_size // block_threads} floats, ~{hidden_size // block_threads} registers — pair with __launch_bounds__(256,8) to spill safely).",
-            ])
     return PlannerSpec(
         mode="root",
         kernel_type=kernel_type,
