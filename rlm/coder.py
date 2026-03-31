@@ -23,6 +23,7 @@ def build_coder_prompt(
     launch_signature: str,
     rag_context: str,
     current_profile: str = "",
+    baseline_regs: int = 0,
 ) -> str:
     name = plan_branch.get("name", "unnamed_branch")
     goal = plan_branch.get("goal") or plan_branch.get("change_summary") or plan_branch.get("what", "")
@@ -75,11 +76,16 @@ def build_coder_prompt(
 
     kernel_specific_rules = []
     if kernel_type == "add_rmsnorm":
+        _baseline_regs = baseline_regs or 40  # actual measured baseline register count
+        _abort_regs = _baseline_regs + 8      # allow 8 regs above baseline before aborting
+        _baseline_occ = 75 if _baseline_regs > 32 else 100
         kernel_specific_rules.extend([
+            f"BASELINE: reference kernel compiles to {_baseline_regs} registers/thread, {_baseline_occ}% occupancy on SM100 (256-thread blocks).",
+            f"On SM100, <=32 registers/thread gives 100% occupancy (8 blocks/SM). At {_baseline_regs} regs the baseline is already below 100%.",
+            "To recover full occupancy, use `__launch_bounds__(256, 8)` which caps registers at 32 on SM100. Occupancy recovery alone gives ~1.33x.",
             "For add+rmsnorm+fp4 on shape 128x2048, treat the Phase-2 residual_out reread as a primary cost center.",
-            "Prefer project helpers from kernels/common/nvfp4_utils.cuh (for example pack_fp4_pair / quantize_block_nvfp4) over re-implementing a scalar branch chain.",
-            "Preserve the working occupancy regime. The strong working path is around 32 registers/thread and 100% occupancy.",
-            "Hard guard: if your first submit on this 128x2048 kernel shows registers above 32 and speedup below 1.05x, you MUST revert in the next turn. Do not iterate further on a high-register path.",
+            "Prefer project helpers from kernels/common/nvfp4_utils.cuh (pack_fp4_pair / quantize_block_nvfp4) over re-implementing a scalar branch chain.",
+            f"Hard guard: if your first submit shows registers above {_abort_regs} and speedup below 1.05x, revert to baseline in the next turn.",
         ])
         if not _branch_mentions(branch_text, "warp", "shuffle", "reduction", "shfl", "syncthreads"):
             kernel_specific_rules.append(
@@ -88,10 +94,9 @@ def build_coder_prompt(
         if _branch_mentions(branch_text, "fuse", "single pass", "single-pass", "reread", "re-read", "smem cache"):
             kernel_specific_rules.extend([
                 "This branch should eliminate the second global-memory read of residual_out.",
-                "Each thread owns exactly 8 elements (2048/256). If you cache them, use a float reg[8] budget consciously.",
-                "A float reg[8] cache costs about 8 registers. Starting from a ~32-register working path, that puts you near ~40 registers, which may drop occupancy sharply.",
-                "If you use reg[8], keep every other change minimal and avoid adding extra arrays or shared-memory staging unless absolutely necessary.",
-                "Abort condition for the single-pass path: if registers reach 40 and speedup stays below 1.05x, revert to the 32-register version immediately and do not continue refining the high-register path.",
+                f"Each thread owns exactly 8 elements (2048/256). If you cache them, use a float reg[8] — that adds ~8 registers above the {_baseline_regs}-reg baseline.",
+                "If you use reg[8], pair with `__launch_bounds__(256, 8)` to keep total regs at 32 and maintain 100% occupancy.",
+                f"Abort condition: if registers exceed {_abort_regs} and speedup stays below 1.05x, revert to baseline immediately.",
             ])
         if _branch_mentions(branch_text, "fp4", "intrinsic", "pack", "quant"):
             kernel_specific_rules.append(

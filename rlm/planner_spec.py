@@ -70,7 +70,8 @@ def build_root_planner_spec(
             "For fused add+rmsnorm+fp4, prioritize eliminating the Phase-2 residual_out reread before minor local tweaks.",
             "Prioritize replacing scalar/branchy FP4 packing with hardware FP4 intrinsics or existing project helpers before cosmetic cleanup.",
             "Do not spend multiple root branches on reduction-only ideas; treat warp-reduction-only branches as secondary unless paired with a larger memory-path improvement.",
-            "Favor branches likely to preserve ~32 registers/thread and full occupancy on the 128x2048 shape.",
+            "The reference kernel baseline_context shows the actual register count and occupancy — use those numbers, not assumed values.",
+            "Favor branches that reduce register pressure (e.g. via __launch_bounds__(256, 8) to cap at 32 regs) or structural simplification. Do not assume the baseline is already at 32 registers.",
         ])
     return PlannerSpec(
         mode="root",

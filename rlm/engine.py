@@ -197,11 +197,11 @@ def _build_refine_system_prompt(
         reg_limit = 96
         occ_limit = 75.0
         if kernel_type == "add_rmsnorm" and tuple(problem_shape or ()) == (128, 2048):
-            reg_limit = 33
-            occ_limit = 99.0
+            reg_limit = 44   # baseline is 40; flag if candidate exceeds baseline+4
+            occ_limit = 74.0  # flag if occupancy drops below current baseline of 75%
         elif kernel_type == "add_rmsnorm":
-            reg_limit = 40
-            occ_limit = 90.0
+            reg_limit = 44
+            occ_limit = 74.0
         if regs >= reg_limit or occupancy < occ_limit:
             hints.append("register pressure or occupancy is already tight")
 
@@ -712,12 +712,15 @@ class RLMEngine:
                 _format_profile_section(current_metrics, round_num)
                 if current_metrics else ""
             )
+            _bcm = self.env.baseline_compiler_metrics
+            _baseline_regs = int(getattr(_bcm, "registers_per_thread", 0) or 0) if _bcm else 0
             initial_prompt = build_coder_prompt(
                 plan_branch=plan_branch,
                 kernel_code=kernel_slice,
                 launch_signature=launch_sig,
                 rag_context=rag_context,
                 current_profile=current_profile,
+                baseline_regs=_baseline_regs,
             )
             return await self._run_agent_loop(
                 initial_prompt=initial_prompt,
@@ -994,12 +997,15 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
             model_id = self.fixer_model
         else:
             current_profile = _format_profile_section(metrics, round_num) if metrics else ""
+            _bcm2 = self.env.baseline_compiler_metrics
+            _baseline_regs2 = int(getattr(_bcm2, "registers_per_thread", 0) or 0) if _bcm2 else 0
             initial_prompt = build_coder_prompt(
                 plan_branch=plan_branch,
                 kernel_code=base_code,
                 launch_signature=launch_sig,
                 rag_context=rag_context,
                 current_profile=current_profile,
+                baseline_regs=_baseline_regs2,
             )
             model_id = self.sub_model
 

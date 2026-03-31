@@ -146,6 +146,13 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     beam = BeamSearch(env)
+    # Measure reference kernel to populate baseline_compiler_metrics (register count etc.)
+    # so coder and planner receive accurate register/occupancy baseline instead of hardcoded guesses.
+    problem_shape = tuple(kernel_def["shape"])
+    logger.info("Measuring reference kernel compiler metrics (register count, occupancy baseline)...")
+    naive_timing, baseline_cm = beam.measure_search_baseline(problem_shape)
+    if baseline_cm:
+        logger.info("Reference kernel: regs=%d smem=%s", baseline_cm.registers_per_thread, baseline_cm.static_smem_bytes)
     try:
         if args.branch_json:
             branch = json.loads(Path(args.branch_json).read_text())
