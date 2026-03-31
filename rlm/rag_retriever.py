@@ -204,6 +204,7 @@ class PineconeRetriever:
         top_k: int | None = None,
         namespace: str | None = None,
         metadata_filter: dict | None = None,
+        exclude_source_patterns: list[str] | None = None,
     ) -> list[PineconeMatch]:
         if not query.strip():
             return []
@@ -239,6 +240,7 @@ class PineconeRetriever:
                     top_k=top_k,
                     namespace=namespace,
                     metadata_filter=metadata_filter,
+                    exclude_source_patterns=exclude_source_patterns,
                 )
             logger.warning("Pinecone search failed for query %r: %s", query, exc)
             self.last_query_mode = "text_error"
@@ -249,6 +251,11 @@ class PineconeRetriever:
         for hit in hits:
             fields = hit.get("fields", {}) or {}
             metadata = hit.get("metadata", {}) or {}
+            source = self._extract_source(fields=fields, metadata=metadata)
+            if exclude_source_patterns and any(
+                pat.lower() in source.lower() for pat in exclude_source_patterns
+            ):
+                continue
             text = self._extract_text(fields=fields, metadata=metadata)
             if not text:
                 continue
@@ -258,7 +265,7 @@ class PineconeRetriever:
                     score=float(hit.get("_score") or hit.get("score") or 0.0),
                     text=text,
                     title=self._extract_title(fields=fields, metadata=metadata, hit=hit),
-                    source=self._extract_source(fields=fields, metadata=metadata),
+                    source=source,
                     metadata=metadata,
                 )
             )
@@ -285,6 +292,7 @@ class PineconeRetriever:
                     top_k=candidate_top_k,
                     namespace=namespace,
                     metadata_filter=metadata_filter,
+                    exclude_source_patterns=exclude_source_patterns,
                 ):
                     existing = deduped.get(match.match_id)
                     if existing is None or match.score > existing.score:
@@ -354,6 +362,7 @@ class PineconeRetriever:
         top_k: int | None = None,
         namespace: str | None = None,
         metadata_filter: dict | None = None,
+        exclude_source_patterns: list[str] | None = None,
     ) -> list[PineconeMatch]:
         index = self._ensure_index()
         if index is None:
@@ -389,6 +398,11 @@ class PineconeRetriever:
         matches = []
         for hit in hits:
             metadata = hit.get("metadata", {}) or {}
+            source = self._extract_source(fields={}, metadata=metadata)
+            if exclude_source_patterns and any(
+                pat.lower() in source.lower() for pat in exclude_source_patterns
+            ):
+                continue
             text = self._extract_text(fields={}, metadata=metadata)
             if not text:
                 continue
@@ -398,7 +412,7 @@ class PineconeRetriever:
                     score=float(hit.get("_score") or hit.get("score") or 0.0),
                     text=text,
                     title=self._extract_title(fields={}, metadata=metadata, hit=hit),
-                    source=self._extract_source(fields={}, metadata=metadata),
+                    source=source,
                     metadata=metadata,
                 )
             )
