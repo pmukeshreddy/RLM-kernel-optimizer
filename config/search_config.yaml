@@ -22,6 +22,7 @@ beam:
   plateau_bad_rounds: 2       # require repeated stagnant/regression outcomes before pruning
   max_concurrent_api_calls: 4 # keep planner/coder parallelism aligned with beam width
   population_crossover: true  # inject one family-distinct crossover candidate per round
+  early_stop_min_improvement: 0.03  # stop if round-over-round best speedup improves by less than this
 
 strategies:
   enabled:

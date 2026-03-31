@@ -56,6 +56,7 @@ class BeamSearch:
         self.plateau_refine_attempts = int(beam_cfg.get("plateau_refine_attempts", 2))
         self.plateau_bad_rounds = int(beam_cfg.get("plateau_bad_rounds", 2))
         self.population_crossover = bool(beam_cfg.get("population_crossover", True))
+        self.early_stop_min_improvement = float(beam_cfg.get("early_stop_min_improvement", 0.03))
         self.max_profile_workers = int(profiler_cfg.get("max_profile_workers", 2))
         self._env_lock = threading.Lock()  # guards shared env counters
 
@@ -700,7 +701,8 @@ int main(int argc, char** argv) {{
                 logger.warning("No viable survivors — stopping early")
                 break
 
-            logger.info("--- Round %d ---", round_num)
+            round_start_best = max((s.speedup for s in survivors), default=0.0)
+            logger.info("--- Round %d --- (best so far: %.3fx)", round_num, round_start_best)
 
             # Split survivors into refineable vs stagnant
             to_refine = []
@@ -897,6 +899,16 @@ int main(int argc, char** argv) {{
             for s in survivors:
                 if id(s) not in prev_survivor_ids:
                     s.prev_metrics = s.metrics
+
+            # Early stopping: if best speedup improved by less than threshold, stop
+            round_end_best = max((s.speedup for s in survivors), default=0.0)
+            improvement = round_end_best - round_start_best
+            if round_num >= 1 and improvement < self.early_stop_min_improvement:
+                logger.info(
+                    "Early stop at round %d: improvement %.4fx < threshold %.4fx (best=%.3fx)",
+                    round_num, improvement, self.early_stop_min_improvement, round_end_best,
+                )
+                break
 
         # ── Final: Combine Orthogonal Survivors (Tournament Bracket) ─────────────
         top_for_combine = self.selector.select_for_combination(survivors)
