@@ -48,11 +48,13 @@ PATTERN_ALIASES = {
 SOURCE_QUALITY_WEIGHTS = {
     "flashinfer": 1.0,
     "vllm": 1.0,
+    "sglang": 1.0,
     "cutlass": 0.95,
     "triton": 0.95,
     "pytorch": 0.9,
     "apex": 0.9,
-    "sakana": 0.65,
+    "lmdeploy": 0.85,
+    "sakana": 0.40,  # synthetic competition data; penalise heavily to surface real production code
 }
 
 
@@ -269,6 +271,7 @@ class PineconeRetriever:
         top_k: int | None = None,
         namespace: str | None = None,
         metadata_filter: dict | None = None,
+        exclude_source_patterns: list[str] | None = None,
     ) -> list[PineconeMatch]:
         deduped = {}
         candidate_top_k = max(
@@ -288,10 +291,26 @@ class PineconeRetriever:
                         deduped[match.match_id] = match
         if not deduped:
             return []
+
+        candidates = list(deduped.values())
+        if exclude_source_patterns:
+            before = len(candidates)
+            candidates = [
+                m for m in candidates
+                if not any(pat.lower() in (m.source or "").lower() for pat in exclude_source_patterns)
+            ]
+            logger.info(
+                "RAG exclude_source_patterns %s removed %d/%d candidates",
+                exclude_source_patterns, before - len(candidates), before,
+            )
+
+        if not candidates:
+            return []
+
         combined_query = " ; ".join(str(query).strip() for query in queries if str(query).strip())
         return self._rerank_matches(
             combined_query,
-            list(deduped.values()),
+            candidates,
             top_n=int(top_k or self.top_k),
         )
 

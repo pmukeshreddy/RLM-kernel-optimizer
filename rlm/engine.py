@@ -378,7 +378,12 @@ class RLMEngine:
         if not clean_queries:
             return "No Pinecone query provided."
         effective_top_k = int(top_k or getattr(self.rag, "top_k", 4))
-        matches = self.rag.search_many(clean_queries[:4], top_k=effective_top_k)
+        # For add_rmsnorm, exclude flashinfer: the RAG index contains the FlashInfer source
+        # that the reference kernel was adapted from — returning it is circular (model already
+        # has the baseline in its prompt). This forces sglang/vllm/cutlass into the top slots.
+        exclude = ["flashinfer"] if getattr(self.env, "kernel_type", "") == "add_rmsnorm" else []
+        matches = self.rag.search_many(clean_queries[:4], top_k=effective_top_k,
+                                       exclude_source_patterns=exclude or None)
         return self.rag.format_matches(matches)
 
     def _log_planner_block(self, title: str, content: str) -> None:
@@ -1109,7 +1114,9 @@ Return the COMPLETE .cu file in a single ```cuda code block. No explanations.
                     })
                 else:
                     logger.info("🧠 SEARCH_PINECONE [%s]: %s", strategy_name, query)
-                    matches = self.rag.search_many([query], top_k=top_k or 3)
+                    _excl = ["flashinfer"] if getattr(self.env, "kernel_type", "") == "add_rmsnorm" else None
+                    matches = self.rag.search_many([query], top_k=top_k or 3,
+                                                   exclude_source_patterns=_excl)
                     aux_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
                         "content": self.rag.format_matches(matches),

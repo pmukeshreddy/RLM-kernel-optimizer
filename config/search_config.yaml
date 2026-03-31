@@ -66,7 +66,7 @@ rag:
   embed_model_env: "PINECONE_EMBED_MODEL"
   rerank_model_env: "PINECONE_RERANK_MODEL"
   rerank_pool: 25
-  source_cap: 2
+  source_cap: 1
   format_max_chars: 16000
   match_max_chars: 4000
   text_field: "source_code"
